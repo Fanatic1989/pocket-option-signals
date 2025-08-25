@@ -1,0 +1,109 @@
+name: refresh-assets
+
+on:
+  workflow_dispatch: {}         # manual button in Actions
+  schedule:
+    - cron: "0 9 * * 1"         # optional: every Monday 09:00 UTC
+
+permissions:
+  contents: write               # allow committing symbols.yaml changes
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (requests, pyyaml)
+        run: pip install requests pyyaml
+
+      - name: Ensure script exists (idempotent)
+        run: |
+          if [ ! -f refresh_assets.py ]; then
+            cat > refresh_assets.py <<'PY'
+import re, yaml, requests
+from pathlib import Path
+
+URLS = [
+    "https://m.pocketoption.com/en/assets-current/",
+    "https://pocketoption.com/en/assets/"
+]
+
+def fetch_assets():
+    html = ""
+    for u in URLS:
+        try:
+            r = requests.get(u, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
+            if r.ok and len(r.text) > len(html):
+                html = r.text
+        except Exception:
+            pass
+    return html
+
+def parse_assets(html: str):
+    raw = set()
+    patterns = [
+        r"[A-Z]{3}/[A-Z]{3}",
+        r"[A-Z]{2,5}-USD",
+        r"\bGOLD\b", r"\bSILVER\b", r"\bBRENT\b", r"\bWTI\b", r"\bNATURAL GAS\b",
+        r"\bNASDAQ\b", r"\bS&P 500\b", r"\bDOW JONES\b"
+    ]
+    for pat in patterns:
+        for m in re.findall(pat, html, flags=re.I):
+            raw.add(m.upper().strip())
+
+    def map_symbol(s: str):
+        s_nospace = s.replace(" ", "")
+        if "/" in s:
+            return {"yf": s_nospace.replace("/","") + "=X", "name": s, "group": "FX", "enabled": True}
+        if s_nospace.endswith("-USD"):
+            base = s_nospace[:-4]
+            return {"yf": f"{base}-USD", "name": f"{base}/USD", "group": "CRYPTO", "enabled": True}
+        if s == "GOLD":
+            return {"yf": "XAUUSD=X", "name": "GOLD (XAU/USD)", "group": "COMMODITY", "enabled": True}
+        if s == "SILVER":
+            return {"yf": "XAGUSD=X", "name": "SILVER (XAG/USD)", "group": "COMMODITY", "enabled": True}
+        if s in {"BRENT","WTI","NATURAL GAS"}:
+            proxy = {"BRENT":"BZ=F","WTI":"CL=F","NATURAL GAS":"NG=F"}[s]
+            return {"yf": proxy, "name": s, "group": "COMMODITY", "enabled": True}
+        if s in {"NASDAQ","S&P 500","DOW JONES"}:
+            proxy = {"NASDAQ":"^IXIC","S&P 500":"^GSPC","DOW JONES":"^DJI"}[s]
+            return {"yf": proxy, "name": s, "group": "INDEX", "enabled": False}
+        return None
+
+    items = []
+    for s in sorted(raw):
+        m = map_symbol(s)
+        if m: items.append(m)
+    return items
+
+def write_symbols(items):
+    path = Path("symbols.yaml")
+    data = {"symbols": items}
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, width=100)
+    print(f"Written {len(items)} symbols to {path}")
+
+if __name__ == "__main__":
+    html = fetch_assets()
+    if not html:
+        raise SystemExit("Could not fetch asset page")
+    items = parse_assets(html)
+    write_symbols(items)
+PY
+          fi
+
+      - name: Run refresh
+        run: python refresh_assets.py
+
+      - name: Commit updated symbols.yaml
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "assets-bot"
+          git add symbols.yaml || true
+          git diff --staged --quiet && echo "No changes" || git commit -m "refresh: update symbols.yaml"
+          git push || true
