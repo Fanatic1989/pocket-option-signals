@@ -9,12 +9,15 @@ import yaml
 import requests
 
 # ===== Config (env-overridable) =====
-INTERVAL   = os.getenv("INTERVAL", "5m")          # candle size
-LOOKBACK   = os.getenv("LOOKBACK", "5d")          # bars to fetch
-EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))   # option expiry (minutes)
+INTERVAL   = os.getenv("INTERVAL", "5m")           # candle size
+LOOKBACK   = os.getenv("LOOKBACK", "15d")          # safer lookback for 5m
+EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))    # option expiry (minutes)
 RSI_BUY    = int(os.getenv("RSI_BUY", "30"))
 RSI_SELL   = int(os.getenv("RSI_SELL", "70"))
-MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))     # filter weak confluence
+MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))      # filter weak confluence
+MIN_ROWS   = 220                                   # need at least this many rows (EMA200 + buffer)
+RETRIES    = 3
+RETRY_SLEEP= 2.0
 
 DATA_DIR    = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_CSV = DATA_DIR / "signals.csv"
@@ -32,10 +35,9 @@ def rsi(series: pd.Series, length: int = 14) -> pd.Series:
     gain  = delta.clip(lower=0)
     loss  = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean().replace(0, np.nan)
+    rs = avg_gain / avg_loss
+    return (100 - (100 / (1 + rs))).fillna(50)
 
 def macd(series: pd.Series, fast=12, slow=26, signal=9):
     macd_line = ema(series, fast) - ema(series, slow)
@@ -52,10 +54,33 @@ def load_symbols():
         raise SystemExit("No enabled symbols in symbols.yaml")
     return syms
 
-def fetch_df(yf_symbol: str) -> pd.DataFrame:
-    df = yf.download(tickers=yf_symbol, interval=INTERVAL, period=LOOKBACK, progress=False)
-    df = df.dropna().rename(columns=str.lower)
-    return df
+def fetch_df(yf_symbol: str) -> pd.DataFrame | None:
+    """
+    Robust fetch with retries. Returns None if empty/too short.
+    """
+    # For 5m, yfinance supports up to ~60d, but some FX/commodities can be flaky.
+    period = LOOKBACK
+    for attempt in range(1, RETRIES + 1):
+        try:
+            df = yf.download(
+                tickers=yf_symbol,
+                interval=INTERVAL,
+                period=period,
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+            if df is None or df.empty:
+                raise ValueError("empty dataframe")
+            df = df.dropna().rename(columns=str.lower)
+            if len(df) < MIN_ROWS:
+                raise ValueError(f"too few rows ({len(df)})")
+            return df
+        except Exception:
+            if attempt == RETRIES:
+                return None
+            time.sleep(RETRY_SLEEP)
+    return None
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["close"]
@@ -110,8 +135,15 @@ def main():
 
     lines = [f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\nInterval: {INTERVAL} | Expiry: {EXPIRY_MIN}m\n"]
     for yf_sym, pretty in enabled:
+        df = fetch_df(yf_sym)
+        if df is None or len(df) < MIN_ROWS:
+            lines.append(f"⚪ *{pretty}* — skipped (no/short data)")
+            continue
         try:
-            df = add_indicators(fetch_df(yf_sym))
+            df = add_indicators(df)
+            if len(df) < 2:
+                lines.append(f"⚪ *{pretty}* — skipped (insufficient after indicators)")
+                continue
             prev, cur = df.iloc[-2], df.iloc[-1]
             px = float(cur["close"])
             sig, score, why = classify(prev, cur)
@@ -134,7 +166,6 @@ def main():
                 })
             else:
                 lines.append(f"⚪ *{pretty}* — No setup (score {score if sig else 0})")
-
         except Exception as e:
             lines.append(f"⚠️ *{pretty}* error: {e}")
 
