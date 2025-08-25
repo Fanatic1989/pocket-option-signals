@@ -15,22 +15,20 @@ EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))
 RSI_BUY    = int(os.getenv("RSI_BUY", "30"))
 RSI_SELL   = int(os.getenv("RSI_SELL", "70"))
 MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))
-MUST_TRADE = int(os.getenv("MUST_TRADE", "1"))  # post at least one pick if possible
-SESSION_UTC = os.getenv("SESSION_UTC", "0700-1700")
-WEEKDAYS    = os.getenv("WEEKDAYS", "12345")
-GATED_GROUPS = set(os.getenv("GATED_GROUPS", "FX,COMMODITY,INDEX").split(","))
+MUST_TRADE = int(os.getenv("MUST_TRADE", "0"))  # default off for strict regular-hours
+SUPPRESS_EMPTY = int(os.getenv("SUPPRESS_EMPTY", "1"))  # don't post if nothing to trade
 
-# Group-specific fetch parameters
-GROUP_PARAMS = {
-    "FX":        {"min_rows": 220, "candidates": [("5m","15d")]},
-    "COMMODITY": {"min_rows": 220, "candidates": [("5m","15d")]},
-    "INDEX":     {"min_rows": 220, "candidates": [("5m","15d")]},
-    # Crypto: prefer Binance (1000 candles). yfinance as a last resort.
-    "CRYPTO":    {"min_rows": 210, "candidates": [("5m","BINANCE"), ("1m","BINANCE"), ("5m","15d"), ("1m","7d")]},
-}
+# Regular-hours windows (UTC) per group — tweak via env if you like
+FX_HOURS_UTC        = os.getenv("FX_HOURS_UTC",        "0000-2100")  # from PO schedule example (EUR/USD 02:00–22:45 UTC+2) -> ~00:00–20:45 UTC
+COMMODITY_HOURS_UTC = os.getenv("COMMODITY_HOURS_UTC", "0000-2100")
+INDEX_HOURS_UTC     = os.getenv("INDEX_HOURS_UTC",     "1330-2000")
+STOCK_HOURS_UTC     = os.getenv("STOCK_HOURS_UTC",     "1330-2000")
 
-RETRIES     = 2
-RETRY_SLEEP = 1.0
+# Which weekdays to allow (1=Mon ... 7=Sun). OTC-free default: weekdays only.
+WEEKDAYS_FX         = os.getenv("WEEKDAYS_FX",         "12345")
+WEEKDAYS_COMMODITY  = os.getenv("WEEKDAYS_COMMODITY",  "12345")
+WEEKDAYS_INDEX      = os.getenv("WEEKDAYS_INDEX",      "12345")
+WEEKDAYS_STOCK      = os.getenv("WEEKDAYS_STOCK",      "12345")
 
 DATA_DIR    = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_CSV = DATA_DIR / "signals.csv"
@@ -39,110 +37,146 @@ SYMBOLS_YML = Path("symbols.yaml")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-# ===== Binance map for crypto =====
-CRYPTO_BINANCE = {
-    "BTC-USD": "BTCUSDT",
-    "ETH-USD": "ETHUSDT",
-}
+UA = {"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome Safari"}
 
-BINANCE_INTERVALS = {"1m":"1m","5m":"5m"}
+# ===== Crypto multi-provider (robust) =====
+BINANCE_MAP  = {"BTC-USD":"BTCUSDT", "ETH-USD":"ETHUSDT"}
+COINBASE_MAP = {"BTC-USD":"BTC-USD",  "ETH-USD":"ETH-USD"}
+KRAKEN_MAP   = {"BTC-USD":"XBTUSD",   "ETH-USD":"ETHUSD"}
 
-# ===== Indicators =====
-def ema(s: pd.Series, length:int) -> pd.Series:
-    return s.ewm(span=length, adjust=False).mean()
-
+def ema(s: pd.Series, length:int) -> pd.Series: return s.ewm(span=length, adjust=False).mean()
 def rsi(s: pd.Series, length:int=14) -> pd.Series:
-    d = s.diff()
-    up = d.clip(lower=0); dn = -d.clip(upper=0)
-    avg_up = up.ewm(alpha=1/length, adjust=False).mean()
-    avg_dn = dn.ewm(alpha=1/length, adjust=False).mean().replace(0,np.nan)
-    rs = avg_up / avg_dn
-    return (100 - 100/(1+rs)).fillna(50)
-
+    d = s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
+    ag=up.ewm(alpha=1/length, adjust=False).mean()
+    al=dn.ewm(alpha=1/length, adjust=False).mean().replace(0,np.nan)
+    return (100 - 100/(1+(ag/al))).fillna(50)
 def macd(s: pd.Series, fast=12, slow=26, signal=9):
-    m = ema(s, fast) - ema(s, slow)
-    sig = ema(m, signal)
-    return m, sig, m - sig
+    m=ema(s,fast)-ema(s,slow); sig=ema(m,signal); return m, sig, m-sig
 
-# ===== Session gate =====
-def _parse_session(s: str):
-    try:
-        a,b = s.split("-"); return int(a), int(b)
-    except: return 0, 2359
+def _hhmm(now: datetime) -> int: return now.hour*100 + now.minute
+def _in_window(now: datetime, hhmm_range: str, weekdays: str) -> bool:
+    try: start,end = map(int, hhmm_range.split("-"))
+    except: start,end = (0,2359)
+    return (str(now.isoweekday()) in set(weekdays)) and (start <= _hhmm(now) <= end)
 
-def in_session_utc(now: datetime, group: str) -> bool:
-    if group.upper() not in GATED_GROUPS:
+def group_in_session(now: datetime, group: str) -> bool:
+    g = group.upper()
+    if g == "CRYPTO":  # crypto 24/7 unless you gate it by editing here or adding an env
         return True
-    if str(now.isoweekday()) not in set(WEEKDAYS):  return False
-    start, end = _parse_session(SESSION_UTC)
-    hhmm = now.hour*100 + now.minute
-    return start <= hhmm <= end
+    if g == "FX":
+        return _in_window(now, FX_HOURS_UTC, WEEKDAYS_FX)
+    if g == "COMMODITY":
+        return _in_window(now, COMMODITY_HOURS_UTC, WEEKDAYS_COMMODITY)
+    if g in {"INDEX","INDICES"}:
+        return _in_window(now, INDEX_HOURS_UTC, WEEKDAYS_INDEX)
+    if g == "STOCK" or g == "STOCKS":
+        return _in_window(now, STOCK_HOURS_UTC, WEEKDAYS_STOCK)
+    # default: treat as FX rules
+    return _in_window(now, FX_HOURS_UTC, WEEKDAYS_FX)
 
-# ===== Data sources =====
-def fetch_binance(symbol_usdt: str, interval: str, limit: int = 1000) -> pd.DataFrame | None:
-    # Public endpoint, no key.
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol_usdt}&interval={interval}&limit={limit}"
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200:
-        return None
-    arr = r.json()
-    if not isinstance(arr, list) or len(arr) == 0:
-        return None
-    # columns: open time, open, high, low, close, volume, close time, ...
-    rows = []
-    for k in arr:
-        ts = pd.to_datetime(k[0], unit="ms", utc=True)
-        rows.append({
-            "datetime": ts,
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low":  float(k[3]),
-            "close":float(k[4]),
-            "volume": float(k[5]),
-        })
-    df = pd.DataFrame(rows).set_index("datetime")
-    return df
+# ---------- data sources ----------
+def df_from_klines(rows):
+    out=[]; 
+    for k in rows:
+        ts=pd.to_datetime(k[0], unit="ms", utc=True)
+        out.append({"datetime":ts,"open":float(k[1]),"high":float(k[2]),"low":float(k[3]),"close":float(k[4]),"volume":float(k[5])})
+    return pd.DataFrame(out).set_index("datetime")
+
+def fetch_binance(host, symbol, interval, limit=1000):
+    url=f"https://{host}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    r=requests.get(url, timeout=15, headers=UA)
+    if r.status_code!=200: return None
+    arr=r.json()
+    if not isinstance(arr,list) or not arr: return None
+    return df_from_klines(arr)
+
+def fetch_coinbase(pid, gran=300, limit=300):
+    url=f"https://api.exchange.coinbase.com/products/{pid}/candles?granularity={gran}&limit={limit}"
+    r=requests.get(url, timeout=15, headers=UA)
+    if r.status_code!=200: return None
+    arr=r.json()
+    if not isinstance(arr,list) or not arr: return None
+    rows=[]
+    for t,low,high,open_,close,vol in arr:
+        ts=pd.to_datetime(t, unit="s", utc=True)
+        rows.append({"datetime":ts,"open":open_,"high":high,"low":low,"close":close,"volume":vol})
+    return pd.DataFrame(rows).set_index("datetime").sort_index()
+
+def fetch_kraken(pair, interval=5):
+    url=f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"
+    r=requests.get(url, timeout=15, headers=UA)
+    if r.status_code!=200: return None
+    js=r.json(); 
+    if "result" not in js: return None
+    key=next((k for k in js["result"].keys() if k!="last"), None)
+    if not key: return None
+    rows=[]
+    for t,o,h,l,c,vwap,vol,cnt in js["result"][key]:
+        ts=pd.to_datetime(int(t), unit="s", utc=True)
+        rows.append({"datetime":ts,"open":float(o),"high":float(h),"low":float(l),"close":float(c),"volume":float(vol)})
+    return pd.DataFrame(rows).set_index("datetime").sort_index()
+
+def fetch_crypto(yf_symbol: str, interval: str) -> pd.DataFrame | None:
+    if interval not in {"1m","5m"}: interval="5m"
+    bi_int={"1m":"1m","5m":"5m"}[interval]
+    # Binance → Coinbase → Kraken
+    if yf_symbol in BINANCE_MAP:
+        sym=BINANCE_MAP[yf_symbol]
+        for host in ("api.binance.com","data.binance.com","api1.binance.com"):
+            try:
+                df=fetch_binance(host, sym, bi_int, 1000)
+                if df is not None and len(df)>0: return df
+            except: pass
+    if yf_symbol in COINBASE_MAP:
+        pid=COINBASE_MAP[yf_symbol]; gran=60 if interval=="1m" else 300
+        try:
+            df=fetch_coinbase(pid, gran, 300)
+            if df is not None and len(df)>0: return df
+        except: pass
+    if yf_symbol in KRAKEN_MAP:
+        pair=KRAKEN_MAP[yf_symbol]; iv=1 if interval=="1m" else 5
+        try:
+            df=fetch_kraken(pair, iv)
+            if df is not None and len(df)>0: return df
+        except: pass
+    return None
 
 def fetch_yf(yf_symbol: str, interval: str, period: str) -> pd.DataFrame | None:
-    df = yf.download(yf_symbol, interval=interval, period=period, progress=False, auto_adjust=False, threads=False)
-    if df is None or df.empty:
-        return None
-    df = df.dropna().rename(columns=str.lower)
-    return df
+    df=yf.download(yf_symbol, interval=interval, period=period, progress=False, auto_adjust=False, threads=False)
+    if df is None or df.empty: return None
+    return df.dropna().rename(columns=str.lower)
 
 def robust_fetch(yf_symbol: str, group: str) -> tuple[pd.DataFrame|None, str]:
-    params = GROUP_PARAMS.get(group, {"min_rows":220, "candidates":[(INTERVAL_DEFAULT, LOOKBACK_DEFAULT)]})
-    min_rows = params["min_rows"]
-    tried = []
-    for (interval, source) in params["candidates"]:
-        for attempt in range(1, RETRIES+1):
+    tried=[]
+    if group.upper()=="CRYPTO":
+        for interval in ("5m","1m"):
             try:
-                if source == "BINANCE" and group == "CRYPTO":
-                    bsym = CRYPTO_BINANCE.get(yf_symbol)
-                    if not bsym or interval not in BINANCE_INTERVALS:
-                        raise ValueError("binance mapping/interval missing")
-                    df = fetch_binance(bsym, BINANCE_INTERVALS[interval], limit=1000)
-                else:
-                    df = fetch_yf(yf_symbol, interval=interval, period=source)
-                if df is None or df.empty:
-                    raise ValueError("empty")
-                if len(df) < min_rows:
-                    raise ValueError(f"short {len(df)} < {min_rows}")
-                df.attrs["interval"] = interval
-                df.attrs["source"]   = source
-                return df, f"{interval}/{source}"
+                df=fetch_crypto(yf_symbol, interval)
+                if df is None or df.empty: raise ValueError("empty")
+                if len(df) < (210 if interval=="1m" else 220): raise ValueError(f"short {len(df)}")
+                df.attrs["interval"]=interval; df.attrs["source"]="CRYPTO_MULTI"
+                return df, f"{interval}/CRYPTO_MULTI"
             except Exception as e:
-                tried.append(f"{interval}/{source} (try {attempt}): {e}")
-                if attempt == RETRIES: break
-                time.sleep(RETRY_SLEEP)
-    return None, "; ".join(tried)
+                tried.append(f"{interval}/CRYPTO_MULTI: {e}")
+        return None, "; ".join(tried)
+    else:
+        for (interval, period) in (("5m","15d"),):
+            try:
+                df=fetch_yf(yf_symbol, interval, period)
+                if df is None or df.empty: raise ValueError("empty")
+                if len(df) < 220: raise ValueError(f"short {len(df)}")
+                df.attrs["interval"]=interval; df.attrs["source"]="YF"
+                return df, f"{interval}/{period}"
+            except Exception as e:
+                tried.append(f"{interval}/{period}: {e}")
+        return None, "; ".join(tried)
 
-# ===== Core helpers =====
+# ---------- indicators & signal ----------
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    c = df["close"]
-    df["ema50"]  = ema(c,50); df["ema200"]=ema(c,200)
-    m,sig,_ = macd(c,12,26,9)
-    df["macd"]=m; df["macds"]=sig
+    c=df["close"]
+    df["ema50"]=ema(c,50); df["ema200"]=ema(c,200)
+    m,sg,_=macd(c,12,26,9)
+    df["macd"]=m; df["macds"]=sg
     df["rsi14"]=rsi(c,14)
     return df.dropna()
 
@@ -181,94 +215,57 @@ def append_signal(row: dict):
         if not exists: w.writeheader()
         w.writerow(row)
 
-# ===== Main =====
+# ---------- main ----------
 def main():
     t0=time.time()
-    now = datetime.now(timezone.utc)
+    now=datetime.now(timezone.utc)
+
     with open(SYMBOLS_YML,"r") as f:
-        cfg = yaml.safe_load(f)
-    symbols=[]
-    for s in cfg["symbols"]:
-        if not s.get("enabled", True): continue
-        symbols.append( (s["yf"], s["name"], str(s.get("group","FX")).upper()) )
+        cfg=yaml.safe_load(f)
+    symbols=[(s["yf"], s["name"], str(s.get("group","FX")).upper()) for s in cfg["symbols"] if s.get("enabled", True)]
 
-    lines=[f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\nInterval: {INTERVAL_DEFAULT} | Expiry: {EXPIRY_MIN}m\nSession: {SESSION_UTC} UTC, Weekdays {WEEKDAYS}\n"]
-
-    posted = 0
-    best_choice = None   # (preference_tuple, text, rowdict)
+    posted=0
+    lines=[]  # keep for debug if you want
 
     for yf_sym, pretty, group in symbols:
-        # session gate for non-crypto groups
-        if not in_session_utc(now, group):
-            lines.append(f"⚪ *{pretty}* — skipped (outside session for {group})")
-            continue
+        if not group_in_session(now, group):
+            continue  # silently skip outside regular hours
 
-        df, debug = robust_fetch(yf_sym, group)
+        df, debug=robust_fetch(yf_sym, group)
         if df is None:
-            lines.append(f"⚪ *{pretty}* — skipped (no/short data; tried {debug})")
+            continue  # silently skip if no data
+
+        df=add_indicators(df)
+        if len(df)<2:
             continue
 
-        try:
-            df = add_indicators(df)
-            if len(df) < 2:
-                lines.append(f"⚪ *{pretty}* — skipped (insufficient after indicators)")
-                continue
+        prev, cur=df.iloc[-2], df.iloc[-1]
+        px=float(cur["close"])
+        sig, score, why=classify(prev, cur)
 
-            prev, cur = df.iloc[-2], df.iloc[-1]
-            px = float(cur["close"])
-            sig, score, why = classify(prev, cur)
+        if sig and score>=MIN_SCORE:
+            arrow="🟢 BUY" if sig=="BUY" else "🔴 SELL"
+            msg=f"📡 *Pocket Option Signal* — {now:%Y-%m-%d %H:%M UTC}\n{arrow} *{pretty}* @ `{px:.5f}`\n• {why} (score {score})\nExpiry: {EXPIRY_MIN}m"
+            send_telegram(msg)
+            evaluate_at=now+timedelta(minutes=EXPIRY_MIN)
+            append_signal({
+                "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol_yf": yf_sym,
+                "symbol_pretty": pretty,
+                "signal": sig,
+                "price": f"{px:.8f}",
+                "expiry_min": EXPIRY_MIN,
+                "evaluate_at_utc": evaluate_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "open",
+                "score": score,
+                "why": why
+            })
+            posted+=1
 
-            if sig and score >= MIN_SCORE:
-                arrow = "🟢 BUY" if sig=="BUY" else "🔴 SELL"
-                msg = f"{arrow} *{pretty}* @ `{px:.5f}`\n• {why} (score {score})"
-                lines.append(msg)
-                evaluate_at = now + timedelta(minutes=EXPIRY_MIN)
-                append_signal({
-                    "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol_yf": yf_sym,
-                    "symbol_pretty": pretty,
-                    "signal": sig,
-                    "price": f"{px:.8f}",
-                    "expiry_min": EXPIRY_MIN,
-                    "evaluate_at_utc": evaluate_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    "status": "open",
-                    "score": score,
-                    "why": why
-                })
-                posted += 1
-            else:
-                lines.append(f"⚪ *{pretty}* — No setup (score {score if sig else 0})")
-                if sig:
-                    cand_row = {
-                        "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
-                        "symbol_yf": yf_sym,
-                        "symbol_pretty": pretty,
-                        "signal": sig,
-                        "price": f"{px:.8f}",
-                        "expiry_min": EXPIRY_MIN,
-                        "evaluate_at_utc": (now+timedelta(minutes=EXPIRY_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
-                        "status": "open",
-                        "score": score,
-                        "why": why
-                    }
-                    cand_text = f"🟨 *MustTrade* {sig} {pretty} @ `{px:.5f}`\n• {why} (score {score})"
-                    # prefer higher score, and prefer CRYPTO
-                    pref = ( (group=="CRYPTO"), score )
-                    if (best_choice is None) or (pref > best_choice[0]):
-                        best_choice = (pref, cand_text, cand_row)
-        except Exception as e:
-            lines.append(f"⚠️ *{pretty}* error: {e}")
-
-    # Must-trade fallback
-    if posted == 0 and MUST_TRADE and best_choice:
-        _, text, row = best_choice
-        lines.append("\n🔥 No standard setups — posting best available:\n" + text)
-        append_signal(row)
-        posted = 1
-
-    build_time = time.time() - t0
-    lines.append(f"\n⏱ Build time: `{build_time:.1f}s`")
-    send_telegram("\n\n".join(lines))
+    # If nothing posted:
+    if posted==0 and not SUPPRESS_EMPTY:
+        send_telegram(f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\n(No valid setups this run)")
+    # else: stay silent
 
 if __name__ == "__main__":
     main()
