@@ -2,8 +2,8 @@ import os, time, csv
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 import yaml
 import requests
@@ -11,7 +11,7 @@ import requests
 # ===== Config (env-overridable) =====
 INTERVAL   = os.getenv("INTERVAL", "5m")          # candle size
 LOOKBACK   = os.getenv("LOOKBACK", "5d")          # bars to fetch
-EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))   # option expiry
+EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))   # option expiry (minutes)
 RSI_BUY    = int(os.getenv("RSI_BUY", "30"))
 RSI_SELL   = int(os.getenv("RSI_SELL", "70"))
 MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))     # filter weak confluence
@@ -23,6 +23,27 @@ SYMBOLS_YML = Path("symbols.yaml")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # e.g. @YourChannelUsername
 
+# --------- Indicators (no pandas_ta) ---------
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+# ----------------------------------------------
 def load_symbols():
     with open(SYMBOLS_YML, "r") as f:
         cfg = yaml.safe_load(f)
@@ -37,12 +58,13 @@ def fetch_df(yf_symbol: str) -> pd.DataFrame:
     return df
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df["ema50"]  = ta.ema(df["close"], length=50)
-    df["ema200"] = ta.ema(df["close"], length=200)
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    df["macd"]  = macd["MACD_12_26_9"]
-    df["macds"] = macd["MACDs_12_26_9"]
-    df["rsi14"] = ta.rsi(df["close"], length=14)
+    close = df["close"]
+    df["ema50"]  = ema(close, 50)
+    df["ema200"] = ema(close, 200)
+    macd_line, signal_line, _ = macd(close, 12, 26, 9)
+    df["macd"]  = macd_line
+    df["macds"] = signal_line
+    df["rsi14"] = rsi(close, 14)
     return df.dropna()
 
 def confluence(prev, cur):

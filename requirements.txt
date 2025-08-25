@@ -1,5 +1,5 @@
-yfinance
-pandas
-pandas_ta
-pyyaml
-requests
+numpy==1.26.4
+pandas==2.2.2
+yfinance==0.2.52
+pyyaml==6.0.2
+requests==2.32.3
