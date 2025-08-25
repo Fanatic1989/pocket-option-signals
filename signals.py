@@ -1,4 +1,4 @@
-import os, time, csv
+import os, time, csv, json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -15,7 +15,7 @@ EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))
 RSI_BUY    = int(os.getenv("RSI_BUY", "30"))
 RSI_SELL   = int(os.getenv("RSI_SELL", "70"))
 MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))
-MUST_TRADE = int(os.getenv("MUST_TRADE", "1"))  # force at least one trade
+MUST_TRADE = int(os.getenv("MUST_TRADE", "1"))  # post at least one pick if possible
 SESSION_UTC = os.getenv("SESSION_UTC", "0700-1700")
 WEEKDAYS    = os.getenv("WEEKDAYS", "12345")
 GATED_GROUPS = set(os.getenv("GATED_GROUPS", "FX,COMMODITY,INDEX").split(","))
@@ -25,12 +25,12 @@ GROUP_PARAMS = {
     "FX":        {"min_rows": 220, "candidates": [("5m","15d")]},
     "COMMODITY": {"min_rows": 220, "candidates": [("5m","15d")]},
     "INDEX":     {"min_rows": 220, "candidates": [("5m","15d")]},
-    # Crypto gets robust fallbacks
-    "CRYPTO":    {"min_rows": 210, "candidates": [("5m","15d"), ("1m","7d")]},
+    # Crypto: prefer Binance (1000 candles). yfinance as a last resort.
+    "CRYPTO":    {"min_rows": 210, "candidates": [("5m","BINANCE"), ("1m","BINANCE"), ("5m","15d"), ("1m","7d")]},
 }
 
-RETRIES     = 3
-RETRY_SLEEP = 1.5
+RETRIES     = 2
+RETRY_SLEEP = 1.0
 
 DATA_DIR    = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_CSV = DATA_DIR / "signals.csv"
@@ -38,6 +38,14 @@ SYMBOLS_YML = Path("symbols.yaml")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+# ===== Binance map for crypto =====
+CRYPTO_BINANCE = {
+    "BTC-USD": "BTCUSDT",
+    "ETH-USD": "ETHUSDT",
+}
+
+BINANCE_INTERVALS = {"1m":"1m","5m":"5m"}
 
 # ===== Indicators =====
 def ema(s: pd.Series, length:int) -> pd.Series:
@@ -70,39 +78,66 @@ def in_session_utc(now: datetime, group: str) -> bool:
     hhmm = now.hour*100 + now.minute
     return start <= hhmm <= end
 
-# ===== Data + symbols =====
-def load_symbols():
-    with open(SYMBOLS_YML,"r") as f:
-        cfg = yaml.safe_load(f)
-    syms=[]
-    for s in cfg["symbols"]:
-        if not s.get("enabled", True): continue
-        syms.append( (s["yf"], s["name"], str(s.get("group","FX")).upper()) )
-    if not syms: raise SystemExit("No enabled symbols in symbols.yaml")
-    return syms
+# ===== Data sources =====
+def fetch_binance(symbol_usdt: str, interval: str, limit: int = 1000) -> pd.DataFrame | None:
+    # Public endpoint, no key.
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol_usdt}&interval={interval}&limit={limit}"
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200:
+        return None
+    arr = r.json()
+    if not isinstance(arr, list) or len(arr) == 0:
+        return None
+    # columns: open time, open, high, low, close, volume, close time, ...
+    rows = []
+    for k in arr:
+        ts = pd.to_datetime(k[0], unit="ms", utc=True)
+        rows.append({
+            "datetime": ts,
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low":  float(k[3]),
+            "close":float(k[4]),
+            "volume": float(k[5]),
+        })
+    df = pd.DataFrame(rows).set_index("datetime")
+    return df
 
-def fetch_df(yf_symbol: str, group: str) -> tuple[pd.DataFrame|None, str]:
+def fetch_yf(yf_symbol: str, interval: str, period: str) -> pd.DataFrame | None:
+    df = yf.download(yf_symbol, interval=interval, period=period, progress=False, auto_adjust=False, threads=False)
+    if df is None or df.empty:
+        return None
+    df = df.dropna().rename(columns=str.lower)
+    return df
+
+def robust_fetch(yf_symbol: str, group: str) -> tuple[pd.DataFrame|None, str]:
     params = GROUP_PARAMS.get(group, {"min_rows":220, "candidates":[(INTERVAL_DEFAULT, LOOKBACK_DEFAULT)]})
     min_rows = params["min_rows"]
     tried = []
-    for (interval, period) in params["candidates"]:
+    for (interval, source) in params["candidates"]:
         for attempt in range(1, RETRIES+1):
             try:
-                df = yf.download(yf_symbol, interval=interval, period=period, progress=False, auto_adjust=False, threads=False)
+                if source == "BINANCE" and group == "CRYPTO":
+                    bsym = CRYPTO_BINANCE.get(yf_symbol)
+                    if not bsym or interval not in BINANCE_INTERVALS:
+                        raise ValueError("binance mapping/interval missing")
+                    df = fetch_binance(bsym, BINANCE_INTERVALS[interval], limit=1000)
+                else:
+                    df = fetch_yf(yf_symbol, interval=interval, period=source)
                 if df is None or df.empty:
                     raise ValueError("empty")
-                df = df.dropna().rename(columns=str.lower)
                 if len(df) < min_rows:
                     raise ValueError(f"short {len(df)} < {min_rows}")
                 df.attrs["interval"] = interval
-                df.attrs["period"]   = period
-                return df, f"{interval}/{period}"
+                df.attrs["source"]   = source
+                return df, f"{interval}/{source}"
             except Exception as e:
-                tried.append(f"{interval}/{period} (try {attempt}): {e}")
+                tried.append(f"{interval}/{source} (try {attempt}): {e}")
                 if attempt == RETRIES: break
                 time.sleep(RETRY_SLEEP)
     return None, "; ".join(tried)
 
+# ===== Core helpers =====
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     c = df["close"]
     df["ema50"]  = ema(c,50); df["ema200"]=ema(c,200)
@@ -146,23 +181,29 @@ def append_signal(row: dict):
         if not exists: w.writeheader()
         w.writerow(row)
 
+# ===== Main =====
 def main():
     t0=time.time()
     now = datetime.now(timezone.utc)
-    symbols = load_symbols()
+    with open(SYMBOLS_YML,"r") as f:
+        cfg = yaml.safe_load(f)
+    symbols=[]
+    for s in cfg["symbols"]:
+        if not s.get("enabled", True): continue
+        symbols.append( (s["yf"], s["name"], str(s.get("group","FX")).upper()) )
 
     lines=[f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\nInterval: {INTERVAL_DEFAULT} | Expiry: {EXPIRY_MIN}m\nSession: {SESSION_UTC} UTC, Weekdays {WEEKDAYS}\n"]
 
     posted = 0
-    best_choice = None   # (score, text, rowdict)
+    best_choice = None   # (preference_tuple, text, rowdict)
 
     for yf_sym, pretty, group in symbols:
-        # session gate (crypto exempt unless added to GATED_GROUPS)
+        # session gate for non-crypto groups
         if not in_session_utc(now, group):
             lines.append(f"⚪ *{pretty}* — skipped (outside session for {group})")
             continue
 
-        df, debug = fetch_df(yf_sym, group)
+        df, debug = robust_fetch(yf_sym, group)
         if df is None:
             lines.append(f"⚪ *{pretty}* — skipped (no/short data; tried {debug})")
             continue
@@ -197,7 +238,6 @@ def main():
                 posted += 1
             else:
                 lines.append(f"⚪ *{pretty}* — No setup (score {score if sig else 0})")
-                # keep candidate for must-trade (prefer crypto)
                 if sig:
                     cand_row = {
                         "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -219,7 +259,7 @@ def main():
         except Exception as e:
             lines.append(f"⚠️ *{pretty}* error: {e}")
 
-    # Must-trade fallback (post exactly one)
+    # Must-trade fallback
     if posted == 0 and MUST_TRADE and best_choice:
         _, text, row = best_choice
         lines.append("\n🔥 No standard setups — posting best available:\n" + text)
