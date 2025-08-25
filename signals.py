@@ -9,161 +9,162 @@ import yaml
 import requests
 
 # ===== Config (env-overridable) =====
-INTERVAL   = os.getenv("INTERVAL", "5m")            # candle size
-LOOKBACK   = os.getenv("LOOKBACK", "15d")           # safer lookback for 5m
-EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))     # option expiry (minutes)
+INTERVAL_DEFAULT = os.getenv("INTERVAL", "5m")
+LOOKBACK_DEFAULT = os.getenv("LOOKBACK", "15d")
+EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))
 RSI_BUY    = int(os.getenv("RSI_BUY", "30"))
 RSI_SELL   = int(os.getenv("RSI_SELL", "70"))
-MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))       # filter weak confluence
-MIN_ROWS   = 220                                     # EMA200 + buffer
-RETRIES    = 3
-RETRY_SLEEP= 2.0
-
-# ===== Session filter (to avoid OTC) =====
-# Format "HHMM-HHMM" in UTC, weekdays "12345" = Mon–Fri
+MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))
+MUST_TRADE = int(os.getenv("MUST_TRADE", "1"))  # force at least one trade
 SESSION_UTC = os.getenv("SESSION_UTC", "0700-1700")
-WEEKDAYS    = os.getenv("WEEKDAYS", "12345")        # Mon=1 ... Sun=7
-# Groups that must follow session gate (CRYPTO runs 24/7 by default)
+WEEKDAYS    = os.getenv("WEEKDAYS", "12345")
 GATED_GROUPS = set(os.getenv("GATED_GROUPS", "FX,COMMODITY,INDEX").split(","))
+
+# Group-specific fetch parameters
+GROUP_PARAMS = {
+    "FX":        {"min_rows": 220, "candidates": [("5m","15d")]},
+    "COMMODITY": {"min_rows": 220, "candidates": [("5m","15d")]},
+    "INDEX":     {"min_rows": 220, "candidates": [("5m","15d")]},
+    # Crypto gets robust fallbacks
+    "CRYPTO":    {"min_rows": 210, "candidates": [("5m","15d"), ("1m","7d")]},
+}
+
+RETRIES     = 3
+RETRY_SLEEP = 1.5
 
 DATA_DIR    = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_CSV = DATA_DIR / "signals.csv"
 SYMBOLS_YML = Path("symbols.yaml")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # e.g. @YourChannelUsername
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-# --------- Indicators (no pandas_ta) ---------
-def ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False).mean()
+# ===== Indicators =====
+def ema(s: pd.Series, length:int) -> pd.Series:
+    return s.ewm(span=length, adjust=False).mean()
 
-def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean().replace(0, np.nan)
-    rs = avg_gain / avg_loss
-    return (100 - (100 / (1 + rs))).fillna(50)
+def rsi(s: pd.Series, length:int=14) -> pd.Series:
+    d = s.diff()
+    up = d.clip(lower=0); dn = -d.clip(upper=0)
+    avg_up = up.ewm(alpha=1/length, adjust=False).mean()
+    avg_dn = dn.ewm(alpha=1/length, adjust=False).mean().replace(0,np.nan)
+    rs = avg_up / avg_dn
+    return (100 - 100/(1+rs)).fillna(50)
 
-def macd(series: pd.Series, fast=12, slow=26, signal=9):
-    macd_line = ema(series, fast) - ema(series, slow)
-    signal_line = ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+def macd(s: pd.Series, fast=12, slow=26, signal=9):
+    m = ema(s, fast) - ema(s, slow)
+    sig = ema(m, signal)
+    return m, sig, m - sig
 
-# --------- Session gate helpers ---------
+# ===== Session gate =====
 def _parse_session(s: str):
     try:
-        a, b = s.split("-")
-        return int(a), int(b)  # HHMM ints
-    except Exception:
-        return 0, 2359
+        a,b = s.split("-"); return int(a), int(b)
+    except: return 0, 2359
 
 def in_session_utc(now: datetime, group: str) -> bool:
-    # Crypto always allowed unless you explicitly add it to GATED_GROUPS
     if group.upper() not in GATED_GROUPS:
         return True
-    wd = str((now.isoweekday()))  # 1..7
-    if wd not in set(WEEKDAYS):
-        return False
+    if str(now.isoweekday()) not in set(WEEKDAYS):  return False
     start, end = _parse_session(SESSION_UTC)
     hhmm = now.hour*100 + now.minute
     return start <= hhmm <= end
 
-# ----------------------------------------------
+# ===== Data + symbols =====
 def load_symbols():
-    with open(SYMBOLS_YML, "r") as f:
+    with open(SYMBOLS_YML,"r") as f:
         cfg = yaml.safe_load(f)
-    syms = [(s["yf"], s["name"], str(s.get("group","FX")).upper()) for s in cfg["symbols"] if s.get("enabled", True)]
-    if not syms:
-        raise SystemExit("No enabled symbols in symbols.yaml")
+    syms=[]
+    for s in cfg["symbols"]:
+        if not s.get("enabled", True): continue
+        syms.append( (s["yf"], s["name"], str(s.get("group","FX")).upper()) )
+    if not syms: raise SystemExit("No enabled symbols in symbols.yaml")
     return syms
 
-def fetch_df(yf_symbol: str) -> pd.DataFrame | None:
-    for attempt in range(1, RETRIES + 1):
-        try:
-            df = yf.download(
-                tickers=yf_symbol,
-                interval=INTERVAL,
-                period=LOOKBACK,
-                progress=False,
-                auto_adjust=False,
-                threads=False,
-            )
-            if df is None or df.empty:
-                raise ValueError("empty dataframe")
-            df = df.dropna().rename(columns=str.lower)
-            if len(df) < MIN_ROWS:
-                raise ValueError(f"too few rows ({len(df)})")
-            return df
-        except Exception:
-            if attempt == RETRIES:
-                return None
-            time.sleep(RETRY_SLEEP)
-    return None
+def fetch_df(yf_symbol: str, group: str) -> tuple[pd.DataFrame|None, str]:
+    params = GROUP_PARAMS.get(group, {"min_rows":220, "candidates":[(INTERVAL_DEFAULT, LOOKBACK_DEFAULT)]})
+    min_rows = params["min_rows"]
+    tried = []
+    for (interval, period) in params["candidates"]:
+        for attempt in range(1, RETRIES+1):
+            try:
+                df = yf.download(yf_symbol, interval=interval, period=period, progress=False, auto_adjust=False, threads=False)
+                if df is None or df.empty:
+                    raise ValueError("empty")
+                df = df.dropna().rename(columns=str.lower)
+                if len(df) < min_rows:
+                    raise ValueError(f"short {len(df)} < {min_rows}")
+                df.attrs["interval"] = interval
+                df.attrs["period"]   = period
+                return df, f"{interval}/{period}"
+            except Exception as e:
+                tried.append(f"{interval}/{period} (try {attempt}): {e}")
+                if attempt == RETRIES: break
+                time.sleep(RETRY_SLEEP)
+    return None, "; ".join(tried)
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    close = df["close"]
-    df["ema50"]  = ema(close, 50)
-    df["ema200"] = ema(close, 200)
-    macd_line, signal_line, _ = macd(close, 12, 26, 9)
-    df["macd"]  = macd_line
-    df["macds"] = signal_line
-    df["rsi14"] = rsi(close, 14)
+    c = df["close"]
+    df["ema50"]  = ema(c,50); df["ema200"]=ema(c,200)
+    m,sig,_ = macd(c,12,26,9)
+    df["macd"]=m; df["macds"]=sig
+    df["rsi14"]=rsi(c,14)
     return df.dropna()
 
 def confluence(prev, cur):
-    score=0; reasons=[]
-    uptrend = cur["ema50"] > cur["ema200"]
-    reasons.append("EMA50>EMA200" if uptrend else "EMA50<EMA200")
-    macd_up   = (prev["macd"] <= prev["macds"]) and (cur["macd"] > cur["macds"])
-    macd_down = (prev["macd"] >= prev["macds"]) and (cur["macd"] < cur["macds"])
-    if macd_up:   reasons.append("MACD↑"); score+=1
-    if macd_down: reasons.append("MACD↓"); score+=1
-    if cur["rsi14"] <= RSI_BUY:  reasons.append(f"RSI≤{RSI_BUY}");  score+=1
-    if cur["rsi14"] >= RSI_SELL: reasons.append(f"RSI≥{RSI_SELL}"); score+=1
-    return score, ", ".join(reasons), uptrend, macd_up, macd_down
+    score=0; why=[]
+    up  = cur["ema50"]>cur["ema200"]; why.append("EMA50>EMA200" if up else "EMA50<EMA200")
+    upX = (prev["macd"]<=prev["macds"]) and (cur["macd"]>cur["macds"])
+    dnX = (prev["macd"]>=prev["macds"]) and (cur["macd"]<cur["macds"])
+    if upX: why.append("MACD↑"); score+=1
+    if dnX: why.append("MACD↓"); score+=1
+    if cur["rsi14"]<=RSI_BUY:  why.append(f"RSI≤{RSI_BUY}");  score+=1
+    if cur["rsi14"]>=RSI_SELL: why.append(f"RSI≥{RSI_SELL}"); score+=1
+    return score, ", ".join(why), up, upX, dnX
 
 def classify(prev, cur):
-    score, why, up, m_up, m_down = confluence(prev, cur)
-    signal=None
-    if up and m_up: signal="BUY"
-    if (not up) and m_down: signal="SELL"
-    if signal is None:
-        if cur["rsi14"] <= RSI_BUY: signal="BUY"
-        elif cur["rsi14"] >= RSI_SELL: signal="SELL"
-    return signal, score, why
+    score, why, up, upX, dnX = confluence(prev, cur)
+    sig=None
+    if up and upX: sig="BUY"
+    if (not up) and dnX: sig="SELL"
+    if sig is None:
+        if cur["rsi14"]<=RSI_BUY: sig="BUY"
+        elif cur["rsi14"]>=RSI_SELL: sig="SELL"
+    return sig, score, why
 
 def send_telegram(text: str):
     if not BOT_TOKEN or not CHAT_ID: return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode":"Markdown"}, timeout=30)
+    url=f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    r=requests.post(url, data={"chat_id":CHAT_ID,"text":text,"parse_mode":"Markdown"}, timeout=30)
     r.raise_for_status()
 
 def append_signal(row: dict):
-    header = ["ts_utc","symbol_yf","symbol_pretty","signal","price","expiry_min","evaluate_at_utc","status","score","why"]
-    exists = SIGNALS_CSV.exists()
-    with open(SIGNALS_CSV, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
+    header=["ts_utc","symbol_yf","symbol_pretty","signal","price","expiry_min","evaluate_at_utc","status","score","why"]
+    exists=SIGNALS_CSV.exists()
+    with open(SIGNALS_CSV,"a",newline="") as f:
+        w=csv.DictWriter(f, fieldnames=header)
         if not exists: w.writeheader()
         w.writerow(row)
 
 def main():
-    t0 = time.time()
+    t0=time.time()
     now = datetime.now(timezone.utc)
+    symbols = load_symbols()
 
-    enabled = load_symbols()
-    lines = [f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\nInterval: {INTERVAL} | Expiry: {EXPIRY_MIN}m\nSession: {SESSION_UTC} UTC, Weekdays {WEEKDAYS}\n"]
+    lines=[f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\nInterval: {INTERVAL_DEFAULT} | Expiry: {EXPIRY_MIN}m\nSession: {SESSION_UTC} UTC, Weekdays {WEEKDAYS}\n"]
 
-    for yf_sym, pretty, group in enabled:
+    posted = 0
+    best_choice = None   # (score, text, rowdict)
+
+    for yf_sym, pretty, group in symbols:
+        # session gate (crypto exempt unless added to GATED_GROUPS)
         if not in_session_utc(now, group):
             lines.append(f"⚪ *{pretty}* — skipped (outside session for {group})")
             continue
 
-        df = fetch_df(yf_sym)
-        if df is None or len(df) < MIN_ROWS:
-            lines.append(f"⚪ *{pretty}* — skipped (no/short data)")
+        df, debug = fetch_df(yf_sym, group)
+        if df is None:
+            lines.append(f"⚪ *{pretty}* — skipped (no/short data; tried {debug})")
             continue
 
         try:
@@ -171,13 +172,15 @@ def main():
             if len(df) < 2:
                 lines.append(f"⚪ *{pretty}* — skipped (insufficient after indicators)")
                 continue
+
             prev, cur = df.iloc[-2], df.iloc[-1]
             px = float(cur["close"])
             sig, score, why = classify(prev, cur)
 
             if sig and score >= MIN_SCORE:
                 arrow = "🟢 BUY" if sig=="BUY" else "🔴 SELL"
-                lines.append(f"{arrow} *{pretty}* @ `{px:.5f}`\n• {why} (score {score})")
+                msg = f"{arrow} *{pretty}* @ `{px:.5f}`\n• {why} (score {score})"
+                lines.append(msg)
                 evaluate_at = now + timedelta(minutes=EXPIRY_MIN)
                 append_signal({
                     "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -191,10 +194,37 @@ def main():
                     "score": score,
                     "why": why
                 })
+                posted += 1
             else:
                 lines.append(f"⚪ *{pretty}* — No setup (score {score if sig else 0})")
+                # keep candidate for must-trade (prefer crypto)
+                if sig:
+                    cand_row = {
+                        "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "symbol_yf": yf_sym,
+                        "symbol_pretty": pretty,
+                        "signal": sig,
+                        "price": f"{px:.8f}",
+                        "expiry_min": EXPIRY_MIN,
+                        "evaluate_at_utc": (now+timedelta(minutes=EXPIRY_MIN)).strftime("%Y-%m-%d %H:%M:%S"),
+                        "status": "open",
+                        "score": score,
+                        "why": why
+                    }
+                    cand_text = f"🟨 *MustTrade* {sig} {pretty} @ `{px:.5f}`\n• {why} (score {score})"
+                    # prefer higher score, and prefer CRYPTO
+                    pref = ( (group=="CRYPTO"), score )
+                    if (best_choice is None) or (pref > best_choice[0]):
+                        best_choice = (pref, cand_text, cand_row)
         except Exception as e:
             lines.append(f"⚠️ *{pretty}* error: {e}")
+
+    # Must-trade fallback (post exactly one)
+    if posted == 0 and MUST_TRADE and best_choice:
+        _, text, row = best_choice
+        lines.append("\n🔥 No standard setups — posting best available:\n" + text)
+        append_signal(row)
+        posted = 1
 
     build_time = time.time() - t0
     lines.append(f"\n⏱ Build time: `{build_time:.1f}s`")
