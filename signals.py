@@ -9,15 +9,22 @@ import yaml
 import requests
 
 # ===== Config (env-overridable) =====
-INTERVAL   = os.getenv("INTERVAL", "5m")           # candle size
-LOOKBACK   = os.getenv("LOOKBACK", "15d")          # safer lookback for 5m
-EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))    # option expiry (minutes)
+INTERVAL   = os.getenv("INTERVAL", "5m")            # candle size
+LOOKBACK   = os.getenv("LOOKBACK", "15d")           # safer lookback for 5m
+EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))     # option expiry (minutes)
 RSI_BUY    = int(os.getenv("RSI_BUY", "30"))
 RSI_SELL   = int(os.getenv("RSI_SELL", "70"))
-MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))      # filter weak confluence
-MIN_ROWS   = 220                                   # need at least this many rows (EMA200 + buffer)
+MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))       # filter weak confluence
+MIN_ROWS   = 220                                     # EMA200 + buffer
 RETRIES    = 3
 RETRY_SLEEP= 2.0
+
+# ===== Session filter (to avoid OTC) =====
+# Format "HHMM-HHMM" in UTC, weekdays "12345" = Mon–Fri
+SESSION_UTC = os.getenv("SESSION_UTC", "0700-1700")
+WEEKDAYS    = os.getenv("WEEKDAYS", "12345")        # Mon=1 ... Sun=7
+# Groups that must follow session gate (CRYPTO runs 24/7 by default)
+GATED_GROUPS = set(os.getenv("GATED_GROUPS", "FX,COMMODITY,INDEX").split(","))
 
 DATA_DIR    = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_CSV = DATA_DIR / "signals.csv"
@@ -45,27 +52,41 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
+# --------- Session gate helpers ---------
+def _parse_session(s: str):
+    try:
+        a, b = s.split("-")
+        return int(a), int(b)  # HHMM ints
+    except Exception:
+        return 0, 2359
+
+def in_session_utc(now: datetime, group: str) -> bool:
+    # Crypto always allowed unless you explicitly add it to GATED_GROUPS
+    if group.upper() not in GATED_GROUPS:
+        return True
+    wd = str((now.isoweekday()))  # 1..7
+    if wd not in set(WEEKDAYS):
+        return False
+    start, end = _parse_session(SESSION_UTC)
+    hhmm = now.hour*100 + now.minute
+    return start <= hhmm <= end
+
 # ----------------------------------------------
 def load_symbols():
     with open(SYMBOLS_YML, "r") as f:
         cfg = yaml.safe_load(f)
-    syms = [(s["yf"], s["name"]) for s in cfg["symbols"] if s.get("enabled", True)]
+    syms = [(s["yf"], s["name"], str(s.get("group","FX")).upper()) for s in cfg["symbols"] if s.get("enabled", True)]
     if not syms:
         raise SystemExit("No enabled symbols in symbols.yaml")
     return syms
 
 def fetch_df(yf_symbol: str) -> pd.DataFrame | None:
-    """
-    Robust fetch with retries. Returns None if empty/too short.
-    """
-    # For 5m, yfinance supports up to ~60d, but some FX/commodities can be flaky.
-    period = LOOKBACK
     for attempt in range(1, RETRIES + 1):
         try:
             df = yf.download(
                 tickers=yf_symbol,
                 interval=INTERVAL,
-                period=period,
+                period=LOOKBACK,
                 progress=False,
                 auto_adjust=False,
                 threads=False,
@@ -131,14 +152,20 @@ def append_signal(row: dict):
 def main():
     t0 = time.time()
     now = datetime.now(timezone.utc)
-    enabled = load_symbols()
 
-    lines = [f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\nInterval: {INTERVAL} | Expiry: {EXPIRY_MIN}m\n"]
-    for yf_sym, pretty in enabled:
+    enabled = load_symbols()
+    lines = [f"📡 *Pocket Option Signals* — {now:%Y-%m-%d %H:%M UTC}\nInterval: {INTERVAL} | Expiry: {EXPIRY_MIN}m\nSession: {SESSION_UTC} UTC, Weekdays {WEEKDAYS}\n"]
+
+    for yf_sym, pretty, group in enabled:
+        if not in_session_utc(now, group):
+            lines.append(f"⚪ *{pretty}* — skipped (outside session for {group})")
+            continue
+
         df = fetch_df(yf_sym)
         if df is None or len(df) < MIN_ROWS:
             lines.append(f"⚪ *{pretty}* — skipped (no/short data)")
             continue
+
         try:
             df = add_indicators(df)
             if len(df) < 2:
