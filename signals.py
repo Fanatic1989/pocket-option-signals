@@ -7,6 +7,8 @@ import pandas as pd
 import yfinance as yf
 import yaml
 import requests
+import urllib.parse
+
 
 # ===== Config (env-overridable) =====
 INTERVAL_DEFAULT = os.getenv("INTERVAL", "5m")
@@ -36,6 +38,22 @@ SYMBOLS_YML = Path("symbols.yaml")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+
+COUNTDOWN_BASE = os.getenv("COUNTDOWN_BASE")  # e.g. https://Fanatic1989.github.io/pocket-option-signals
+
+def build_countdown_url(pair: str, expiry_dt, start_dt, bar_label: str):
+    if not COUNTDOWN_BASE:
+        return None
+    try:
+        exp = int(expiry_dt.timestamp()); start = int(start_dt.timestamp())
+    except Exception:
+        return None
+    q = {
+        "pair": pair, "expiry": str(exp), "start": str(start)
+    }
+    if bar_label: q["bar"] = bar_label
+    return f"{COUNTDOWN_BASE.rstrip('/')}/countdown.html?"+urllib.parse.urlencode(q)
+
 # ---- load adaptive tuning if present ----
 try:
     import json

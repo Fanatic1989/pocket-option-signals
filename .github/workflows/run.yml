@@ -26,6 +26,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          COUNTDOWN_BASE: https://Fanatic1989.github.io/pocket-option-signals
           # Regular hours (UTC) – no OTC
           FX_HOURS_UTC:        "0000-2100"
           COMMODITY_HOURS_UTC: "0000-2100"
