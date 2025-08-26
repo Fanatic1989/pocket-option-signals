@@ -1,0 +1,10 @@
+name: keepalive
+on:
+  schedule:
+    - cron: '0 12 * * 1'  # every Monday 12:00 UTC
+  workflow_dispatch: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Keeping repo active $(date -u)"

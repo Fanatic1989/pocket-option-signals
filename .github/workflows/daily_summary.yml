@@ -1,0 +1,44 @@
+name: daily-summary
+
+on:
+  schedule:
+    - cron: '5 21 * * *'   # 21:05 UTC
+  workflow_dispatch: {}
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests
+      - name: Post CSV summary
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TELEGRAM_DEBUG_CHAT }}
+        run: |
+          python - <<'PY'
+import os, pandas as pd
+from pathlib import Path
+csv = Path("data/signals.csv")
+if not csv.exists():
+    print("no csv yet"); raise SystemExit(0)
+df = pd.read_csv(csv)
+if df.empty:
+    print("empty csv"); raise SystemExit(0)
+df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
+df = df.dropna(subset=["ts_utc"])
+today = pd.Timestamp.utcnow().date()
+d = df[df["ts_utc"].dt.date == today]
+t=len(d)
+pairs = ", ".join(sorted(set(d["pair"]))) if t else "—"
+msg = f"📊 OANDA bot daily — {today} UTC\nRows logged: {t}\nPairs today: {pairs}"
+tok, chat = os.getenv("TG_TOKEN"), os.getenv("TG_CHAT")
+if tok and chat:
+    import requests
+    requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                  data={"chat_id": chat, "text": msg})
+print(msg)
+PY
