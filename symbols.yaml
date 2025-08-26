@@ -67,6 +67,10 @@ symbols:
   name: CHF/JPY
   group: FX
   enabled: true
+- yf: COMAPP=X
+  name: COM/APP
+  group: FX
+  enabled: true
 - yf: COMBLO=X
   name: COM/BLO
   group: FX
