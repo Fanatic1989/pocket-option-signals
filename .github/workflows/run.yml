@@ -2,13 +2,11 @@ name: signals
 
 on:
   schedule:
-    - cron: "*/5 * * * *"      # generate signals every 5m
-    - cron: "*/5 * * * *"      # evaluate outcomes every 5m
-    - cron: "59 23 * * *"      # daily summary 23:59 UTC
+    - cron: "*/5 * * * *"      # run every 5m (UTC)
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # allow committing CSV updates
+  contents: write
 
 jobs:
   generate:
@@ -23,6 +21,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Regular hours (UTC) – no OTC
           FX_HOURS_UTC:        "0000-2100"
           COMMODITY_HOURS_UTC: "0000-2100"
           INDEX_HOURS_UTC:     "1330-2000"
@@ -31,23 +30,11 @@ jobs:
           WEEKDAYS_COMMODITY:  "12345"
           WEEKDAYS_INDEX:      "12345"
           WEEKDAYS_STOCK:      "12345"
+          # Behavior
           MIN_SCORE:           "2"
-          MUST_TRADE:          "0"
-          SUPPRESS_EMPTY:      "1"
+          MUST_TRADE:          "0"        # strict: only post real setups
+          SUPPRESS_EMPTY:      "1"        # stay silent when nothing to trade
         run: python signals.py
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # INTERVAL: "5m"
-          # EXPIRY_MIN: "10"
-          # MIN_SCORE: "2"
-      - name: Commit signal log
-        run: |
-          git config user.email "bot@users.noreply.github.com"
-          git config user.name "signals-bot"
-          git add data/signals.csv || true
-          git commit -m "update signals $(date -u +'%F %T')" || echo "no changes"
-          git push
 
   evaluate:
     runs-on: ubuntu-latest
@@ -63,41 +50,7 @@ jobs:
       - name: Commit performance updates
         run: |
           git config user.email "bot@users.noreply.github.com"
-          git config user.name "signals-bot"
+          git config user.name  "signals-bot"
           git add data/*.csv || true
           git commit -m "evaluate outcomes $(date -u +'%F %T')" || echo "no changes"
-          git push
-
-  daily_summary:
-    runs-on: ubuntu-latest
-    if: github.event.schedule == '59 23 * * *'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - name: Post daily accuracy to Telegram
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python - <<'PY'
-          import os, csv, requests
-          from pathlib import Path
-          PERF = Path("data/perf.csv")
-          if not PERF.exists(): raise SystemExit(0)
-          rows = list(csv.DictReader(open(PERF)))
-          if not rows: raise SystemExit(0)
-          last = rows[-1]
-          text = (
-            "📊 *Pocket Option Signals — Daily Summary*\n"
-            f"Total trades: {last['count_total']}\n"
-            f"Accuracy 1d: {last['acc_1d']}%\n"
-            f"Accuracy 7d: {last['acc_7d']}%\n"
-            f"Wins: {last['wins']} | Losses: {last['losses']}"
-          )
-          url=f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
-          r = requests.post(url, data={"chat_id": os.environ['TELEGRAM_CHAT_ID'], "text": text, "parse_mode":"Markdown"})
-          r.raise_for_status()
-          PY
+          git push || true
