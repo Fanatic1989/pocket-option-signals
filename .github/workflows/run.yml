@@ -20,6 +20,8 @@ jobs:
       - name: Run self-tuner
         run: python tuner.py
 
+      - name: Run self-tuner
+        run: python tuner.py
       - name: Run signals
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

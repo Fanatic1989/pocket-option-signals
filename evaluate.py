@@ -45,6 +45,10 @@ def evaluate_due(rows):
             if abs(result_px-entry_px)<=eps:
                 win=None  # DRAW
             else:
+                eps = 1e-8
+            if abs(result_px-entry_px)<=eps:
+                win=None  # DRAW
+            else:
                 win = (result_px > entry_px) if side == "BUY" else (result_px < entry_px)
             r["result_price"] = f"{result_px:.8f}"
             r["outcome"] = "DRAW" if win is None else ("WIN" if win else "LOSS")
