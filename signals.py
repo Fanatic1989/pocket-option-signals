@@ -36,6 +36,16 @@ SYMBOLS_YML = Path("symbols.yaml")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+# ---- load adaptive tuning if present ----
+try:
+    import json
+    _tj = json.load(open("tuning.json"))
+    RSI_BUY  = int(_tj.get("RSI_BUY", RSI_BUY))
+    RSI_SELL = int(_tj.get("RSI_SELL", RSI_SELL))
+    MIN_SCORE= int(_tj.get("MIN_SCORE", MIN_SCORE))
+except Exception:
+    pass
+
 
 UA = {"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome Safari"}
 

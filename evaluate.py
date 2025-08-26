@@ -41,9 +41,13 @@ def evaluate_due(rows):
                 result_px = float(later["Close"].iloc[0])
             entry_px = float(r["price"])
             side = r["signal"]
-            win = (result_px > entry_px) if side == "BUY" else (result_px < entry_px)
+            eps=1e-8
+            if abs(result_px-entry_px)<=eps:
+                win=None  # DRAW
+            else:
+                win = (result_px > entry_px) if side == "BUY" else (result_px < entry_px)
             r["result_price"] = f"{result_px:.8f}"
-            r["outcome"] = "WIN" if win else "LOSS"
+            r["outcome"] = "DRAW" if win is None else ("WIN" if win else "LOSS")
             r["status"] = "closed"
             changed = True
     return changed
