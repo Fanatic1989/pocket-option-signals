@@ -2,7 +2,7 @@ name: session-summary
 
 on:
   schedule:
-    - cron: "5 21 * * 1-5"   # 21:05 UTC Mon–Fri (end of FX window)
+    - cron: "5 21 * * 1-5"   # 21:05 UTC Mon–Fri
   workflow_dispatch: {}
 
 permissions:
@@ -25,12 +25,10 @@ jobs:
           python - <<'PY'
 import os, csv
 from pathlib import Path
-from datetime import datetime, timezone
 import pandas as pd
 DATA = Path("data"); DATA.mkdir(exist_ok=True)
 SIG  = DATA/"signals.csv"
-if not SIG.exists():
-    raise SystemExit(0)
+if not SIG.exists(): raise SystemExit(0)
 df = pd.read_csv(SIG)
 if df.empty or "status" not in df.columns: raise SystemExit(0)
 df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
