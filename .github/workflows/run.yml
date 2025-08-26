@@ -20,6 +20,20 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements.txt
       - name: Run signals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          FX_HOURS_UTC:        "0000-2100"
+          COMMODITY_HOURS_UTC: "0000-2100"
+          INDEX_HOURS_UTC:     "1330-2000"
+          STOCK_HOURS_UTC:     "1330-2000"
+          WEEKDAYS_FX:         "12345"
+          WEEKDAYS_COMMODITY:  "12345"
+          WEEKDAYS_INDEX:      "12345"
+          WEEKDAYS_STOCK:      "12345"
+          MIN_SCORE:           "2"
+          MUST_TRADE:          "0"
+          SUPPRESS_EMPTY:      "1"
         run: python signals.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
