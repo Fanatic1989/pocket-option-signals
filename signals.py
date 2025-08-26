@@ -282,7 +282,7 @@ def main():
 
         if sig and score>=MIN_SCORE:
             arrow="🟢 BUY" if sig=="BUY" else "🔴 SELL"
-            msg=f"📡 *Pocket Option Signal* — {now:%Y-%m-%d %H:%M UTC}\n{arrow} *{pretty}* @ `{px:.5f}`\n• {why} (score {score})\nExpiry: {EXPIRY_MIN}m"
+            msg=f"📡 *Pocket Option Signal* — {now:%Y-%m-%d %H:%M UTC}\n{arrow} *{pretty}* @ `{px:.5f}`\n• {why} \nExpiry: {EXPIRY_MIN}m"
             send_telegram(msg)
             evaluate_at=now+timedelta(minutes=EXPIRY_MIN)
             append_signal({
