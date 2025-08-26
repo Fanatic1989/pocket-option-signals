@@ -1,27 +1,24 @@
 name: refresh-assets
 
 on:
-  workflow_dispatch: {}         # manual button in Actions
+  workflow_dispatch: {}          # manual button
   schedule:
-    - cron: "0 9 * * 1"         # optional: every Monday 09:00 UTC
+    - cron: "0 9 * * 1"          # Mondays 09:00 UTC
 
 permissions:
-  contents: write               # allow committing symbols.yaml changes
+  contents: write
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install deps (requests, pyyaml)
+      - name: Install deps
         run: pip install requests pyyaml
-
-      - name: Ensure script exists (idempotent)
+      - name: Ensure script exists
         run: |
           if [ ! -f refresh_assets.py ]; then
             cat > refresh_assets.py <<'PY'
@@ -96,10 +93,8 @@ if __name__ == "__main__":
     write_symbols(items)
 PY
           fi
-
       - name: Run refresh
         run: python refresh_assets.py
-
       - name: Commit updated symbols.yaml
         run: |
           git config user.email "bot@users.noreply.github.com"
