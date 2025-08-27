@@ -29,3 +29,5 @@ signals_local.py
 .vscode/
 .idea/
 *.swp
+data/
+logs/
