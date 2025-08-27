@@ -1,20 +1,20 @@
-📡 OANDA+Binance — 2025-08-27 05:54 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
-✅ SELL *EUR/USD* @ `1.16180`  (score 2)  expires 05:59 UTC
-✅ SELL *GBP/USD* @ `1.34550`  (score 2)  expires 05:59 UTC
-✅ BUY *USD/JPY* @ `147.83800`  (score 2)  expires 05:59 UTC
-⚪ USD/CHF — no setup (score 1) [RSI 59.5]
-⚪ USD/CAD — no setup (score 1) [RSI 42.9]
-⚪ AUD/USD — no setup (score 1) [RSI 48.8]
-⚪ NZD/USD — no setup (score 1) [RSI 43.9]
-✅ BUY *EUR/JPY* @ `171.75600`  (score 2)  expires 05:59 UTC
-⚪ GBP/JPY — no setup (score 1) [RSI 44.9]
-⚪ Gold — no setup (score 1) [RSI 50.7]
-⚪ Silver — no setup (score 1) [RSI 45.0]
-⚠️ BTC/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=500
-⚠️ ETH/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1m&limit=500
-⚠️ SOL/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=SOLUSDT&interval=1m&limit=500
-⚠️ DOGE/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=DOGEUSDT&interval=1m&limit=500
-⚠️ LTC/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=LTCUSDT&interval=1m&limit=500
-⚠️ XRP/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=XRPUSDT&interval=1m&limit=500
-⚠️ BCH/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=BCHUSDT&interval=1m&limit=500
+📡 OANDA+Binance — 2025-08-27 06:21 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
+⚪ EUR/USD — no setup (score 1) [RSI 47.4]
+⚪ GBP/USD — no setup (score 1) [RSI 46.8]
+✅ BUY *USD/JPY* @ `147.75600`  (score 2)  expires 06:26 UTC
+⚪ USD/CHF — no setup (score 1) [RSI 54.2]
+⚪ USD/CAD — no setup (score 2) [RSI 46.2]
+⚪ AUD/USD — no setup (score 1) [RSI 56.0]
+⚪ NZD/USD — no setup (score 1) [RSI 57.6]
+✅ BUY *EUR/JPY* @ `171.66800`  (score 2)  expires 06:26 UTC
+✅ BUY *GBP/JPY* @ `198.78600`  (score 2)  expires 06:26 UTC
+✅ SELL *Gold* @ `3381.38500`  (score 2)  expires 06:26 UTC
+✅ SELL *Silver* @ `38.52375`  (score 2)  expires 06:26 UTC
+⚪ BTC/USDT — no setup (score 1) [RSI 44.9]
+✅ BUY *ETH/USDT* @ `4594.99000`  (score 2)  expires 06:26 UTC
+⚪ SOL/USDT — no setup (score 1) [RSI 49.0]
+⚪ DOGE/USDT — no setup (score 1) [RSI 42.7]
+✅ BUY *LTC/USDT* @ `113.49000`  (score 2)  expires 06:26 UTC
+⚪ XRP/USDT — no setup (score 1) [RSI 44.1]
+⚪ BCH/USDT — no setup (score 1) [RSI 43.7]
 Telegram error: 400 Client Error: Bad Request for url: https://api.telegram.org/bot8427835735:AAG0uPiTk-vG0TK1HwjUzmYokDZYwiY9JQs/sendMessage
