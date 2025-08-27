@@ -96,6 +96,11 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Evaluate outcomes
         run: |
           python evaluate.py

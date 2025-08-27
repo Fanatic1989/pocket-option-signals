@@ -21,6 +21,11 @@ jobs:
         run: |
           pip install pandas requests
 
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Post daily summary
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
