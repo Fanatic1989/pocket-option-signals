@@ -1,34 +1,36 @@
-name: oanda-signals
+name: oanda-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
-  workflow_dispatch: {}      # allow manual run
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      INTERVAL: "1m"
-      EXPIRY_MIN: "5"
-      MIN_SCORE: "1"
-      RSI_BUY: "40"
-      RSI_SELL: "60"
-      MUST_TRADE: "1"
-      OANDA_ENV: "practice"
       OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
+      OANDA_ENV: practice
+      INTERVAL: '1m'
+      EXPIRY_MIN: '5'
+      MIN_SCORE: '1'
+      RSI_BUY: '40'
+      RSI_SELL: '60'
+      MUST_TRADE: '1'
+      USE_TREND: '1'
+      PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install deps
-        run: pip install pandas pandas_ta requests pyyaml
+      - name: Install deps (pinned versions)
+        run: |
+          pip install numpy==1.26.4 pandas==2.2.2 pandas_ta==0.3.14b requests pyyaml
 
       - name: Run OANDA bot
         run: python oanda_signal_bot.py
