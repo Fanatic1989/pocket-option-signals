@@ -1,15 +1,15 @@
-📡 OANDA+Binance — 2025-08-27 05:33 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
+📡 OANDA+Binance — 2025-08-27 05:44 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
 ⚪ EUR/USD — no setup (score 1) [RSI 56.2]
-⚪ GBP/USD — no setup (score 1) [RSI 55.9]
-⚪ USD/JPY — no setup (score 1) [RSI 56.2]
-⚪ USD/CHF — no setup (score 1) [RSI 47.8]
-⚪ USD/CAD — no setup (score 1) [RSI 42.5]
-⚪ AUD/USD — no setup (score 1) [RSI 48.3]
-⚪ NZD/USD — no setup (score 1) [RSI 53.0]
-✅ SELL *EUR/JPY* @ `171.86000`  (score 2)  expires 05:38 UTC
-✅ SELL *GBP/JPY* @ `198.99000`  (score 2)  expires 05:38 UTC
-⚪ Gold — no setup (score 1) [RSI 57.0]
-✅ SELL *Silver* @ `38.48045`  (score 2)  expires 05:38 UTC
+✅ SELL *GBP/USD* @ `1.34542`  (score 2)  expires 05:49 UTC
+✅ BUY *USD/JPY* @ `147.86500`  (score 2)  expires 05:49 UTC
+⚪ USD/CHF — no setup (score 1) [RSI 52.4]
+⚪ USD/CAD — no setup (score 2) [RSI 40.0]
+⚪ AUD/USD — no setup (score 2) [RSI 51.9]
+⚪ NZD/USD — no setup (score 1) [RSI 55.3]
+⚪ EUR/JPY — no setup (score 1) [RSI 40.7]
+⚪ GBP/JPY — no setup (score 1) [RSI 45.3]
+✅ SELL *Gold* @ `3378.25500`  (score 2)  expires 05:49 UTC
+✅ SELL *Silver* @ `38.52130`  (score 2)  expires 05:49 UTC
 ⚠️ BTC/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=500
 ⚠️ ETH/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1m&limit=500
 ⚠️ SOL/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=SOLUSDT&interval=1m&limit=500
