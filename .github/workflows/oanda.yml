@@ -34,8 +34,7 @@ jobs:
           cache: 'pip'
 
       - name: Install deps
-        run: |
-          pip install pandas pandas_ta requests pyyaml
+        run: pip install -r requirements.txt
 
       - name: Run bot (retry, capture logs)
         env:
