@@ -31,10 +31,10 @@ jobs:
         env:
           # Telegram (set in repo Secrets)
           TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}         # legacy single-channel (optional)
-          TELEGRAM_FREE_CHAT_ID:  ${{ secrets.TELEGRAM_FREE_CHAT_ID }}    # @PocketOptionFree (optional)
-          TELEGRAM_STD_CHAT_ID:   ${{ secrets.TELEGRAM_STD_CHAT_ID }}     # @PocketOptionPro
-          TELEGRAM_PREM_CHAT_ID:  ${{ secrets.TELEGRAM_PREM_CHAT_ID }}    # @PocketOptionVIP
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_PRO }}
+          TELEGRAM_FREE_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_FREE }}
+          TELEGRAM_STD_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_PRO }}
+          TELEGRAM_PREM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_VIP }}
 
           # Countdown (GitHub Pages base), optional
           COUNTDOWN_BASE:         ${{ secrets.COUNTDOWN_BASE }}

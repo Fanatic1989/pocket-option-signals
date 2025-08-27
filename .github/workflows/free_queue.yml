@@ -24,7 +24,7 @@ jobs:
       - name: Publish due free messages
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_FREE_CHAT_ID: ${{ secrets.TELEGRAM_FREE_CHAT_ID }}
+          TELEGRAM_FREE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_FREE }}
         run: |
           python - <<'PY'
           import os, pandas as pd

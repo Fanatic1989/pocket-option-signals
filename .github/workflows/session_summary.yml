@@ -24,7 +24,7 @@ jobs:
       - name: Post daily summary
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_STD_CHAT_ID }}   # summary to Standard; change if desired
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_PRO }}
         run: |
           python - <<'PY'
           import os, csv
