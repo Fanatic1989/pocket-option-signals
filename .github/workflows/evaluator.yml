@@ -1,0 +1,31 @@
+name: evaluator
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    env:
+      OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+      OANDA_ENV: "practice"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install pandas requests
+      - name: Evaluate outcomes
+        run: python evaluate_results.py
+      - name: Commit updates
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "evaluator-bot"
+          git add data/signals.csv || true
+          git commit -m "evaluator: $(date -u +'%F %T')" || echo "no changes"
+          git push || true

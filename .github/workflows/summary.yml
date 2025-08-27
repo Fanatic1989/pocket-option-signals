@@ -1,0 +1,75 @@
+name: summaries
+
+on:
+  schedule:
+    - cron: "5 21 * * 1-4"   # Mon-Thu 21:05 UTC -> daily
+    - cron: "10 21 * * 5"    # Fri  21:10 UTC -> weekly
+  workflow_dispatch: {}
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_SUMMARY_CHAT: ${{ secrets.TELEGRAM_SUMMARY_CHAT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install pandas requests
+      - name: Build + send summary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pandas as pd
+          from pathlib import Path
+          from datetime import datetime, timedelta, timezone
+          tok  = os.getenv("TELEGRAM_BOT_TOKEN")
+          chat = os.getenv("TELEGRAM_SUMMARY_CHAT")
+          csv = Path("data/signals.csv")
+          if not tok or not chat or not csv.exists():
+              raise SystemExit(0)
+
+          df = pd.read_csv(csv)
+          if df.empty: raise SystemExit(0)
+          if "status" not in df.columns or "outcome" not in df.columns:
+              raise SystemExit(0)
+
+          df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
+          df = df.dropna(subset=["ts_utc"])
+          closed = df[df["status"]=="closed"].copy()
+          if closed.empty: raise SystemExit(0)
+
+          now = datetime.now(timezone.utc)
+
+          import requests
+          def send(msg):
+              requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                            data={"chat_id": chat, "text": msg})
+
+          wd = now.weekday()  # 0=Mon ... 4=Fri
+          if wd <= 3:
+              # Daily (Mon-Thu)
+              day = now.date()
+              d = closed[closed["ts_utc"].dt.date == day]
+              if len(d)==0: raise SystemExit(0)
+              wins = int((d["outcome"]=="WIN").sum())
+              loss = int((d["outcome"]=="LOSS").sum())
+              draw = int((d["outcome"]=="DRAW").sum())
+              acc  = round(100 * wins / max(1,(wins+loss)), 1)
+              msg = f"📊 Daily Summary — {day} UTC\nTotal: {len(d)}\nWins: {wins} | Losses: {loss} | Draws: {draw}\nAccuracy (excl. draws): {acc}%"
+              send(msg)
+          else:
+              # Weekly (Fri) — last 5 trading days
+              start = (now - timedelta(days=7)).date()
+              w = closed[(closed["ts_utc"].dt.date >= start)]
+              if len(w)==0: raise SystemExit(0)
+              wins = int((w["outcome"]=="WIN").sum())
+              loss = int((w["outcome"]=="LOSS").sum())
+              draw = int((w["outcome"]=="DRAW").sum())
+              acc  = round(100 * wins / max(1,(wins+loss)), 1)
+              msg = f"📈 Weekly Summary — up to {now.date()} UTC\nTotal: {len(w)}\nWins: {wins} | Losses: {loss} | Draws: {draw}\nAccuracy (excl. draws): {acc}%"
+              send(msg)
+          PY
