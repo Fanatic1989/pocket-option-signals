@@ -4,8 +4,8 @@ from pathlib import Path
 import pandas_ta as ta
 
 # ========= Config via ENV =========
-OANDA_API_KEY = os.environ.get("OANDA_API_KEY")         # required for FX/metals
-OANDA_ENV     = os.environ.get("OANDA_ENV", "practice") # practice|live
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
+OANDA_ENV     = os.environ.get("OANDA_ENV", "practice")  # practice|live
 
 INTERVAL      = os.environ.get("INTERVAL", "5m")        # 1m/5m/15m/30m/60m
 EXPIRY_MIN    = int(os.environ.get("EXPIRY_MIN", "10"))
@@ -15,40 +15,36 @@ RSI_SELL      = int(os.environ.get("RSI_SELL", "70"))
 MUST_TRADE    = os.environ.get("MUST_TRADE", "0") == "1"
 USE_TREND     = os.environ.get("USE_TREND", "1") == "1"
 
-# Optional Telegram mirroring
+# Telegram
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID")  # @channelusername or numeric id
+TG_CHATS = {
+    "FREE":  os.environ.get("TELEGRAM_CHAT_FREE"),
+    "BASIC": os.environ.get("TELEGRAM_CHAT_BASIC"),
+    "PRO":   os.environ.get("TELEGRAM_CHAT_PRO"),
+    "VIP":   os.environ.get("TELEGRAM_CHAT_VIP"),
+}
 
-# CSV log
 DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
 SIGNALS_CSV = DATA_DIR / "signals.csv"
 
-# Symbols: OANDA (FX/metals) + Binance (crypto)
-# - OANDA: use YF-style "EURUSD=X", "XAUUSD=X"
-# - Binance: use "CRYPTO:SYMBOLUSDT" (e.g., CRYPTO:BTCUSDT)
-SYMBOLS = [
-    # --- FX (OANDA) ---
-    ("EURUSD=X", "EUR/USD"),
-    ("GBPUSD=X", "GBP/USD"),
-    ("USDJPY=X", "USD/JPY"),
-    ("USDCHF=X", "USD/CHF"),
-    ("USDCAD=X", "USD/CAD"),
-    ("AUDUSD=X", "AUD/USD"),
-    ("NZDUSD=X", "NZD/USD"),
-    ("EURJPY=X", "EUR/JPY"),
-    ("GBPJPY=X", "GBP/JPY"),
-    # --- Metals (OANDA) ---
-    ("XAUUSD=X", "Gold"),
-    ("XAGUSD=X", "Silver"),
-    # --- Crypto (Binance) ---
-    ("CRYPTO:BTCUSDT", "BTC/USDT"),
-    ("CRYPTO:ETHUSDT", "ETH/USDT"),
-    ("CRYPTO:SOLUSDT", "SOL/USDT"),
-    ("CRYPTO:DOGEUSDT","DOGE/USDT"),
-    ("CRYPTO:LTCUSDT", "LTC/USDT"),
-    ("CRYPTO:XRPUSDT", "XRP/USDT"),
-    ("CRYPTO:BCHUSDT", "BCH/USDT"),
+# ===== Symbol maps by Tier =====
+FX_ALL = [
+    ("EURUSD=X","EUR/USD"),("GBPUSD=X","GBP/USD"),("USDJPY=X","USD/JPY"),("USDCHF=X","USD/CHF"),
+    ("USDCAD=X","USD/CAD"),("AUDUSD=X","AUD/USD"),("NZDUSD=X","NZD/USD"),
+    ("EURJPY=X","EUR/JPY"),("GBPJPY=X","GBP/JPY")
 ]
+METALS = [("XAUUSD=X","Gold"),("XAGUSD=X","Silver")]
+CRYPTO_TOP = [
+    ("CRYPTO:BTCUSDT","BTC/USDT"),("CRYPTO:ETHUSDT","ETH/USDT"),("CRYPTO:SOLUSDT","SOL/USDT"),
+    ("CRYPTO:DOGEUSDT","DOGE/USDT"),("CRYPTO:LTCUSDT","LTC/USDT"),("CRYPTO:XRPUSDT","XRP/USDT"),("CRYPTO:BCHUSDT","BCH/USDT")
+]
+
+TIERS = {
+    "FREE":  [("EURUSD=X","EUR/USD"), ("CRYPTO:BTCUSDT","BTC/USDT")],
+    "BASIC": FX_ALL[:6] + [("XAUUSD=X","Gold")] + [("CRYPTO:BTCUSDT","BTC/USDT")],
+    "PRO":   FX_ALL + METALS + CRYPTO_TOP,
+    "VIP":   FX_ALL + METALS + CRYPTO_TOP
+}
 
 # ========= OANDA helpers (FX/metals) =========
 def oanda_symbol(yf_sym: str):
@@ -63,7 +59,6 @@ def oanda_base_url():
     return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
 
 def oanda_granularity(interval: str):
-    # map minutes to OANDA granularity
     iv = "".join(ch for ch in interval if ch.isdigit())
     try: iv = int(iv)
     except: iv = 5
@@ -81,8 +76,7 @@ def fetch_oanda_df(yf_sym: str, interval: str, count: int = 500) -> pd.DataFrame
     r = requests.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
     rows=[]
-    data = r.json().get("candles", [])
-    for c in data:
+    for c in r.json().get("candles", []):
         if not c.get("complete"): continue
         mid = c.get("mid") or {}
         rows.append({
@@ -110,7 +104,6 @@ def is_crypto_sym(yf_sym: str) -> bool:
     return str(yf_sym).upper().startswith("CRYPTO:")
 
 def binance_symbol_from_crypto(yf_sym: str) -> str:
-    # expects CRYPTO:BTCUSDT
     return "".join(ch for ch in yf_sym.split(":",1)[1].upper() if ch.isalnum())
 
 def fetch_binance_df(yf_sym: str, interval: str, limit: int = 500) -> pd.DataFrame:
@@ -121,7 +114,6 @@ def fetch_binance_df(yf_sym: str, interval: str, limit: int = 500) -> pd.DataFra
     r.raise_for_status()
     rows=[]
     for k in r.json():
-        # [ openTime, open, high, low, close, volume, closeTime, ... ]
         rows.append({
             "time": pd.to_datetime(int(k[6]), unit="ms", utc=True), # closeTime
             "open": float(k[1]),
@@ -158,8 +150,7 @@ def score_and_signal(prev, cur):
     macd_down = (prev["macd"] >= prev["macds"]) and (cur["macd"] < cur["macds"])
 
     if USE_TREND:
-        score += 1  # we count trend as a general quality factor
-
+        score += 1
     if macd_up or macd_down:
         score += 1
 
@@ -181,6 +172,15 @@ def score_and_signal(prev, cur):
     return side, score, {"rsi": float(rsi)}
 
 # ========= Logging & Telegram =========
+def send_telegram(text: str, chat_id: str):
+    if not TG_TOKEN or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode":"Markdown"}, timeout=20).raise_for_status()
+    except Exception as e:
+        print("Telegram error:", e, file=sys.stderr)
+
 def log_row(ts, name, side, score, price, interval, expiry_min, expires_utc, rsi):
     import csv
     hdr = ["ts_utc","pair","side","score","price","interval","expiry_min","expires_utc","rsi"]
@@ -195,26 +195,19 @@ def log_row(ts, name, side, score, price, interval, expiry_min, expires_utc, rsi
             "expires_utc": expires_utc or "", "rsi": f"{rsi:.2f}" if rsi is not None else ""
         })
 
-def send_telegram(text: str):
-    if not TG_TOKEN or not TG_CHAT:
+# ========= Main per-tier =========
+def run_for_tier(tier_name: str, pairs: list, chat_id: str):
+    if not chat_id:
         return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TG_CHAT, "text": text, "parse_mode":"Markdown"}, timeout=20).raise_for_status()
-    except Exception as e:
-        print("Telegram error:", e, file=sys.stderr)
 
-# ========= Main =========
-def main():
     now = datetime.now(timezone.utc)
-    header = f"📡 OANDA+Binance — {now:%Y-%m-%d %H:%M UTC}  (tf {INTERVAL}, expiry {EXPIRY_MIN}m, RSI≤{RSI_BUY}/≥{RSI_SELL}, MIN_SCORE={MIN_SCORE})"
+    header = f"📡 {tier_name} — {now:%Y-%m-%d %H:%M UTC}  (tf {INTERVAL}, expiry {EXPIRY_MIN}m, RSI≤{RSI_BUY}/≥{RSI_SELL}, MIN_SCORE={MIN_SCORE})"
     print(header)
-
     lines=[]
     ts = now.strftime("%Y-%m-%d %H:%M:%S")
-    best = None  # (score, rsi_extremity, text, name, px, rsi)
+    best = None
 
-    for yf_sym, name in SYMBOLS:
+    for yf_sym, name in pairs:
         try:
             df  = add_indicators(fetch_df_router(yf_sym, INTERVAL))
             prev, cur = df.iloc[-2], df.iloc[-1]
@@ -228,12 +221,10 @@ def main():
                 print(line); lines.append(line)
                 log_row(ts, name, side, score, px, INTERVAL, EXPIRY_MIN, evaluate_at.strftime("%Y-%m-%d %H:%M:%S"), rsi)
             else:
-                # Track best fallback by (score, RSI distance from extremes)
                 dist = min(abs(rsi - RSI_BUY), abs(rsi - RSI_SELL))
                 rtext = f"🤖 Fallback {('BUY' if rsi < 50 else 'SELL')} *{name}* @ `{px:.5f}` (score {score}) [RSI {rsi:.1f}]"
                 cand = (score, -dist, rtext, name, px, rsi)
-                if (best is None) or (cand > best):
-                    best = cand
+                if (best is None) or (cand > best): best = cand
 
                 line = f"⚪ {name} — no setup (score {score}) [RSI {rsi:.1f}]"
                 print(line); lines.append(line)
@@ -251,7 +242,14 @@ def main():
         log_row(ts, name, side, 0, px, INTERVAL, EXPIRY_MIN, None, rsi)
 
     if lines:
-        send_telegram(header + "\n" + "\n".join(lines))
+        send_telegram(header + "\n" + "\n".join(lines), chat_id)
+
+def main():
+    # Run once per available tier chat
+    for tier, chat in TG_CHATS.items():
+        if chat:
+            pairs = TIERS.get(tier, [])
+            run_for_tier(tier, pairs, chat)
 
 if __name__ == "__main__":
     main()

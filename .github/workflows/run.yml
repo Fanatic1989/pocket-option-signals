@@ -2,7 +2,7 @@ name: oanda-bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -21,16 +21,18 @@ jobs:
       RSI_SELL: '60'
       MUST_TRADE: '1'
       USE_TREND: '1'
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_FREE:  ${{ secrets.TELEGRAM_CHAT_FREE }}
+      TELEGRAM_CHAT_BASIC: ${{ secrets.TELEGRAM_CHAT_BASIC }}
+      TELEGRAM_CHAT_PRO:   ${{ secrets.TELEGRAM_CHAT_PRO }}
+      TELEGRAM_CHAT_VIP:   ${{ secrets.TELEGRAM_CHAT_VIP }}
       PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install deps (pinned versions)
-        run: |
-          pip install numpy==1.26.4 pandas==2.2.2 pandas_ta==0.3.14b requests pyyaml
-
-      - name: Run OANDA bot
+      - name: Install deps (pinned)
+        run: pip install numpy==1.26.4 pandas==2.2.2 pandas_ta==0.3.14b requests pyyaml
+      - name: Run OANDA+Binance bot (all tiers)
         run: python oanda_signal_bot.py

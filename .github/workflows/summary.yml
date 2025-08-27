@@ -2,40 +2,44 @@ name: summaries
 
 on:
   schedule:
-    - cron: "5 21 * * 1-4"   # Mon-Thu 21:05 UTC -> daily
-    - cron: "10 21 * * 5"    # Fri  21:10 UTC -> weekly
+    - cron: "5 21 * * 1-4"   # Mon-Thu daily
+    - cron: "10 21 * * 5"    # Fri weekly
   workflow_dispatch: {}
 
 jobs:
   summarize:
     runs-on: ubuntu-latest
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_SUMMARY_CHAT: ${{ secrets.TELEGRAM_SUMMARY_CHAT }}
+      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_FREE:   ${{ secrets.TELEGRAM_CHAT_FREE }}
+      TELEGRAM_CHAT_BASIC:  ${{ secrets.TELEGRAM_CHAT_BASIC }}
+      TELEGRAM_CHAT_PRO:    ${{ secrets.TELEGRAM_CHAT_PRO }}
+      TELEGRAM_CHAT_VIP:    ${{ secrets.TELEGRAM_CHAT_VIP }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install deps
-        run: pip install pandas requests
-      - name: Build + send summary
+        run: pip install numpy==1.26.4 pandas==2.2.2 requests
+      - name: Build + send summary to all channels
         shell: bash
         run: |
           python - <<'PY'
-          import os, pandas as pd
+          import os, pandas as pd, requests
           from pathlib import Path
           from datetime import datetime, timedelta, timezone
-          tok  = os.getenv("TELEGRAM_BOT_TOKEN")
-          chat = os.getenv("TELEGRAM_SUMMARY_CHAT")
+
+          tok = os.getenv("TELEGRAM_BOT_TOKEN")
+          chats = [os.getenv("TELEGRAM_CHAT_FREE"), os.getenv("TELEGRAM_CHAT_BASIC"),
+                   os.getenv("TELEGRAM_CHAT_PRO"), os.getenv("TELEGRAM_CHAT_VIP")]
+          chats = [c for c in chats if c]
+
           csv = Path("data/signals.csv")
-          if not tok or not chat or not csv.exists():
-              raise SystemExit(0)
+          if not tok or not chats or not csv.exists(): raise SystemExit(0)
 
           df = pd.read_csv(csv)
-          if df.empty: raise SystemExit(0)
-          if "status" not in df.columns or "outcome" not in df.columns:
-              raise SystemExit(0)
+          if df.empty or "status" not in df.columns or "outcome" not in df.columns: raise SystemExit(0)
 
           df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
           df = df.dropna(subset=["ts_utc"])
@@ -43,15 +47,17 @@ jobs:
           if closed.empty: raise SystemExit(0)
 
           now = datetime.now(timezone.utc)
-
-          import requests
-          def send(msg):
-              requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                            data={"chat_id": chat, "text": msg})
-
           wd = now.weekday()  # 0=Mon ... 4=Fri
+
+          def send_all(msg):
+              for chat in chats:
+                  try:
+                      requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                                    data={"chat_id": chat, "text": msg}).raise_for_status()
+                  except Exception as e:
+                      print("send error:", e)
+
           if wd <= 3:
-              # Daily (Mon-Thu)
               day = now.date()
               d = closed[closed["ts_utc"].dt.date == day]
               if len(d)==0: raise SystemExit(0)
@@ -60,9 +66,8 @@ jobs:
               draw = int((d["outcome"]=="DRAW").sum())
               acc  = round(100 * wins / max(1,(wins+loss)), 1)
               msg = f"📊 Daily Summary — {day} UTC\nTotal: {len(d)}\nWins: {wins} | Losses: {loss} | Draws: {draw}\nAccuracy (excl. draws): {acc}%"
-              send(msg)
+              send_all(msg)
           else:
-              # Weekly (Fri) — last 5 trading days
               start = (now - timedelta(days=7)).date()
               w = closed[(closed["ts_utc"].dt.date >= start)]
               if len(w)==0: raise SystemExit(0)
@@ -71,5 +76,5 @@ jobs:
               draw = int((w["outcome"]=="DRAW").sum())
               acc  = round(100 * wins / max(1,(wins+loss)), 1)
               msg = f"📈 Weekly Summary — up to {now.date()} UTC\nTotal: {len(w)}\nWins: {wins} | Losses: {loss} | Draws: {draw}\nAccuracy (excl. draws): {acc}%"
-              send(msg)
+              send_all(msg)
           PY
