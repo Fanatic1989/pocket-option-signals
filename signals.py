@@ -1,4 +1,4 @@
-import os, time, csv, json
+import os, time, csv, csv, json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -83,3 +83,49 @@ def bulk_fetch(*args, **kwargs):
 
 # === OANDA-ONLY LOCAL FETCH ENABLED ===
 print('🔄 Using OANDA-only local fetchers (no Yahoo/Stooq)')
+
+
+# ---------- Tier routing ----------
+def _queue_write(path, when_iso, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["available_at_utc","text"])
+        if not exists: w.writeheader()
+        w.writerow({"available_at_utc": when_iso, "text": text})
+
+def _post_now(chat_id, text):
+    if not BOT_TOKEN or not chat_id: return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    import requests
+    r = requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode":"Markdown"}, timeout=30)
+    r.raise_for_status()
+
+def send_to_tiers(text, now_utc=None):
+    from datetime import datetime, timezone, timedelta
+    now_utc = now_utc or datetime.now(timezone.utc)
+    # VIP & PRO: instant if configured
+    if 'CHAT_VIP' in globals() and CHAT_VIP:   _post_now(CHAT_VIP, text)
+    if 'CHAT_PRO' in globals() and CHAT_PRO:   _post_now(CHAT_PRO, text)
+
+    # BASIC: queue or instant
+    if 'CHAT_BASIC' in globals() and CHAT_BASIC:
+        if BASIC_DELAY_MIN > 0:
+            when = now_utc + timedelta(minutes=BASIC_DELAY_MIN)
+            _queue_write(Path("data/basic_queue.csv"), when.strftime("%Y-%m-%d %H:%M:%S"), text)
+        else:
+            _post_now(CHAT_BASIC, text)
+
+    # FREE: queue or instant
+    if 'CHAT_FREE' in globals() and CHAT_FREE:
+        if FREE_DELAY_MIN > 0:
+            when = now_utc + timedelta(minutes=FREE_DELAY_MIN)
+            _queue_write(Path("data/free_queue.csv"), when.strftime("%Y-%m-%d %H:%M:%S"), text)
+        else:
+            _post_now(CHAT_FREE, text)
+
+# Final dispatch
+try:
+    send_to_tiers("\n\n".join(lines))
+except Exception:
+    send_telegram("\n\n".join(lines))
