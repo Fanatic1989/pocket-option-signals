@@ -19,7 +19,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: " 3.11 "
+          cache: pip
+          cache-dependency-path: requirements.txt
       - name: Install deps
         run: pip install numpy==1.26.4 pandas==2.2.2 requests
       - name: Build + send summary to all channels
