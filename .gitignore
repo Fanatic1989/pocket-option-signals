@@ -1,0 +1,31 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+*.bak
+
+# === Virtual environments ===
+venv/
+.env/
+.venv/
+
+# === Data & logs ===
+data/
+logs/
+*.log
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+
+# === Local helpers (not needed on GitHub) ===
+debug_check.py
+signals_local.py
+
+# === IDE/editor settings ===
+.vscode/
+.idea/
+*.swp
