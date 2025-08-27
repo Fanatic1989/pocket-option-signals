@@ -2,7 +2,7 @@ name: free-queue
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"   # every 5 minutes
   workflow_dispatch: {}
 
 permissions:
@@ -13,19 +13,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: " 3.11 "
+          python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Install deps        run: |
-          pip install pandas requests
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f constraints.txt ]; then
+            python -m pip install -r requirements.txt -c constraints.txt
+          else
+            python -m pip install -r requirements.txt
+          fi
+          python -m pip install pandas requests --upgrade
 
       - name: Publish due free messages
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_FREE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_FREE }}        run: |
+          TELEGRAM_FREE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_FREE }}
+        run: |
           python - <<'PY'
           import os, pandas as pd
           from pathlib import Path
@@ -33,7 +42,7 @@ jobs:
           import requests, subprocess
 
           DATA = Path("data"); DATA.mkdir(exist_ok=True)
-          Q = DATA/"free_queue.csv"
+          Q = DATA / "free_queue.csv"
           if not Q.exists():
               raise SystemExit(0)
 
@@ -46,12 +55,16 @@ jobs:
           due  = df[df["available_at_utc"] <= now]
           keep = df[df["available_at_utc"] > now]
 
-          if due.empty: raise SystemExit(0)
+          if due.empty:
+              raise SystemExit(0)
 
-          url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+          bot = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat = os.environ["TELEGRAM_FREE_CHAT_ID"]
+          url = f"https://api.telegram.org/bot{bot}/sendMessage"
+
           for _, row in due.iterrows():
               text = str(row["text"])
-              r = requests.post(url, data={"chat_id": os.environ["TELEGRAM_FREE_CHAT_ID"], "text": text, "parse_mode":"Markdown"}, timeout=30)
+              r = requests.post(url, data={"chat_id": chat, "text": text, "parse_mode": "Markdown"}, timeout=30)
               r.raise_for_status()
 
           if keep.empty:
@@ -59,10 +72,13 @@ jobs:
           else:
               keep.to_csv(Q, index=False)
 
-          # persist queue state
-          subprocess.run(["git","config","user.email","bot@users.noreply.github.com"], check=True)
-          subprocess.run(["git","config","user.name","free-queue-bot"], check=True)
-          subprocess.run(["git","add","data/free_queue.csv"], check=True)
-          subprocess.run(["git","commit","-m",f"free-queue: posted {len(due)} items"], check=False)
-          subprocess.run(["git","push"], check=False)
+          # persist queue state (optional; safe if no changes)
+          try:
+              subprocess.run(["git","config","user.email","bot@users.noreply.github.com"], check=False)
+              subprocess.run(["git","config","user.name","free-queue-bot"], check=False)
+              subprocess.run(["git","add","data/free_queue.csv"], check=False)
+              subprocess.run(["git","commit","-m",f"free-queue: posted {len(due)} item(s)"], check=False)
+              subprocess.run(["git","push"], check=False)
+          except Exception:
+              pass
           PY
