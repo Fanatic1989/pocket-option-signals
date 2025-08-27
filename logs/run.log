@@ -1,20 +1,19 @@
-📡 OANDA+Binance — 2025-08-27 10:37 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
-✅ BUY *EUR/USD* @ `1.15822`  (score 2)  expires 10:42 UTC
-✅ BUY *GBP/USD* @ `1.34320`  (score 2)  expires 10:42 UTC
-✅ SELL *USD/JPY* @ `148.09400`  (score 2)  expires 10:42 UTC
-⚪ USD/CHF — no setup (score 1) [RSI 57.2]
-⚪ USD/CAD — no setup (score 1) [RSI 56.2]
-✅ BUY *AUD/USD* @ `0.64659`  (score 2)  expires 10:42 UTC
-✅ BUY *NZD/USD* @ `0.58218`  (score 2)  expires 10:42 UTC
-⚪ EUR/JPY — no setup (score 1) [RSI 48.5]
-⚪ GBP/JPY — no setup (score 1) [RSI 47.8]
-✅ BUY *Gold* @ `3375.40000`  (score 2)  expires 10:42 UTC
-⚪ Silver — no setup (score 1) [RSI 43.3]
+📡 OANDA+Binance — 2025-08-27 10:47 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
+⚪ EUR/USD — no setup (score 1) [RSI 42.2]
+✅ BUY *GBP/USD* @ `1.34324`  (score 2)  expires 10:52 UTC
+⚪ USD/JPY — no setup (score 1) [RSI 57.2]
+⚪ USD/CHF — no setup (score 1) [RSI 42.9]
+⚪ USD/CAD — no setup (score 1) [RSI 42.9]
+⚪ AUD/USD — no setup (score 1) [RSI 48.8]
+⚪ NZD/USD — no setup (score 1) [RSI 44.4]
+⚪ EUR/JPY — no setup (score 1) [RSI 49.3]
+⚪ GBP/JPY — no setup (score 1) [RSI 48.0]
+✅ BUY *Gold* @ `3375.37000`  (score 2)  expires 10:52 UTC
+⚪ Silver — no setup (score 1) [RSI 59.0]
 ⚠️ BTC/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=500
 ⚠️ ETH/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1m&limit=500
 ⚠️ SOL/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=SOLUSDT&interval=1m&limit=500
-⚠️ DOGE/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=DOGEUSDT&interval=1m&limit=500
+⚠️ DOGE/USDT error: HTTPSConnectionPool(host='api.binance.com', port=443): Max retries exceeded with url: /api/v3/klines?symbol=DOGEUSDT&interval=1m&limit=500 (Caused by ConnectTimeoutError(<urllib3.connection.HTTPSConnection object at 0x7fa7899504d0>, 'Connection to api.binance.com timed out. (connect timeout=20)'))
 ⚠️ LTC/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=LTCUSDT&interval=1m&limit=500
 ⚠️ XRP/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=XRPUSDT&interval=1m&limit=500
 ⚠️ BCH/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=BCHUSDT&interval=1m&limit=500
-Telegram error: 400 Client Error: Bad Request for url: https://api.telegram.org/bot8427835735:AAG0uPiTk-vG0TK1HwjUzmYokDZYwiY9JQs/sendMessage
