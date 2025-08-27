@@ -20,6 +20,9 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install deps
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_PYTHON_VERSION_WARNING: "1"
         run: |
           pip install pandas requests
 
@@ -27,6 +30,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_FREE_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_FREE }}
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_PYTHON_VERSION_WARNING: "1"
         run: |
           python - <<'PY'
           import os, pandas as pd
