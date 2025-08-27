@@ -1,62 +1,34 @@
-name: signals
+name: oanda-signals
 
 on:
   schedule:
-    - cron: "*/5 * * * *"      # run every 5m (UTC)
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
+    - cron: "*/5 * * * *"   # every 5 minutes
+  workflow_dispatch: {}      # allow manual run
 
 jobs:
-  generate:
+  run:
     runs-on: ubuntu-latest
+    env:
+      INTERVAL: "1m"
+      EXPIRY_MIN: "5"
+      MIN_SCORE: "1"
+      RSI_BUY: "40"
+      RSI_SELL: "60"
+      MUST_TRADE: "1"
+      OANDA_ENV: "practice"
+      OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - name: Run self-tuner
-        run: python tuner.py
 
-      - name: Run self-tuner
-        run: python tuner.py
-      - name: Run signals
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          COUNTDOWN_BASE: https://Fanatic1989.github.io/pocket-option-signals
-          # Regular hours (UTC) – no OTC
-          FX_HOURS_UTC:        "0000-2100"
-          COMMODITY_HOURS_UTC: "0000-2100"
-          INDEX_HOURS_UTC:     "1330-2000"
-          STOCK_HOURS_UTC:     "1330-2000"
-          WEEKDAYS_FX:         "12345"
-          WEEKDAYS_COMMODITY:  "12345"
-          WEEKDAYS_INDEX:      "12345"
-          WEEKDAYS_STOCK:      "12345"
-          # Behavior
-          MIN_SCORE:           "2"
-          MUST_TRADE:          "0"        # strict: only post real setups
-          SUPPRESS_EMPTY:      "1"        # stay silent when nothing to trade
-        run: python signals.py
+      - name: Install deps
+        run: pip install pandas pandas_ta requests pyyaml
 
-  evaluate:
-    runs-on: ubuntu-latest
-    needs: generate
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - name: Evaluate outcomes
-        run: python evaluate.py
-      - name: Commit performance updates
-        run: |
-          git config user.email "bot@users.noreply.github.com"
-          git config user.name  "signals-bot"
-          git add data/*.csv || true
-          git commit -m "evaluate outcomes $(date -u +'%F %T')" || echo "no changes"
-          git push || true
+      - name: Run OANDA bot
+        run: python oanda_signal_bot.py
