@@ -17,61 +17,32 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install deps
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run self-tuner (optional)
+      - name: Run self-tuner
         run: python tuner.py
         continue-on-error: true
 
-      - name: Install deps
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install deps
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
       - name: Run signals
         env:
-          # Telegram (set in repo Secrets)
           TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_PRO }}
           TELEGRAM_FREE_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_FREE }}
           TELEGRAM_STD_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_PRO }}
           TELEGRAM_PREM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_VIP }}
-
-          # Countdown (GitHub Pages base), optional
-          COUNTDOWN_BASE:         ${{ secrets.COUNTDOWN_BASE }}
-
-          # Data providers
-          USE_OANDA:              "1"
-          OANDA_ENV:              "practice"
           OANDA_API_KEY:          ${{ secrets.OANDA_API_KEY }}
-
-          # Behavior toggles
+          USE_OANDA:              "1"
           INTERVAL:               "5m"
           EXPIRY_MIN:             "10"
-          MIN_SCORE:              "2"        # make "1" to loosen, "3" to tighten
-          MUST_TRADE:             "0"        # "1" forces at least 1 pick per run
-          SUPPRESS_EMPTY:         "1"        # "1" = post nothing when no setups
-
-          # Hours (UTC windows)
-          FX_HOURS_UTC:           "0000-2100"
-          COMMODITY_HOURS_UTC:    "0000-2100"
-          INDEX_HOURS_UTC:        "1330-2000"
-          STOCK_HOURS_UTC:        "1330-2000"
-          WEEKDAYS_FX:            "12345"
-          WEEKDAYS_COMMODITY:     "12345"
-          WEEKDAYS_INDEX:         "12345"
-          WEEKDAYS_STOCK:         "12345"
-        run: |
-          python signals.py
+          MIN_SCORE:              "1"
+          MUST_TRADE:             "1"
+        run: python signals.py
 
       - name: Commit signal log
         run: |
@@ -90,11 +61,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install deps
         run: |
@@ -102,8 +70,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Evaluate outcomes
-        run: |
-          python evaluate.py
+        run: python evaluate.py
 
       - name: Commit performance updates
         run: |
