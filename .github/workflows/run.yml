@@ -1,38 +1,99 @@
-name: oanda-bot
+name: signals
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: "*/5 * * * *"     # every 5 minutes
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
 jobs:
-  run:
+  generate:
     runs-on: ubuntu-latest
-    env:
-      OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-      OANDA_ENV: practice
-      INTERVAL: '1m'
-      EXPIRY_MIN: '5'
-      MIN_SCORE: '1'
-      RSI_BUY: '40'
-      RSI_SELL: '60'
-      MUST_TRADE: '1'
-      USE_TREND: '1'
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_FREE:  ${{ secrets.TELEGRAM_CHAT_FREE }}
-      TELEGRAM_CHAT_BASIC: ${{ secrets.TELEGRAM_CHAT_BASIC }}
-      TELEGRAM_CHAT_PRO:   ${{ secrets.TELEGRAM_CHAT_PRO }}
-      TELEGRAM_CHAT_VIP:   ${{ secrets.TELEGRAM_CHAT_VIP }}
-      PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install deps (pinned)
-        run: pip install numpy==1.26.4 pandas==2.2.2 pandas_ta==0.3.14b requests pyyaml
-      - name: Run OANDA+Binance bot (all tiers)
-        run: python oanda_signal_bot.py
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run self-tuner (optional)
+        run: python tuner.py
+        continue-on-error: true
+
+      - name: Run signals
+        env:
+          # Telegram (set in repo Secrets)
+          TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:       ${{ secrets.TELEGRAM_CHAT_ID }}         # legacy single-channel (optional)
+          TELEGRAM_FREE_CHAT_ID:  ${{ secrets.TELEGRAM_FREE_CHAT_ID }}    # @PocketOptionFree (optional)
+          TELEGRAM_STD_CHAT_ID:   ${{ secrets.TELEGRAM_STD_CHAT_ID }}     # @PocketOptionPro
+          TELEGRAM_PREM_CHAT_ID:  ${{ secrets.TELEGRAM_PREM_CHAT_ID }}    # @PocketOptionVIP
+
+          # Countdown (GitHub Pages base), optional
+          COUNTDOWN_BASE:         ${{ secrets.COUNTDOWN_BASE }}
+
+          # Data providers
+          USE_OANDA:              "1"
+          OANDA_ENV:              "practice"
+          OANDA_API_KEY:          ${{ secrets.OANDA_API_KEY }}
+
+          # Behavior toggles
+          INTERVAL:               "5m"
+          EXPIRY_MIN:             "10"
+          MIN_SCORE:              "2"        # make "1" to loosen, "3" to tighten
+          MUST_TRADE:             "0"        # "1" forces at least 1 pick per run
+          SUPPRESS_EMPTY:         "1"        # "1" = post nothing when no setups
+
+          # Hours (UTC windows)
+          FX_HOURS_UTC:           "0000-2100"
+          COMMODITY_HOURS_UTC:    "0000-2100"
+          INDEX_HOURS_UTC:        "1330-2000"
+          STOCK_HOURS_UTC:        "1330-2000"
+          WEEKDAYS_FX:            "12345"
+          WEEKDAYS_COMMODITY:     "12345"
+          WEEKDAYS_INDEX:         "12345"
+          WEEKDAYS_STOCK:         "12345"
+        run: |
+          python signals.py
+
+      - name: Commit signal log
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "signals-bot"
+          git add data/signals.csv data/free_queue.csv || true
+          git commit -m "update signals $(date -u +'%F %T')" || echo "no changes"
+          git push || echo "skip push (no changes)"
+
+  evaluate:
+    runs-on: ubuntu-latest
+    needs: generate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Evaluate outcomes
+        run: |
+          python evaluate.py
+
+      - name: Commit performance updates
+        run: |
+          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "signals-bot"
+          git add data/*.csv || true
+          git commit -m "evaluate outcomes $(date -u +'%F %T')" || echo "no changes"
+          git push || echo "skip push (no changes)"

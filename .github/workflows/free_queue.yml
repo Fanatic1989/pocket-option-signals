@@ -1,0 +1,68 @@
+name: free-queue
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  post_free:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install pandas requests
+
+      - name: Publish due free messages
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_FREE_CHAT_ID: ${{ secrets.TELEGRAM_FREE_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os, pandas as pd
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import requests, subprocess
+
+          DATA = Path("data"); DATA.mkdir(exist_ok=True)
+          Q = DATA/"free_queue.csv"
+          if not Q.exists():
+              raise SystemExit(0)
+
+          df = pd.read_csv(Q)
+          if df.empty or "available_at_utc" not in df.columns or "text" not in df.columns:
+              raise SystemExit(0)
+
+          df["available_at_utc"] = pd.to_datetime(df["available_at_utc"], utc=True, errors="coerce")
+          now = datetime.now(timezone.utc)
+          due  = df[df["available_at_utc"] <= now]
+          keep = df[df["available_at_utc"] > now]
+
+          if due.empty: raise SystemExit(0)
+
+          url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+          for _, row in due.iterrows():
+              text = str(row["text"])
+              r = requests.post(url, data={"chat_id": os.environ["TELEGRAM_FREE_CHAT_ID"], "text": text, "parse_mode":"Markdown"}, timeout=30)
+              r.raise_for_status()
+
+          if keep.empty:
+              Q.unlink(missing_ok=True)
+          else:
+              keep.to_csv(Q, index=False)
+
+          # persist queue state
+          subprocess.run(["git","config","user.email","bot@users.noreply.github.com"], check=True)
+          subprocess.run(["git","config","user.name","free-queue-bot"], check=True)
+          subprocess.run(["git","add","data/free_queue.csv"], check=True)
+          subprocess.run(["git","commit","-m",f"free-queue: posted {len(due)} items"], check=False)
+          subprocess.run(["git","push"], check=False)
+          PY
