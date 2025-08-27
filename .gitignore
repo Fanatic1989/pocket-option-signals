@@ -31,3 +31,5 @@ signals_local.py
 *.swp
 data/
 logs/
+.env
+signals_test.py
