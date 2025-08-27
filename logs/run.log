@@ -1,17 +1,15 @@
-📡 OANDA+Binance — 2025-08-27 04:54 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
-✅ BUY *EUR/USD* @ `1.16136`  (score 3)  expires 04:59 UTC
-⚪ GBP/USD — no setup (score 1) [RSI 44.6]
-⚪ USD/JPY — no setup (score 1) [RSI 49.9]
-⚪ USD/CHF — no setup (score 2) [RSI 53.0]
-/home/runner/work/pocket-option-signals/pocket-option-signals/oanda_signal_bot.py:98: UserWarning: Could not infer format, so each element will be parsed individually, falling back to `dateutil`. To ensure parsing is consistent and as-expected, please specify a format.
-  df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-⚪ USD/CAD — no setup (score 1) [RSI 48.1]
-⚪ AUD/USD — no setup (score 1) [RSI 48.8]
-⚪ NZD/USD — no setup (score 1) [RSI 50.0]
-✅ BUY *EUR/JPY* @ `171.79400`  (score 2)  expires 04:59 UTC
-⚪ GBP/JPY — no setup (score 1) [RSI 45.3]
-✅ BUY *Gold* @ `3374.30500`  (score 2)  expires 04:59 UTC
-✅ BUY *Silver* @ `38.44950`  (score 2)  expires 04:59 UTC
+📡 OANDA+Binance — 2025-08-27 05:14 UTC  (tf 1m, expiry 5m, RSI≤40/≥60, MIN_SCORE=1)
+✅ SELL *EUR/USD* @ `1.16166`  (score 2)  expires 05:19 UTC
+⚪ GBP/USD — no setup (score 1) [RSI 58.1]
+⚪ USD/JPY — no setup (score 1) [RSI 54.5]
+⚪ USD/CHF — no setup (score 1) [RSI 48.7]
+✅ SELL *USD/CAD* @ `1.38448`  (score 2)  expires 05:19 UTC
+⚪ AUD/USD — no setup (score 1) [RSI 47.3]
+⚪ NZD/USD — no setup (score 1) [RSI 57.2]
+✅ SELL *EUR/JPY* @ `171.86700`  (score 2)  expires 05:19 UTC
+⚪ GBP/JPY — no setup (score 1) [RSI 58.9]
+✅ SELL *Gold* @ `3374.45000`  (score 2)  expires 05:19 UTC
+⚪ Silver — no setup (score 1) [RSI 46.9]
 ⚠️ BTC/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=500
 ⚠️ ETH/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1m&limit=500
 ⚠️ SOL/USDT error: 451 Client Error:  for url: https://api.binance.com/api/v3/klines?symbol=SOLUSDT&interval=1m&limit=500
