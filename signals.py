@@ -1,4 +1,4 @@
-import os, time, csv, csv, json
+import os, time, csv, json, csv, json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -101,28 +101,67 @@ def _post_now(chat_id, text):
     r = requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode":"Markdown"}, timeout=30)
     r.raise_for_status()
 
+
+# ---------- Tier limits & counters ----------
+_LIMITS_FILE = Path("tier_limits.json")
+_DATA_DIR = Path("data"); _DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def _load_limits():
+    try:
+        return json.load(open(_LIMITS_FILE))
+    except Exception:
+        # sensible defaults if file missing
+        return {"FREE": 5, "BASIC": 15, "PRO": 40, "VIP": 999999}
+
+def _count_file_for_today():
+    d = datetime.datetime.utcnow().strftime("%Y%m%d")
+    return _DATA_DIR / f"tier_counts_{d}.json"
+
+def _load_counts():
+    f = _count_file_for_today()
+    if f.exists():
+        try:
+            return json.load(open(f))
+        except Exception:
+            return {}
+    return {}
+
+def _save_counts(c):
+    json.dump(c, open(_count_file_for_today(), "w"))
+
+def _tier_can_send(tier: str) -> bool:
+    lim = _load_limits()
+    cap = int(lim.get(tier.upper(), 999999))
+    counts = _load_counts()
+    return int(counts.get(tier.upper(), 0)) < cap
+
+def _bump_tier_count(tier: str):
+    counts = _load_counts()
+    key = tier.upper()
+    counts[key] = int(counts.get(key, 0)) + 1
+    _save_counts(counts)
+
+
 def send_to_tiers(text, now_utc=None):
     from datetime import datetime, timezone, timedelta
     now_utc = now_utc or datetime.now(timezone.utc)
-    # VIP & PRO: instant if configured
-    if 'CHAT_VIP' in globals() and CHAT_VIP:   _post_now(CHAT_VIP, text)
-    if 'CHAT_PRO' in globals() and CHAT_PRO:   _post_now(CHAT_PRO, text)
 
-    # BASIC: queue or instant
-    if 'CHAT_BASIC' in globals() and CHAT_BASIC:
-        if BASIC_DELAY_MIN > 0:
-            when = now_utc + timedelta(minutes=BASIC_DELAY_MIN)
-            _queue_write(Path("data/basic_queue.csv"), when.strftime("%Y-%m-%d %H:%M:%S"), text)
-        else:
-            _post_now(CHAT_BASIC, text)
+    def try_send(tier_name, chat_id):
+        if not chat_id:
+            return
+        # VIP always allowed (large cap), others respect caps
+        if _tier_can_send(tier_name):
+            _post_now(chat_id, text)
+            _bump_tier_count(tier_name)
 
-    # FREE: queue or instant
-    if 'CHAT_FREE' in globals() and CHAT_FREE:
-        if FREE_DELAY_MIN > 0:
-            when = now_utc + timedelta(minutes=FREE_DELAY_MIN)
-            _queue_write(Path("data/free_queue.csv"), when.strftime("%Y-%m-%d %H:%M:%S"), text)
-        else:
-            _post_now(CHAT_FREE, text)
+    # VIP & PRO: instant
+    try_send("VIP",   CHAT_VIP   if 'CHAT_VIP'   in globals() else None)
+    try_send("PRO",   CHAT_PRO   if 'CHAT_PRO'   in globals() else None)
+
+    # BASIC & FREE: now instant too (caps still apply)
+    try_send("BASIC", CHAT_BASIC if 'CHAT_BASIC' in globals() else None)
+    try_send("FREE",  CHAT_FREE  if 'CHAT_FREE'  in globals() else None)
+
 
 # Final dispatch
 try:
