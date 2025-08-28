@@ -14,7 +14,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python - <<'PY'
-        import os
-        print("OANDA key present:", bool(os.getenv("OANDA_API_KEY")))
-        PY
+      - name: Show OANDA key presence
+        run: |
+          python - <<'PY'
+          import os
+          print("OANDA key present:", bool(os.getenv("OANDA_API_KEY")))
+          PY
