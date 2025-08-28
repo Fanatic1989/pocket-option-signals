@@ -1,15 +1,15 @@
 name: keepalive
+
 on:
   schedule:
-    - cron: '0 12 * * 1'  # every Monday 12:00 UTC
+    - cron: "0 */12 * * *"
   workflow_dispatch: {}
-env:
-  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+
 env:
   OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
-  ping:
+  ok:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Keeping repo active $(date -u)"
+      - run: echo "Keepalive OK. ✅"

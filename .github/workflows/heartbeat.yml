@@ -1,24 +1,15 @@
 name: heartbeat
+
 on:
   schedule:
-    - cron: "0 11 * * 1-5"   # 11:00 UTC = 07:00 America/Port_of_Spain (Mon–Fri)
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
+
 env:
   OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
-  ping_pro:
+  ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Send heartbeat to PRO
-        env:
-  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-        env:  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_PRO:  ${{ secrets.TELEGRAM_CHAT_PRO }}
-        run: |
-          UTC_NOW="$(date -u +'%Y-%m-%d %H:%M UTC')"
-          MSG="✅ Signals online — $UTC_NOW"
-          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_PRO}" -d parse_mode=Markdown \
-            --data-urlencode text="$MSG"
+      - run: echo "Heartbeat OK $(date -u). ✅"

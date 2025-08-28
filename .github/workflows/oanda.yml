@@ -1,83 +1,20 @@
-name: oanda-bot
+name: oanda-test
+
 on:
-  schedule:
-    - cron: '*/5 * * * *'   # every 5 minutes (UTC)
   workflow_dispatch: {}
+
 env:
   OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
-  run:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
-    env:
-  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-      INTERVAL: '1m'
-      EXPIRY_MIN: '5'
-      MIN_SCORE: '1'
-      RSI_BUY: '40'
-      RSI_SELL: '60'
-      MUST_TRADE: '1'
-      USE_TREND: '1'
-      PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache-dependency-path: requirements.txt
-          cache: 'pip'
-
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Run bot (retry, capture logs)
-        env:
-          OANDA_ENV: practice
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          set -e
-          mkdir -p logs data
-          tries=0
-          until [ $tries -ge 3 ]; do
-            python oanda_signal_bot.py 2>&1 | tee logs/run.log && break
-            tries=$((tries+1))
-            echo "Retry $tries/3 in 10s..." | tee -a logs/run.log
-            sleep 10
-          done
-
-          # Step summary for quick view
-          echo "### OANDA Bot — $(date -u +'%F %T UTC')" >> $GITHUB_STEP_SUMMARY
-          tail -n 80 logs/run.log >> $GITHUB_STEP_SUMMARY
-
-      - name: Commit CSV + log (optional but helpful)
-        run: |
-          git config user.email "bot@users.noreply.github.com"
-          git config user.name  "oanda-bot"
-          git add data/signals.csv logs/run.log || true
-          git commit -m "bot: $(date -u +'%F %T')" || echo "no changes"
-          git push || true
-
-      - name: Upload log artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: oanda-runlog-${{ github.run_number }}
-          path: logs/run.log
-          retention-days: 14
-
-      - name: Telegram debug ping (optional)
-        if: always()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT:  ${{ secrets.TELEGRAM_DEBUG_CHAT }}
-        run: |
-          if [ -n "${TG_TOKEN}" ] && [ -n "${TG_CHAT}" ]; then
-            STATUS="${{ job.status }}"
-            LAST="$(tail -n 10 logs/run.log | sed 's/%/%25/g' | sed 's/&/%26/g' | sed 's/+/%2B/g')"
-            MSG="OANDA bot: *${STATUS}* — $(date -u +'%F %T UTC')%0ARun #${{ github.run_number }}%0ARepo: ${{ github.repository }}%0ALast lines:%0A${LAST}"
-            curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-              -d chat_id="${TG_CHAT}" -d parse_mode=Markdown -d text="$MSG" >/dev/null
-          fi
+        with: { python-version: "3.11" }
+      - run: python - <<'PY'
+        import os, requests
+        key = os.getenv("OANDA_API_KEY")
+        print("Has key:", bool(key))
+        PY

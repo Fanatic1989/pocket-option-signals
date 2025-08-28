@@ -1,48 +1,13 @@
 name: stats-now
+
 on:
   workflow_dispatch: {}
-permissions:
-  contents: read
+
 env:
   OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
-  stats:
+  ok:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Post current caps & usage
-        env:
-  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-        env:  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_PRO:  ${{ secrets.TELEGRAM_CHAT_PRO }}
-        run: |
-          python - <<'PY'
-          import os, json, glob
-          from pathlib import Path
-          from datetime import datetime, timezone
-          DATA = Path("data"); DATA.mkdir(exist_ok=True)
-          # caps
-          lim = {"FREE":5,"BASIC":15,"PRO":40,"VIP":999999}
-          try: lim.update(json.load(open("tier_limits.json")))
-          except: pass
-          # today counts
-          today = datetime.now(timezone.utc).strftime("%Y%m%d")
-          counts = {}
-          fns = list(DATA.glob(f"tier_counts_{today}.json"))
-          if fns:
-            try: counts = json.load(open(fns[0]))
-            except: counts = {}
-          def fmt(n): return "∞" if n>=999999 else str(n)
-          msg = (
-            "📊 *Usage / Caps (Today)*\n"
-            f"FREE: {counts.get('FREE',0)}/{fmt(lim.get('FREE',5))}\n"
-            f"BASIC: {counts.get('BASIC',0)}/{fmt(lim.get('BASIC',15))}\n"
-            f"PRO: {counts.get('PRO',0)}/{fmt(lim.get('PRO',40))}\n"
-            f"VIP: {counts.get('VIP',0)}/{fmt(lim.get('VIP',999999))}"
-          )
-          import requests
-          url=f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
-          requests.post(url, data={"chat_id": os.environ["TELEGRAM_CHAT_PRO"], "text": msg, "parse_mode":"Markdown"}).raise_for_status()
-          PY
+      - run: echo "Stats now placeholder. ✅"

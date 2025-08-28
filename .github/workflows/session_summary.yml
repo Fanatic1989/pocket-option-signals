@@ -1,10 +1,14 @@
 name: session-summary
+
 on:
   schedule:
-    - cron: "5 21 * * 1-5"    # 21:05 UTC Mon–Fri
+    - cron: "5 21 * * 1-5"   # 21:05 UTC Mon–Fri
   workflow_dispatch: {}
+
 env:
   OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_PRO:   ${{ secrets.TELEGRAM_CHAT_PRO }}
 
 jobs:
   summarize:
@@ -12,22 +16,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: " 3.11 "
-          cache: pip
-          cache-dependency-path: requirements.txt
-
-      - name: Install deps
+        with: { python-version: "3.11" }
+      - run: python -m pip install --upgrade pip
+      - run: pip install pandas requests yfinance pyyaml
+      - name: Build & send daily summary
         env:
-  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-        env:  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-          PIP_DISABLE_PIP_VERSION_CHECK: "1"
-          PIP_NO_PYTHON_VERSION_WARNING: "1"
+          TELEGRAM_BOT_TOKEN: ${{ env.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ env.TELEGRAM_CHAT_PRO }}
         run: |
-          pip install pandas requests
-
-      - name: Install deps
-        run: |
-          pip install --upgrade pip
-          pip install --upgrade pip
-          pip install -r requirements.txt -c constraints.txt
+          python - <<'PY'
+          import os, csv, requests
+          from pathlib import Path
+          import pandas as pd
+          DATA = Path("data"); DATA.mkdir(exist_ok=True)
+          SIG  = DATA/"signals.csv"
+          if not SIG.exists(): raise SystemExit(0)
+          df = pd.read_csv(SIG)
+          if df.empty or "status" not in df.columns: raise SystemExit(0)
+          df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
+          df = df.dropna(subset=["ts_utc"])
+          today = pd.Timestamp.utcnow().date()
+          day = df[(df["status"]=="closed") & (df["ts_utc"].dt.date==today)]
+          if day.empty: raise SystemExit(0)
+          wins  = int((day["outcome"]=="WIN").sum())
+          loss  = int((day["outcome"]=="LOSS").sum())
+          draw  = int((day["outcome"]=="DRAW").sum()) if "outcome" in day else 0
+          total = wins+loss+draw
+          acc   = round(100* wins / max(1,(wins+loss)),1)
+          text = (f"📊 *Session Summary* — {today} UTC\n"
+                  f"Total: {total}\nWins: {wins} | Losses: {loss} | Draws: {draw}\n"
+                  f"Accuracy (excl. draws): {acc}%")
+          url=f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+          r = requests.post(url, data={"chat_id": os.environ['TELEGRAM_CHAT_ID'], "text": text, "parse_mode":"Markdown"})
+          r.raise_for_status()
+          PY
