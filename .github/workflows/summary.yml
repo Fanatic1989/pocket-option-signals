@@ -10,6 +10,7 @@ jobs:
   summarize:
     runs-on: ubuntu-latest
     env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
     env:  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
       TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_FREE:   ${{ secrets.TELEGRAM_CHAT_FREE }}

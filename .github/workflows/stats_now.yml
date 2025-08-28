@@ -10,6 +10,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Post current caps & usage
         env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
         env:  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_PRO:  ${{ secrets.TELEGRAM_CHAT_PRO }}

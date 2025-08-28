@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 6
     env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
       INTERVAL: '1m'
       EXPIRY_MIN: '5'
       MIN_SCORE: '1'
@@ -39,7 +40,6 @@ jobs:
 
       - name: Run bot (retry, capture logs)
         env:
-          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
           OANDA_ENV: practice
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}

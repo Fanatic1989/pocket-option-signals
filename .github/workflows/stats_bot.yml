@@ -20,6 +20,7 @@ jobs:
       - run: pip install requests pyyaml
       - name: Handle /stats commands
         env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
         env:  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python stats_bot.py
