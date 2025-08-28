@@ -1,6 +1,9 @@
 name: signals
 
 on:
+  # allow pushing CSV updates
+permissions:
+  contents: write
   schedule:
     - cron: "*/5 * * * *"      # generate + evaluate every 5m
   workflow_dispatch: {}
@@ -28,7 +31,8 @@ jobs:
         run: |
           git config user.email "bot@users.noreply.github.com"
           git config user.name "signals-bot"
-          git add data/signals.csv || true
+          mkdir -p data
+  git add -A data || true
           git commit -m "update signals $(date -u +'%F %T')" || echo "no changes"
           git push
   evaluate:
@@ -46,6 +50,7 @@ jobs:
         run: |
           git config user.email "bot@users.noreply.github.com"
           git config user.name "signals-bot"
-          git add data/*.csv || true
+          mkdir -p data
+  git add -A data || true
           git commit -m "evaluate outcomes $(date -u +'%F %T')" || echo "no changes"
           git push
