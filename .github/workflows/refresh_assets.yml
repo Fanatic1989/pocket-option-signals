@@ -1,15 +1,11 @@
 name: refresh-assets
-
 on:
   workflow_dispatch: {}          # manual button
   schedule:
     - cron: "0 9 * * 1"          # Mondays 09:00 UTC
-
-permissions:
-  contents: write
-
 env:
   OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+
 jobs:
   refresh:
     runs-on: ubuntu-latest

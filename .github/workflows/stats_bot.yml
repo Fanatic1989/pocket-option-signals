@@ -1,9 +1,10 @@
 name: stats-bot
-
 on:
   schedule:
     - cron: "*/2 * * * *"   # every 2 minutes
   workflow_dispatch: {}
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
   stats:

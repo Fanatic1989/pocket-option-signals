@@ -1,12 +1,10 @@
 name: heartbeat
-
 on:
   schedule:
     - cron: "0 11 * * 1-5"   # 11:00 UTC = 07:00 America/Port_of_Spain (Mon–Fri)
   workflow_dispatch: {}
-
-permissions:
-  contents: read
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
   ping_pro:

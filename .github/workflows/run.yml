@@ -1,12 +1,10 @@
 name: signals
-
 on:
   schedule:
     - cron: "*/5 * * * *"     # every 5 minutes
   workflow_dispatch: {}
-
-permissions:
-  contents: write
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
   generate:

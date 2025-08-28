@@ -3,6 +3,9 @@ on:
   workflow_dispatch: {}
 permissions:
   contents: read
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+
 jobs:
   stats:
     runs-on: ubuntu-latest

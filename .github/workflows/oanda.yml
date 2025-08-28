@@ -1,16 +1,10 @@
 name: oanda-bot
-
 on:
   schedule:
     - cron: '*/5 * * * *'   # every 5 minutes (UTC)
   workflow_dispatch: {}
-
-permissions:
-  contents: write   # allow committing CSV/logs if desired
-
-concurrency:
-  group: oanda-bot
-  cancel-in-progress: false
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
 
 jobs:
   run:

@@ -5,6 +5,9 @@ on:
   workflow_dispatch: {}
 env:
   OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+
 jobs:
   ping:
     runs-on: ubuntu-latest
