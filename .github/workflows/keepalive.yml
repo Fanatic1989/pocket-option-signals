@@ -3,6 +3,9 @@ on:
   schedule:
     - cron: '0 12 * * 1'  # every Monday 12:00 UTC
   workflow_dispatch: {}
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+
 jobs:
   ping:
     runs-on: ubuntu-latest

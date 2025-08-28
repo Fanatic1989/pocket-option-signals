@@ -22,6 +22,7 @@ jobs:
 
       - name: Install deps
         env:
+        env:  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
           PIP_NO_PYTHON_VERSION_WARNING: "1"
         run: |

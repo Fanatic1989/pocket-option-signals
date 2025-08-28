@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
