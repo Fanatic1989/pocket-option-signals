@@ -168,26 +168,25 @@ def main():
 
 if __name__ == "__main__":
     try:
-        lines = None
+        lines = []
         try:
-            lines = main()
-        except TypeError:
-            lines = [
-        f"📡 Pocket Option Signals — {now.strftime('%Y-%m-%d %H:%M UTC')}",
-        f"Candle: {INTERVAL} | Expiry: {EXPIRY_MIN}m",
-        ""    ] if 'lines = [' in locals() or True else lines]
+            result = main()
+            if result:
+                lines = result
+        except Exception as inner:
+            print("⚠️ Error running main():", inner)
+
         if not lines:
-            lines = [
-        f"📡 Pocket Option Signals — {now.strftime('%Y-%m-%d %H:%M UTC')}",
-        f"Candle: {INTERVAL} | Expiry: {EXPIRY_MIN}m",
-        ""    ] if 'lines = [' in locals() or True else lines"⚠️ No signals generated (debug)."]
-        full = "\n\n".join(lines)
-        print("=== MESSAGE TO SEND ===\n" + full + "\n=======================")
+            lines = ["⚠️ No signals generated (debug)."]
+
+        full_msg = "\n\n".join(lines)
+
         try:
-            send_to_tiers(full)
-        except Exception as e:
-            print("send_to_tiers failed:", e, "→ trying send_telegram()")
-            send_telegram(full)
+            send_to_tiers(full_msg)
+        except NameError:
+            print("send_to_tiers() missing, falling back to send_telegram()")
+            send_telegram(full_msg)
+
         print("✅ Signals run completed.")
     except Exception as e:
         import traceback

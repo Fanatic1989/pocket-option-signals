@@ -12,9 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
       - run: python - <<'PY'
-        import os, requests
-        key = os.getenv("OANDA_API_KEY")
-        print("Has key:", bool(key))
+        import os
+        print("OANDA key present:", bool(os.getenv("OANDA_API_KEY")))
         PY
