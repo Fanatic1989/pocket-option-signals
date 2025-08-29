@@ -33,4 +33,4 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run signals
-        run: python signals.py
+        run: python signals_live.py
