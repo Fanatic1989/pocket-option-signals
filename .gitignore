@@ -33,3 +33,5 @@ data/
 logs/
 .env
 signals_test.py
+*.bak.*
+*.tmp
