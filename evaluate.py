@@ -1,18 +1,28 @@
-import csv, requests
+import csv, os
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
 import pandas as pd
-from oanda_utils import oanda_get_candle
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
 
+from oanda_utils import oanda_price_at
 
 DATA = Path("data"); DATA.mkdir(exist_ok=True)
-SIGNALS_CSV = DATA / "signals.csv"
-PERF_CSV    = DATA / "perf.csv"
+SIGNALS_CSV = DATA/"signals.csv"
+PERF_CSV    = DATA/"perf.csv"
+
+# Map Yahoo symbols to OANDA instruments
+YF_TO_OANDA = {
+    "EURUSD=X":"EUR_USD", "GBPUSD=X":"GBP_USD", "USDJPY=X":"USD_JPY",
+    "USDCHF=X":"USD_CHF", "USDCAD=X":"USD_CAD", "AUDUSD=X":"AUD_USD",
+    "NZDUSD=X":"NZD_USD", "EURJPY=X":"EUR_JPY", "XAUUSD=X":"XAU_USD",
+    "BTC-USD":"BTC_USD", "ETH-USD":"ETH_USD"
+}
+
+def tolerance(symbol_yf: str) -> float:
+    s = symbol_yf.upper()
+    if s.endswith("JPY=X"): return 1e-3    # ~0.1 pip in JPY pairs
+    if s == "XAUUSD=X":     return 0.1     # 10c in gold
+    if s in ("BTC-USD","ETH-USD"): return 1.0
+    return 1e-5                              # ~0.1 pip
 
 def read_signals():
     if not SIGNALS_CSV.exists(): return []
@@ -23,110 +33,78 @@ def write_signals(rows):
     header = ["ts_utc","symbol_yf","symbol_pretty","signal","price","expiry_min",
               "evaluate_at_utc","status","score","why","result_price","outcome"]
     with open(SIGNALS_CSV, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        w.writeheader()
+        w = csv.DictWriter(f, fieldnames=header); w.writeheader()
         for r in rows: w.writerow(r)
-
-def fetch_1m_close(symbol_yf: str, when_utc: datetime) -> float:
-    sym = (symbol_yf or "").upper()
-
-    # --- Crypto via Binance (USDT)
-    if sym in ("BTC-USD","BTCUSD","BTCUSD=X"):
-        pair = "BTCUSDT"
-    elif sym in ("ETH-USD","ETHUSD","ETHUSD=X"):
-        pair = "ETHUSDT"
-    else:
-        pair = None
-
-    if pair:
-        url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval=1m&limit=6"
-        js = requests.get(url, timeout=10).json()
-        # kline: [open_time, open, high, low, close, volume, close_time, ...]
-        target = int(when_utc.timestamp())
-        for k in js:
-            ts = int(k[0]) // 1000
-            if ts >= target:
-                return float(k[4])
-        return float(js[-1][4])
-
-    # --- FX via Stooq (eurusd -> /?s=eurusd&i=1)
-    if sym.endswith("=X") and len(sym) == 8:
-        base = sym[:3].lower() + sym[3:6].lower()   # EURUSD=X -> eurusd
-        url = f"https://stooq.com/q/d/l/?s={base}&i=1"
-        txt = requests.get(url, timeout=10).text.strip().splitlines()
-        # header: Date,Time,Open,High,Low,Close,Volume
-        for row in txt[1:]:
-            d,t,o,h,l,c,v = row.split(",")
-            ts = datetime.strptime(d + " " + t, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            if ts >= when_utc:
-                return float(c)
-        # if none >= when_utc, return last close
-        return float(txt[-1].split(",")[5])
-
-    # If we get here, no supported feed
-    raise RuntimeError(f"No feed for {symbol_yf}")
 
 def evaluate_due(rows):
     now = datetime.now(timezone.utc)
     changed = False
     for r in rows:
-        if r.get("status","open") != "open": 
-            continue
-        dt = r.get("evaluate_at_utc") or r.get("expires_utc")
-        if not dt: 
-            continue
-        # tolerant parse (supports ISO with Z/offsets)
+        if r.get("status","open") != "open": continue
+        if not r.get("evaluate_at_utc"):     continue
         try:
-            eval_at = datetime.fromisoformat(dt.replace("Z","+00:00")).astimezone(timezone.utc)
+            eval_at = datetime.strptime(r["evaluate_at_utc"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except Exception:
-            eval_at = datetime.strptime(dt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            continue
+        if now < eval_at: continue
 
-        if now >= eval_at:
-            try:
-                result_px = fetch_1m_close(r["symbol_yf"], eval_at)
-            except Exception:
-                # skip if no data
-                continue
+        yf_symbol = r.get("symbol_yf","")
+        inst = YF_TO_OANDA.get(yf_symbol)
+        if not inst:
+            # skip if we don't have a clean mapping
+            continue
 
-            entry_px = float(r["price"])
-            side = r["signal"]
-            eps = 1e-5
-            if abs(result_px - entry_px) <= eps:
-                outcome = "DRAW"
-            else:
-                if side == "BUY":
-                    outcome = "WIN" if result_px > entry_px else "LOSS"
-                else:
-                    outcome = "WIN" if result_px < entry_px else "LOSS"
+        # fetch result price at/after evaluate time
+        try:
+            result_px = float(oanda_price_at(inst, eval_at.isoformat().replace("+00:00","Z"), granularity="M1"))
+        except Exception as e:
+            # leave open if we truly can't price
+            print(f"⚠️ pricing error for {yf_symbol} at {eval_at}: {e}")
+            continue
 
-            r["result_price"] = f"{result_px:.8f}"
-            r["outcome"] = outcome
-            r["status"] = "closed"
-            changed = True
+        entry_px = float(r.get("price","0") or "0")
+        side = r.get("signal")
+        tol  = tolerance(yf_symbol)
+
+        out=None
+        if abs(result_px - entry_px) <= tol:
+            out = "DRAW"
+        else:
+            win = (result_px > entry_px) if side == "BUY" else (result_px < entry_px)
+            out = "WIN" if win else "LOSS"
+
+        r["result_price"] = f"{result_px:.8f}"
+        r["outcome"] = out
+        r["status"] = "closed"
+        changed = True
     return changed
 
 def recompute_perf(rows):
     df = pd.DataFrame(rows)
     if df.empty: return None
-    df = df[df["status"]=="closed"]
+    df = df[df["status"]=="closed"].copy()
     if df.empty: return None
     df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["ts_utc"])
-    df["is_win"] = (df["outcome"]=="WIN").astype(int)
     now = pd.Timestamp.utcnow()
     d1 = df[df["ts_utc"] >= now - pd.Timedelta(days=1)]
     d7 = df[df["ts_utc"] >= now - pd.Timedelta(days=7)]
-    def acc(x): 
-        return round(100 * (x["is_win"].mean() if len(x)>0 else 0), 1)
+
+    def acc(x):
+        if x.empty: return 0.0
+        y = x[x["outcome"]!="DRAW"]
+        return round(100 * (y["outcome"].eq("WIN").mean() if not y.empty else 0), 1)
+
     perf = {
         "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
         "count_total": int(len(df)),
         "acc_1d": acc(d1),
         "acc_7d": acc(d7),
-        "wins": int(df["is_win"].sum()),
-        "losses": int((1-df["is_win"]).sum()),
+        "wins": int((df["outcome"]=="WIN").sum()),
+        "losses": int((df["outcome"]=="LOSS").sum()),
+        "draws": int((df["outcome"]=="DRAW").sum()),
     }
-    header = ["ts_utc","count_total","acc_1d","acc_7d","wins","losses"]
+    header = ["ts_utc","count_total","acc_1d","acc_7d","wins","losses","draws"]
     exists = PERF_CSV.exists()
     with open(PERF_CSV,"a",newline="") as f:
         w = csv.DictWriter(f, fieldnames=header)
