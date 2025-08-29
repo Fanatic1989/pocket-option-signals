@@ -46,4 +46,4 @@ jobs:
       - name: Run signals (ensure repo on PYTHONPATH)
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python signals_live.py
+        run: python signals_orb.py

@@ -1,181 +1,341 @@
 symbols:
-- yf: EURUSD=X
-  name: EUR/USD
+- oanda: EUR_SGD
+  yf: EURSGD=X
+  name: EUR/SGD
   group: FX
   enabled: true
-- yf: GBPUSD=X
-  name: GBP/USD
-  group: FX
-  enabled: true
-- yf: USDJPY=X
-  name: USD/JPY
-  group: FX
-  enabled: true
-- yf: USDCHF=X
-  name: USD/CHF
-  group: FX
-  enabled: true
-- yf: USDCAD=X
-  name: USD/CAD
-  group: FX
-  enabled: true
-- yf: AUDUSD=X
-  name: AUD/USD
-  group: FX
-  enabled: true
-- yf: NZDUSD=X
-  name: NZD/USD
-  group: FX
-  enabled: true
-- yf: EURGBP=X
-  name: EUR/GBP
-  group: FX
-  enabled: true
-- yf: EURJPY=X
-  name: EUR/JPY
-  group: FX
-  enabled: true
-- yf: EURAUD=X
+- oanda: EUR_AUD
+  yf: EURAUD=X
   name: EUR/AUD
   group: FX
   enabled: true
-- yf: EURNZD=X
-  name: EUR/NZD
+- oanda: USD_CAD
+  yf: USDCAD=X
+  name: USD/CAD
   group: FX
   enabled: true
-- yf: EURCAD=X
-  name: EUR/CAD
+- oanda: EUR_NOK
+  yf: EURNOK=X
+  name: EUR/NOK
   group: FX
   enabled: true
-- yf: EURCHF=X
-  name: EUR/CHF
+- oanda: NZD_HKD
+  yf: NZDHKD=X
+  name: NZD/HKD
   group: FX
   enabled: true
-- yf: GBPJPY=X
-  name: GBP/JPY
+- oanda: USD_CZK
+  yf: USDCZK=X
+  name: USD/CZK
   group: FX
   enabled: true
-- yf: GBPAUD=X
-  name: GBP/AUD
+- oanda: EUR_GBP
+  yf: EURGBP=X
+  name: EUR/GBP
   group: FX
   enabled: true
-- yf: GBPNZD=X
-  name: GBP/NZD
+- oanda: USD_CNH
+  yf: USDCNH=X
+  name: USD/CNH
   group: FX
   enabled: true
-- yf: GBPCAD=X
-  name: GBP/CAD
-  group: FX
-  enabled: true
-- yf: GBPCHF=X
-  name: GBP/CHF
-  group: FX
-  enabled: true
-- yf: AUDJPY=X
-  name: AUD/JPY
-  group: FX
-  enabled: true
-- yf: AUDCAD=X
-  name: AUD/CAD
-  group: FX
-  enabled: true
-- yf: AUDCHF=X
-  name: AUD/CHF
-  group: FX
-  enabled: true
-- yf: NZDJPY=X
+- oanda: NZD_JPY
+  yf: NZDJPY=X
   name: NZD/JPY
   group: FX
   enabled: true
-- yf: NZDCAD=X
-  name: NZD/CAD
+- oanda: USD_HKD
+  yf: USDHKD=X
+  name: USD/HKD
   group: FX
   enabled: true
-- yf: NZDCHF=X
+- oanda: CAD_HKD
+  yf: CADHKD=X
+  name: CAD/HKD
+  group: FX
+  enabled: true
+- oanda: USD_CHF
+  yf: USDCHF=X
+  name: USD/CHF
+  group: FX
+  enabled: true
+- oanda: AUD_HKD
+  yf: AUDHKD=X
+  name: AUD/HKD
+  group: FX
+  enabled: true
+- oanda: NZD_CHF
+  yf: NZDCHF=X
   name: NZD/CHF
   group: FX
   enabled: true
-- yf: CADJPY=X
-  name: CAD/JPY
+- oanda: AUD_CHF
+  yf: AUDCHF=X
+  name: AUD/CHF
   group: FX
   enabled: true
-- yf: CADCHF=X
-  name: CAD/CHF
+- oanda: GBP_CHF
+  yf: GBPCHF=X
+  name: GBP/CHF
   group: FX
   enabled: true
-- yf: CHFJPY=X
+- oanda: USD_THB
+  yf: USDTHB=X
+  name: USD/THB
+  group: FX
+  enabled: true
+- oanda: EUR_HKD
+  yf: EURHKD=X
+  name: EUR/HKD
+  group: FX
+  enabled: true
+- oanda: CHF_JPY
+  yf: CHFJPY=X
   name: CHF/JPY
   group: FX
   enabled: true
-- yf: XAUUSD=X
-  name: Gold (XAU/USD)
-  group: COMMODITY
+- oanda: GBP_HKD
+  yf: GBPHKD=X
+  name: GBP/HKD
+  group: FX
   enabled: true
-- yf: XAGUSD=X
-  name: Silver (XAG/USD)
-  group: COMMODITY
+- oanda: EUR_NZD
+  yf: EURNZD=X
+  name: EUR/NZD
+  group: FX
   enabled: true
-- yf: BTC-USD
-  name: BTC/USD
-  group: CRYPTO
+- oanda: AUD_SGD
+  yf: AUDSGD=X
+  name: AUD/SGD
+  group: FX
   enabled: true
-- yf: ETH-USD
-  name: ETH/USD
-  group: CRYPTO
+- oanda: EUR_JPY
+  yf: EURJPY=X
+  name: EUR/JPY
+  group: FX
   enabled: true
-- yf: SOL-USD
-  name: SOL/USD
-  group: CRYPTO
-  enabled: false
-- yf: XRP-USD
-  name: XRP/USD
-  group: CRYPTO
-  enabled: false
-- yf: LTC-USD
-  name: LTC/USD
-  group: CRYPTO
-  enabled: false
-- yf: ^GSPC
-  name: S&P 500
-  group: INDEX
+- oanda: EUR_TRY
+  yf: EURTRY=X
+  name: EUR/TRY
+  group: FX
   enabled: true
-- yf: ^NDX
-  name: NASDAQ 100
-  group: INDEX
+- oanda: USD_JPY
+  yf: USDJPY=X
+  name: USD/JPY
+  group: FX
   enabled: true
-- yf: ^DJI
-  name: Dow Jones 30
-  group: INDEX
+- oanda: SGD_JPY
+  yf: SGDJPY=X
+  name: SGD/JPY
+  group: FX
   enabled: true
-- yf: ^IXIC
-  name: Nasdaq Comp
-  group: INDEX
-  enabled: false
-- yf: ^GDAXI
-  name: DAX (GER40)
-  group: INDEX
+- oanda: GBP_ZAR
+  yf: GBPZAR=X
+  name: GBP/ZAR
+  group: FX
   enabled: true
-- yf: ^FTSE
-  name: FTSE 100 (UK)
-  group: INDEX
+- oanda: ZAR_JPY
+  yf: ZARJPY=X
+  name: ZAR/JPY
+  group: FX
   enabled: true
-- yf: ^FCHI
-  name: CAC 40 (FR)
-  group: INDEX
-  enabled: false
-- yf: ^STOXX50E
-  name: EURO STOXX 50
-  group: INDEX
-  enabled: false
-- yf: ^N225
-  name: Nikkei 225
-  group: INDEX
+- oanda: NZD_SGD
+  yf: NZDSGD=X
+  name: NZD/SGD
+  group: FX
   enabled: true
-- yf: ^HSI
-  name: Hang Seng
-  group: INDEX
-  enabled: false
-- yf: ^AXJO
-  name: ASX 200
-  group: INDEX
-  enabled: false
+- oanda: USD_SEK
+  yf: USDSEK=X
+  name: USD/SEK
+  group: FX
+  enabled: true
+- oanda: GBP_SGD
+  yf: GBPSGD=X
+  name: GBP/SGD
+  group: FX
+  enabled: true
+- oanda: AUD_JPY
+  yf: AUDJPY=X
+  name: AUD/JPY
+  group: FX
+  enabled: true
+- oanda: TRY_JPY
+  yf: TRYJPY=X
+  name: TRY/JPY
+  group: FX
+  enabled: true
+- oanda: HKD_JPY
+  yf: HKDJPY=X
+  name: HKD/JPY
+  group: FX
+  enabled: true
+- oanda: USD_PLN
+  yf: USDPLN=X
+  name: USD/PLN
+  group: FX
+  enabled: true
+- oanda: GBP_AUD
+  yf: GBPAUD=X
+  name: GBP/AUD
+  group: FX
+  enabled: true
+- oanda: CAD_CHF
+  yf: CADCHF=X
+  name: CAD/CHF
+  group: FX
+  enabled: true
+- oanda: NZD_USD
+  yf: NZDUSD=X
+  name: NZD/USD
+  group: FX
+  enabled: true
+- oanda: EUR_ZAR
+  yf: EURZAR=X
+  name: EUR/ZAR
+  group: FX
+  enabled: true
+- oanda: USD_NOK
+  yf: USDNOK=X
+  name: USD/NOK
+  group: FX
+  enabled: true
+- oanda: AUD_NZD
+  yf: AUDNZD=X
+  name: AUD/NZD
+  group: FX
+  enabled: true
+- oanda: CHF_ZAR
+  yf: CHFZAR=X
+  name: CHF/ZAR
+  group: FX
+  enabled: true
+- oanda: EUR_CHF
+  yf: EURCHF=X
+  name: EUR/CHF
+  group: FX
+  enabled: true
+- oanda: USD_DKK
+  yf: USDDKK=X
+  name: USD/DKK
+  group: FX
+  enabled: true
+- oanda: CAD_SGD
+  yf: CADSGD=X
+  name: CAD/SGD
+  group: FX
+  enabled: true
+- oanda: EUR_DKK
+  yf: EURDKK=X
+  name: EUR/DKK
+  group: FX
+  enabled: true
+- oanda: USD_ZAR
+  yf: USDZAR=X
+  name: USD/ZAR
+  group: FX
+  enabled: true
+- oanda: CAD_JPY
+  yf: CADJPY=X
+  name: CAD/JPY
+  group: FX
+  enabled: true
+- oanda: USD_HUF
+  yf: USDHUF=X
+  name: USD/HUF
+  group: FX
+  enabled: true
+- oanda: EUR_CAD
+  yf: EURCAD=X
+  name: EUR/CAD
+  group: FX
+  enabled: true
+- oanda: EUR_USD
+  yf: EURUSD=X
+  name: EUR/USD
+  group: FX
+  enabled: true
+- oanda: EUR_HUF
+  yf: EURHUF=X
+  name: EUR/HUF
+  group: FX
+  enabled: true
+- oanda: CHF_HKD
+  yf: CHFHKD=X
+  name: CHF/HKD
+  group: FX
+  enabled: true
+- oanda: GBP_NZD
+  yf: GBPNZD=X
+  name: GBP/NZD
+  group: FX
+  enabled: true
+- oanda: USD_SGD
+  yf: USDSGD=X
+  name: USD/SGD
+  group: FX
+  enabled: true
+- oanda: EUR_SEK
+  yf: EURSEK=X
+  name: EUR/SEK
+  group: FX
+  enabled: true
+- oanda: USD_TRY
+  yf: USDTRY=X
+  name: USD/TRY
+  group: FX
+  enabled: true
+- oanda: GBP_JPY
+  yf: GBPJPY=X
+  name: GBP/JPY
+  group: FX
+  enabled: true
+- oanda: GBP_PLN
+  yf: GBPPLN=X
+  name: GBP/PLN
+  group: FX
+  enabled: true
+- oanda: EUR_PLN
+  yf: EURPLN=X
+  name: EUR/PLN
+  group: FX
+  enabled: true
+- oanda: AUD_CAD
+  yf: AUDCAD=X
+  name: AUD/CAD
+  group: FX
+  enabled: true
+- oanda: EUR_CZK
+  yf: EURCZK=X
+  name: EUR/CZK
+  group: FX
+  enabled: true
+- oanda: GBP_USD
+  yf: GBPUSD=X
+  name: GBP/USD
+  group: FX
+  enabled: true
+- oanda: USD_MXN
+  yf: USDMXN=X
+  name: USD/MXN
+  group: FX
+  enabled: true
+- oanda: GBP_CAD
+  yf: GBPCAD=X
+  name: GBP/CAD
+  group: FX
+  enabled: true
+- oanda: SGD_CHF
+  yf: SGDCHF=X
+  name: SGD/CHF
+  group: FX
+  enabled: true
+- oanda: NZD_CAD
+  yf: NZDCAD=X
+  name: NZD/CAD
+  group: FX
+  enabled: true
+- oanda: AUD_USD
+  yf: AUDUSD=X
+  name: AUD/USD
+  group: FX
+  enabled: true
