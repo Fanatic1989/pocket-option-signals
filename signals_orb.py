@@ -2,7 +2,8 @@ import os, csv, yaml, time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from telegram_send import send_to_tiers
-import orb
+try: import orb
+except ModuleNotFoundError: print("⚠️ ORB module not found, skipping ORB strategy."); orb=None
 
 INTERVAL   = os.getenv("INTERVAL","1m")         # 1m candles
 EXPIRY_MIN = int(os.getenv("EXPIRY_MIN","5"))   # 5m expiry

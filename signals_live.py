@@ -2,6 +2,33 @@ import os, csv, time, requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+
+def send_to_tiers(msg: str):
+    """Send plain text to all tier channels."""
+    import os, requests
+    bot = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot:
+        print("⚠️ TELEGRAM_BOT_TOKEN missing, skipped send")
+        return
+    chats = [
+        os.getenv("TELEGRAM_CHAT_FREE"),
+        os.getenv("TELEGRAM_CHAT_BASIC"),
+        os.getenv("TELEGRAM_CHAT_PRO"),
+        os.getenv("TELEGRAM_CHAT_VIP"),
+    ]
+    url = f"https://api.telegram.org/bot{bot}/sendMessage"
+    for cid in chats:
+        if not cid: continue
+        r = requests.post(url, data={"chat_id": cid, "text": msg}, timeout=20)
+        try:
+            js = r.json()
+        except Exception:
+            js = {"ok": False}
+        if js.get("ok"):
+            print(f"✅ Sent to {cid}")
+        else:
+            print(f"⚠️ Send failed {cid}: {js}")
+
 # -------- Config --------
 INTERVAL   = os.getenv("INTERVAL", "5m")        # 1m / 5m
 EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10")) # option expiry
@@ -19,7 +46,7 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY","")
 OANDA_ENV     = os.getenv("OANDA_ENV","practice")  # practice|live
 OANDA_HOST    = "api-fxpractice.oanda.com" if OANDA_ENV!="live" else "api-fxtrade.oanda.com"
 
-from telegram_send import send_to_tiers
+
 
 def y2o(yf):
     # minimal map for FX/crypto/gold; extend as needed
@@ -32,6 +59,8 @@ def y2o(yf):
 
 def load_symbols():
     import yaml
+try: import orb
+except ModuleNotFoundError: print("⚠️ ORB module not found, skipping ORB strategy."); orb=None
     cfg = yaml.safe_load(open(SYMS))
     return [(s["yf"], s.get("name", s["yf"])) for s in cfg["symbols"] if s.get("enabled", True)]
 
@@ -117,6 +146,62 @@ def main():
     picked=None
     for yf_sym, pretty in load_symbols():
         try:
+        # === ORB attempt (1m ORB + retest) ===
+        try:
+            orb_res, orb_note = orb.orb_signal(yf_sym, pretty, expiry_min=5)
+        except Exception as _e:
+            orb_res, orb_note = (None, f"orb error: {_e}")
+        if orb_res:
+            side = orb_res["signal"]
+            px   = float(orb_res["price"])
+            score= int(orb_res.get("score",2))
+            why  = orb_res.get("why","ORB")
+            arrow = "🟢 BUY" if side=="BUY" else "🔴 SELL"
+            lines.append(f"{arrow} *{pretty}* @ `{px:.5f}`\n• {why} (score {score})")
+            evaluate_at = now + timedelta(minutes=EXPIRY_MIN if 'EXPIRY_MIN' in globals() else 5)
+            append_signal({
+                "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol_yf": yf_sym,
+                "symbol_pretty": pretty,
+                "signal": side,
+                "price": f"{px:.8f}",
+                "expiry_min": EXPIRY_MIN if 'EXPIRY_MIN' in globals() else 5,
+                "evaluate_at_utc": evaluate_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "open",
+                "score": score,
+                "why": why
+            })
+            continue  # skip to next symbol if ORB fired
+        # === end ORB ===
+
+        # === ORB attempt (1m ORB + retest) ===
+        try:
+            orb_res, orb_note = orb.orb_signal(yf_sym, pretty, expiry_min=5)
+        except Exception as _e:
+            orb_res, orb_note = (None, f"orb error: {_e}")
+        if orb_res:
+            side = orb_res["signal"]
+            px   = float(orb_res["price"])
+            score= int(orb_res.get("score",2))
+            why  = orb_res.get("why","ORB")
+            arrow = "🟢 BUY" if side=="BUY" else "🔴 SELL"
+            lines.append(f"{arrow} *{pretty}* @ `{px:.5f}`\n• {why} (score {score})")
+            evaluate_at = now + timedelta(minutes=EXPIRY_MIN if 'EXPIRY_MIN' in globals() else 5)
+            append_signal({
+                "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol_yf": yf_sym,
+                "symbol_pretty": pretty,
+                "signal": side,
+                "price": f"{px:.8f}",
+                "expiry_min": EXPIRY_MIN if 'EXPIRY_MIN' in globals() else 5,
+                "evaluate_at_utc": evaluate_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "status": "open",
+                "score": score,
+                "why": why
+            })
+            continue  # skip to next symbol if ORB fired
+        # === end ORB ===
+
             o = y2o(yf_sym)
             if not o: 
                 lines.append(f"⚪ {pretty} — unsupported map")
