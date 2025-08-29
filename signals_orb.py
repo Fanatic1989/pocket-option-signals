@@ -4,6 +4,12 @@ except ModuleNotFoundError:
     print("⚠️ ORB module not found, skipping ORB strategy.")
     orb=None
 
+try:
+    import orb
+except ModuleNotFoundError:
+    print("⚠️ ORB module not found, skipping ORB strategy.")
+    orb=None
+
 import os, csv, yaml, time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
