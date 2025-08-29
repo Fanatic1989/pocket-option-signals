@@ -1,3 +1,6 @@
 symbols:
-  - { yf: "EURUSD=X", name: "EUR/USD", group: FX, enabled: true }
-  - { yf: "BTCUSD=X", name: "BTC/USD", group: CRYPTO, enabled: true }
+  - { yf: "EURUSD=X", name: "EUR/USD", group: FX,      enabled: true }
+  - { yf: "GBPUSD=X", name: "GBP/USD", group: FX,      enabled: true }
+  - { yf: "USDJPY=X", name: "USD/JPY", group: FX,      enabled: true }
+  - { yf: "BTC-USD",  name: "BTC/USD",  group: CRYPTO, enabled: true }
+  - { yf: "ETH-USD",  name: "ETH/USD",  group: CRYPTO, enabled: true }
