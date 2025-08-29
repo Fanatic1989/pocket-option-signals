@@ -32,5 +32,14 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run signals
+      - name: Show repo root & file exists
+        run: |
+          pwd
+          ls -lah
+          python -c "import sys; print('PYTHONPATH=', sys.path)"
+          python -c "import telegram_send; print('telegram_send import OK')"
+
+      - name: Run signals (ensure repo on PYTHONPATH)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: python signals_live.py
