@@ -2,52 +2,14 @@ name: signals
 
 on:
   schedule:
+    - cron: "*/1 * * * *"
     - cron: "*/1 * * * 1-5"   # every 1 minute, weekdays
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
-
-jobs:
+  schedule:
+    - cron: "*/1 * * * *"
   scalper:
     runs-on: ubuntu-latest
-    env:
-  FX_HOURS_UTC: "0700-1700"
-  COMMODITY_HOURS_UTC: "0700-1700"
-  INDEX_HOURS_UTC: "1330-2000"
-  STOCK_HOURS_UTC: "1330-2000"
-  WEEKDAYS_FX: "12345"
-  WEEKDAYS_COMMODITY: "12345"
-  WEEKDAYS_INDEX: "12345"
-  WEEKDAYS_STOCK: "12345"
-      EXPIRY_MIN: "5"
-      RSI_BUY: "50"
-      RSI_SELL: "50"
-      MIN_SCORE: "1"
-      MUST_TRADE: "0"
-      SUPPRESS_EMPTY: "1"
-      OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-      OANDA_ENV:     ${{ secrets.OANDA_ENV }}   # practice or live
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_FREE:  ${{ secrets.TELEGRAM_CHAT_FREE }}
-      TELEGRAM_CHAT_BASIC: ${{ secrets.TELEGRAM_CHAT_BASIC }}
-      TELEGRAM_CHAT_PRO:   ${{ secrets.TELEGRAM_CHAT_PRO }}
-      TELEGRAM_CHAT_VIP:   ${{ secrets.TELEGRAM_CHAT_VIP }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
+  schedule:
+    - cron: "*/1 * * * *"
           python-version: "3.11"
-          cache: "pip"
-      - run: |
-          python -m pip install --upgrade pip
-          pip install numpy==1.26.4 pandas==2.2.2 pandas_ta yfinance pyyaml requests
-      - name: Run scalper
-        run: python signals_live.py
-      - name: Commit logs
-        run: |
-          git config user.email "bot@users.noreply.github.com"
-          git config user.name "signals-bot"
-          git add data/*.csv || true
-          git commit -m "scalper logs $(date -u +'%F %T')" || echo "no changes"
-          git push || true
+  schedule:
+    - cron: "*/1 * * * *"
