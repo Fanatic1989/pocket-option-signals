@@ -1,3 +1,9 @@
+try:
+    import orb
+except ModuleNotFoundError:
+    print("⚠️ ORB module not found, skipping ORB strategy.")
+    orb=None
+
 import os, csv, time, requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
