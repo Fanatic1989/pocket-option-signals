@@ -1,63 +1,36 @@
-name: signals
+name: Run Signals Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5min
+    - cron: "*/5 * * * 1-5"  # every 5 min Mon–Fri
   workflow_dispatch: {}
 
-permissions:
-  contents: write
-
 jobs:
-  generate:
+  run-signals:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    env:
+      MUST_TRADE: "0"
+      SUPPRESS_EMPTY: "1"
+      INTERVAL: "5m"
+      EXPIRY_MIN: "10"
+      OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+      OANDA_ENV: ${{ secrets.OANDA_ENV }}   # "practice" or "live"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      # Load .env if present, also inject OANDA secret
-      - name: Load env
+      - name: Install dependencies
         run: |
-          if [ -f .env ]; then set -a; . ./.env; set +a; fi
-          echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" >> $GITHUB_ENV
-          echo "TELEGRAM_CHAT_FREE=${TELEGRAM_CHAT_FREE}"   >> $GITHUB_ENV
-          echo "TELEGRAM_CHAT_BASIC=${TELEGRAM_CHAT_BASIC}" >> $GITHUB_ENV
-          echo "TELEGRAM_CHAT_PRO=${TELEGRAM_CHAT_PRO}"     >> $GITHUB_ENV
-          echo "TELEGRAM_CHAT_VIP=${TELEGRAM_CHAT_VIP}"     >> $GITHUB_ENV
-          echo "OANDA_API_KEY=${{ secrets.OANDA_API_KEY }}" >> $GITHUB_ENV
-
-      - name: Install requirements
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install yfinance pandas pandas_ta pyyaml requests
-          fi
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run signals
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ env.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_FREE: ${{ env.TELEGRAM_CHAT_FREE }}
-          TELEGRAM_CHAT_BASIC: ${{ env.TELEGRAM_CHAT_BASIC }}
-          TELEGRAM_CHAT_PRO: ${{ env.TELEGRAM_CHAT_PRO }}
-          TELEGRAM_CHAT_VIP: ${{ env.TELEGRAM_CHAT_VIP }}
-          OANDA_API_KEY: ${{ env.OANDA_API_KEY }}
-          INTERVAL: "5m"
-          EXPIRY_MIN: "10"
-          MIN_SCORE: "2"
-          MUST_TRADE: "0"
-          SUPPRESS_EMPTY: "1"
         run: python signals.py
-
-      - name: Commit CSV updates
-        run: |
-          git config user.email "bot@users.noreply.github.com"
-          git config user.name  "signals-bot"
-          mkdir -p data
-          git add -A data || true
-          git commit -m "update data $(date -u +'%F %T')" || echo "no changes"
-          git push
