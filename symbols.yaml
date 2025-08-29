@@ -1,46 +1,181 @@
 symbols:
-  # ===== FX Majors =====
-  - { yf: "EURUSD=X", name: "EUR/USD", group: FX, enabled: true }
-  - { yf: "GBPUSD=X", name: "GBP/USD", group: FX, enabled: true }
-  - { yf: "USDJPY=X", name: "USD/JPY", group: FX, enabled: true }
-  - { yf: "USDCHF=X", name: "USD/CHF", group: FX, enabled: true }
-  - { yf: "USDCAD=X", name: "USD/CAD", group: FX, enabled: true }
-  - { yf: "AUDUSD=X", name: "AUD/USD", group: FX, enabled: true }
-  - { yf: "NZDUSD=X", name: "NZD/USD", group: FX, enabled: true }
-
-  # ===== Euro Crosses =====
-  - { yf: "EURGBP=X", name: "EUR/GBP", group: FX, enabled: true }
-  - { yf: "EURJPY=X", name: "EUR/JPY", group: FX, enabled: true }
-  - { yf: "EURAUD=X", name: "EUR/AUD", group: FX, enabled: true }
-  - { yf: "EURNZD=X", name: "EUR/NZD", group: FX, enabled: true }
-  - { yf: "EURCAD=X", name: "EUR/CAD", group: FX, enabled: true }
-  - { yf: "EURCHF=X", name: "EUR/CHF", group: FX, enabled: true }
-
-  # ===== GBP Crosses =====
-  - { yf: "GBPJPY=X", name: "GBP/JPY", group: FX, enabled: true }
-  - { yf: "GBPAUD=X", name: "GBP/AUD", group: FX, enabled: true }
-  - { yf: "GBPNZD=X", name: "GBP/NZD", group: FX, enabled: true }
-  - { yf: "GBPCAD=X", name: "GBP/CAD", group: FX, enabled: true }
-  - { yf: "GBPCHF=X", name: "GBP/CHF", group: FX, enabled: true }
-
-  # ===== AUD/NZD/CAD/CHF/JPY Crosses =====
-  - { yf: "AUDJPY=X", name: "AUD/JPY", group: FX, enabled: true }
-  - { yf: "AUDCAD=X", name: "AUD/CAD", group: FX, enabled: true }
-  - { yf: "AUDCHF=X", name: "AUD/CHF", group: FX, enabled: true }
-  - { yf: "NZDJPY=X", name: "NZD/JPY", group: FX, enabled: true }
-  - { yf: "NZDCAD=X", name: "NZD/CAD", group: FX, enabled: true }
-  - { yf: "NZDCHF=X", name: "NZD/CHF", group: FX, enabled: true }
-  - { yf: "CADJPY=X", name: "CAD/JPY", group: FX, enabled: true }
-  - { yf: "CADCHF=X", name: "CAD/CHF", group: FX, enabled: true }
-  - { yf: "CHFJPY=X", name: "CHF/JPY", group: FX, enabled: true }
-
-  # ===== Metals =====
-  - { yf: "XAUUSD=X", name: "Gold (XAU/USD)", group: COMMODITY, enabled: true }
-  - { yf: "XAGUSD=X", name: "Silver (XAG/USD)", group: COMMODITY, enabled: true }
-
-  # ===== Crypto (top) =====
-  - { yf: "BTC-USD",  name: "BTC/USD", group: CRYPTO, enabled: true }
-  - { yf: "ETH-USD",  name: "ETH/USD", group: CRYPTO, enabled: true }
-  - { yf: "SOL-USD",  name: "SOL/USD", group: CRYPTO, enabled: false }
-  - { yf: "XRP-USD",  name: "XRP/USD", group: CRYPTO, enabled: false }
-  - { yf: "LTC-USD",  name: "LTC/USD", group: CRYPTO, enabled: false }
+- yf: EURUSD=X
+  name: EUR/USD
+  group: FX
+  enabled: true
+- yf: GBPUSD=X
+  name: GBP/USD
+  group: FX
+  enabled: true
+- yf: USDJPY=X
+  name: USD/JPY
+  group: FX
+  enabled: true
+- yf: USDCHF=X
+  name: USD/CHF
+  group: FX
+  enabled: true
+- yf: USDCAD=X
+  name: USD/CAD
+  group: FX
+  enabled: true
+- yf: AUDUSD=X
+  name: AUD/USD
+  group: FX
+  enabled: true
+- yf: NZDUSD=X
+  name: NZD/USD
+  group: FX
+  enabled: true
+- yf: EURGBP=X
+  name: EUR/GBP
+  group: FX
+  enabled: true
+- yf: EURJPY=X
+  name: EUR/JPY
+  group: FX
+  enabled: true
+- yf: EURAUD=X
+  name: EUR/AUD
+  group: FX
+  enabled: true
+- yf: EURNZD=X
+  name: EUR/NZD
+  group: FX
+  enabled: true
+- yf: EURCAD=X
+  name: EUR/CAD
+  group: FX
+  enabled: true
+- yf: EURCHF=X
+  name: EUR/CHF
+  group: FX
+  enabled: true
+- yf: GBPJPY=X
+  name: GBP/JPY
+  group: FX
+  enabled: true
+- yf: GBPAUD=X
+  name: GBP/AUD
+  group: FX
+  enabled: true
+- yf: GBPNZD=X
+  name: GBP/NZD
+  group: FX
+  enabled: true
+- yf: GBPCAD=X
+  name: GBP/CAD
+  group: FX
+  enabled: true
+- yf: GBPCHF=X
+  name: GBP/CHF
+  group: FX
+  enabled: true
+- yf: AUDJPY=X
+  name: AUD/JPY
+  group: FX
+  enabled: true
+- yf: AUDCAD=X
+  name: AUD/CAD
+  group: FX
+  enabled: true
+- yf: AUDCHF=X
+  name: AUD/CHF
+  group: FX
+  enabled: true
+- yf: NZDJPY=X
+  name: NZD/JPY
+  group: FX
+  enabled: true
+- yf: NZDCAD=X
+  name: NZD/CAD
+  group: FX
+  enabled: true
+- yf: NZDCHF=X
+  name: NZD/CHF
+  group: FX
+  enabled: true
+- yf: CADJPY=X
+  name: CAD/JPY
+  group: FX
+  enabled: true
+- yf: CADCHF=X
+  name: CAD/CHF
+  group: FX
+  enabled: true
+- yf: CHFJPY=X
+  name: CHF/JPY
+  group: FX
+  enabled: true
+- yf: XAUUSD=X
+  name: Gold (XAU/USD)
+  group: COMMODITY
+  enabled: true
+- yf: XAGUSD=X
+  name: Silver (XAG/USD)
+  group: COMMODITY
+  enabled: true
+- yf: BTC-USD
+  name: BTC/USD
+  group: CRYPTO
+  enabled: true
+- yf: ETH-USD
+  name: ETH/USD
+  group: CRYPTO
+  enabled: true
+- yf: SOL-USD
+  name: SOL/USD
+  group: CRYPTO
+  enabled: false
+- yf: XRP-USD
+  name: XRP/USD
+  group: CRYPTO
+  enabled: false
+- yf: LTC-USD
+  name: LTC/USD
+  group: CRYPTO
+  enabled: false
+- yf: ^GSPC
+  name: S&P 500
+  group: INDEX
+  enabled: true
+- yf: ^NDX
+  name: NASDAQ 100
+  group: INDEX
+  enabled: true
+- yf: ^DJI
+  name: Dow Jones 30
+  group: INDEX
+  enabled: true
+- yf: ^IXIC
+  name: Nasdaq Comp
+  group: INDEX
+  enabled: false
+- yf: ^GDAXI
+  name: DAX (GER40)
+  group: INDEX
+  enabled: true
+- yf: ^FTSE
+  name: FTSE 100 (UK)
+  group: INDEX
+  enabled: true
+- yf: ^FCHI
+  name: CAC 40 (FR)
+  group: INDEX
+  enabled: false
+- yf: ^STOXX50E
+  name: EURO STOXX 50
+  group: INDEX
+  enabled: false
+- yf: ^N225
+  name: Nikkei 225
+  group: INDEX
+  enabled: true
+- yf: ^HSI
+  name: Hang Seng
+  group: INDEX
+  enabled: false
+- yf: ^AXJO
+  name: ASX 200
+  group: INDEX
+  enabled: false
