@@ -12,8 +12,8 @@ jobs:
     env:
       MUST_TRADE: "0"
       SUPPRESS_EMPTY: "1"
-      INTERVAL: "5m"
-      EXPIRY_MIN: "10"
+      INTERVAL: "1m"
+      EXPIRY_MIN: "5"
       OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
       OANDA_ENV: ${{ secrets.OANDA_ENV }}   # "practice" or "live"
 
