@@ -1,21 +1,17 @@
 name: vip-tally
-
 on:
   schedule:
-    - cron: "5 21 * * 1-5"    # Daily close (Mon-Fri) 21:05 UTC
-    - cron: "10 21 * * 0"     # Weekly close (Sun) 21:10 UTC
+    - cron: "5 21 * * 1-5"  # Daily close (Mon–Fri) 21:05 UTC
+    - cron: "10 21 * * 0"   # Weekly close (Sun) 21:10 UTC
   workflow_dispatch: {}
-
 permissions:
   contents: read
-
 env:
   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TELEGRAM_CHAT_FREE:  ${{ secrets.TELEGRAM_CHAT_FREE }}
   TELEGRAM_CHAT_BASIC: ${{ secrets.TELEGRAM_CHAT_BASIC }}
   TELEGRAM_CHAT_PRO:   ${{ secrets.TELEGRAM_CHAT_PRO }}
   TELEGRAM_CHAT_VIP:   ${{ secrets.TELEGRAM_CHAT_VIP }}
-
 jobs:
   daily:
     if: github.event.schedule == '5 21 * * 1-5' || github.event_name == 'workflow_dispatch'
@@ -36,7 +32,6 @@ jobs:
           TELEGRAM_CHAT_PRO:   ${{ env.TELEGRAM_CHAT_PRO }}
           TELEGRAM_CHAT_VIP:   ${{ env.TELEGRAM_CHAT_VIP }}
         run: python scripts/post_summary.py daily
-
   weekly:
     if: github.event.schedule == '10 21 * * 0'
     runs-on: ubuntu-latest
