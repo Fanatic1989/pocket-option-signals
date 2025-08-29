@@ -35,3 +35,7 @@ logs/
 signals_test.py
 *.bak.*
 *.tmp
+*.bak.*
+*.tmp
+.env.save
+.github/workflows/_bak/
