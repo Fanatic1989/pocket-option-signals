@@ -2,14 +2,46 @@ name: signals
 
 on:
   schedule:
-    - cron: "*/1 * * * *"
-    - cron: "*/1 * * * 1-5"   # every 1 minute, weekdays
-  schedule:
-    - cron: "*/1 * * * *"
-  scalper:
+    - cron: "*/1 * * * 1-5"   # every minute, Mon–Fri (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
     runs-on: ubuntu-latest
-  schedule:
-    - cron: "*/1 * * * *"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
           python-version: "3.11"
-  schedule:
-    - cron: "*/1 * * * *"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt
+      - name: Run signals (live, 1m/5m, NO-OTC hours)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_FREE:  ${{ secrets.TELEGRAM_CHAT_FREE }}
+          TELEGRAM_CHAT_BASIC: ${{ secrets.TELEGRAM_CHAT_BASIC }}
+          TELEGRAM_CHAT_PRO:   ${{ secrets.TELEGRAM_CHAT_PRO }}
+          TELEGRAM_CHAT_VIP:   ${{ secrets.TELEGRAM_CHAT_VIP }}
+          # Market session windows (UTC) — blocks OTC
+          FX_HOURS_UTC:        "0700-1700"
+          COMMODITY_HOURS_UTC: "0700-1700"
+          INDEX_HOURS_UTC:     "1330-2000"
+          STOCK_HOURS_UTC:     "1330-2000"
+          WEEKDAYS_FX:         "12345"
+          WEEKDAYS_COMMODITY:  "12345"
+          WEEKDAYS_INDEX:      "12345"
+          WEEKDAYS_STOCK:      "12345"
+          # Strategy runtime
+          INTERVAL: "1m"
+          EXPIRY_MIN: "5"
+          MIN_SCORE: "1"
+          MUST_TRADE: "0"
+          SUPPRESS_EMPTY: "1"
+          # OANDA live/practice pricing
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ENV:     ${{ secrets.OANDA_ENV }}   # "practice" or "live"
+        run: python signals_live.py
