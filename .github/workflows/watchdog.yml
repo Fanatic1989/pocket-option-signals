@@ -1,0 +1,17 @@
+name: Watchdog (restart signals if failed)
+
+on:
+  workflow_run:
+    workflows: ["Signals (every minute)"]
+    types:
+      - completed
+
+jobs:
+  restart:
+    if: ${{ github.event.workflow_run.conclusion != 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger signals workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: "Signals (every minute)"
