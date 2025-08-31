@@ -1,3 +1,6 @@
+concurrency:
+  group: signals-minute
+  cancel-in-progress: true
 name: Signals (every minute)
 
 on:
@@ -37,4 +40,8 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Run and send signals
-        run: python run_and_send.py
+        uses: nick-invision/retry@v3
+        with:
+          timeout_minutes: 3
+          max_attempts: 3
+          command: python run_and_send.py
