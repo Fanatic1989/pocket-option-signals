@@ -1,24 +1,9 @@
-beautifulsoup4==4.13.5
-certifi==2025.8.3
-charset-normalizer==3.4.3
-frozendict==2.4.6
-html5lib==1.1
-idna==3.10
-lxml==6.0.1
-multitasking==0.0.12
 numpy==1.26.4
 pandas==2.2.2
 pandas_ta==0.3.14b0
-peewee==3.18.2
-platformdirs==4.3.8
+requests==2.32.3
+PyYAML==6.0.2
 python-dateutil==2.9.0.post0
 pytz==2025.2
-PyYAML==6.0.2
-requests==2.32.3
-six==1.17.0
-soupsieve==2.7
-typing_extensions==4.15.0
 tzdata==2025.2
-urllib3==2.5.0
-webencodings==0.5.1
-yfinance==0.2.52
+# we *do not* depend on yfinance anymore
