@@ -42,7 +42,13 @@ def main():
             "", "⚠️ No signals generated (runner)."
         ]
 
-    msg = "\n".join(lines)
+    # Build message safely
+    if isinstance(lines, list):
+        msg = "\n".join(str(x) for x in lines)
+    elif isinstance(lines, str):
+        msg = lines
+    else:
+        msg = str(lines)
 
     # Strict confirmed-only behavior (no spam)
     SUPPRESS_EMPTY = os.getenv("SUPPRESS_EMPTY","1") == "1"

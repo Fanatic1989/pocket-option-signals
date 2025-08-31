@@ -7,6 +7,9 @@ def _send_plain(text: str, chat_id: str):
     if not (bot and chat_id):
         print(f"⚠️ send skipped: missing bot or chat_id ({chat_id})")
         return False
+        # Coerce to string to avoid TypeError when someone passes bool/None/etc.
+    if not isinstance(text, str):
+        text = str(text or "")
     url = f"https://api.telegram.org/bot{bot}/sendMessage"
     chunks = [text[i:i+MAX_CHARS] for i in range(0, len(text), MAX_CHARS)] or ["(empty)"]
     ok = True
@@ -24,6 +27,8 @@ def _send_plain(text: str, chat_id: str):
 
 def send_to_tiers(msg: str):
     """Broadcast to all tier chats (FREE, BASIC, PRO, VIP)."""
+    if not isinstance(msg, str):
+        msg = str(msg or "")
     any_ok = False
     for env_k in ("TELEGRAM_CHAT_FREE","TELEGRAM_CHAT_BASIC","TELEGRAM_CHAT_PRO","TELEGRAM_CHAT_VIP"):
         cid = os.getenv(env_k, "")
