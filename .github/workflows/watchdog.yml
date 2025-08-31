@@ -3,8 +3,7 @@ name: Watchdog (restart signals if failed)
 on:
   workflow_run:
     workflows: ["Signals (every minute)"]
-    types:
-      - completed
+    types: [completed]
 
 jobs:
   restart:
