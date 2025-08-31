@@ -1,0 +1,230 @@
+import os, csv, json, time
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+import pandas as pd
+import pandas_ta as ta
+import yaml
+
+from data_sources import fetch_df_from_symbol
+
+# ========= Config (env) =========
+INTERVAL   = os.getenv("INTERVAL", "5m")
+LOOKBACK   = os.getenv("LOOKBACK", "5d")
+EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "10"))
+RSI_BUY    = int(os.getenv("RSI_BUY", "30"))
+RSI_SELL   = int(os.getenv("RSI_SELL", "70"))
+MIN_SCORE  = int(os.getenv("MIN_SCORE", "2"))
+MUST_TRADE = int(os.getenv("MUST_TRADE", "0"))
+SUPPRESS_EMPTY = int(os.getenv("SUPPRESS_EMPTY", "1"))
+
+DATA_DIR    = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+SIGNALS_CSV = DATA_DIR / "signals.csv"
+SYMBOLS_YML = Path("symbols.yaml")
+
+# ========= Tuning (optional) =========
+def apply_tuning():
+    try:
+        tj = json.load(open("tuning.json"))
+        globals()["RSI_BUY"]  = int(tj.get("RSI_BUY",  RSI_BUY))
+        globals()["RSI_SELL"] = int(tj.get("RSI_SELL", RSI_SELL))
+        globals()["MIN_SCORE"]= int(tj.get("MIN_SCORE", MIN_SCORE))
+    except Exception:
+        pass
+
+# ========= Telegram =========
+
+
+def send_telegram(text: str, chat_id: str):
+    """Send plain-text message to Telegram (chunked to avoid size limits)."""
+    import os, requests
+    bot = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not (bot and chat_id):
+        print(f"⚠️ send_telegram skipped: missing bot or chat_id for {chat_id}")
+        return
+    url = f"https://api.telegram.org/bot{bot}/sendMessage"
+    MAX = 3800
+    chunks = [text[i:i+MAX] for i in range(0, len(text), MAX)] or ["(empty)"]
+    ok_any = False
+    for idx, part in enumerate(chunks, 1):
+        try:
+            r = requests.post(url, data={"chat_id": chat_id, "text": part}, timeout=30)
+            js = r.json()
+        except Exception as e:
+            js = {"ok": False, "error": str(e)}
+        if js.get("ok"):
+            ok_any = True
+        else:
+            print(f"❌ send_telegram failed ({idx}/{len(chunks)}):", js)
+    if not ok_any:
+        print("⚠️ No successful sends for", chat_id)
+
+def send_to_tiers(text: str):
+    """Send to all tier channels (Free, Basic, Pro, VIP)."""
+    import os
+    for envkey in ("TELEGRAM_CHAT_FREE","TELEGRAM_CHAT_BASIC","TELEGRAM_CHAT_PRO","TELEGRAM_CHAT_VIP"):
+        cid = os.getenv(envkey, "")
+        if cid:
+            send_telegram(text, cid)
+            print(f"✅ Sent to {envkey}")
+        else:
+            print(f"⚠️ {envkey} empty; skipped")
+(text: str):
+    """Send to all tier channels (Free, Basic, Pro, VIP)."""
+    import os
+    for envkey in ("TELEGRAM_CHAT_FREE","TELEGRAM_CHAT_BASIC","TELEGRAM_CHAT_PRO","TELEGRAM_CHAT_VIP"):
+        cid = os.getenv(envkey, "")
+        if cid:
+            send_telegram(text, cid)
+            print(f"✅ Sent to {envkey}")
+        else:
+            print(f"⚠️ {envkey} empty; skipped")
+(text: str):
+    for envkey in ("TELEGRAM_CHAT_FREE","TELEGRAM_CHAT_BASIC","TELEGRAM_CHAT_PRO","TELEGRAM_CHAT_VIP"):
+        cid = os.getenv(envkey, "")
+        if cid:
+            send_telegram(text, cid)
+            print(f"✅ Sent to {envkey}")
+        else:
+            print(f"⚠️ {envkey} empty; skipped")
+(text: str):
+    for envkey in ("TELEGRAM_CHAT_FREE","TELEGRAM_CHAT_BASIC","TELEGRAM_CHAT_PRO","TELEGRAM_CHAT_VIP"):
+        cid = os.getenv(envkey, "")
+        if cid:
+            send_telegram(text, cid)
+            print(f"✅ Sent to {envkey}")
+        else:
+            print(f"⚠️ {envkey} empty; skipped")
+
+# ========= IO =========
+def load_symbols():
+    cfg = yaml.safe_load(open(SYMBOLS_YML, "r"))
+    syms = [dict(s) for s in cfg.get("symbols", []) if s.get("enabled", True)]
+    if not syms:
+        raise SystemExit("No enabled symbols in symbols.yaml")
+    return syms
+
+def write_signal_row(row: dict):
+    header = ["ts_utc","symbol_yf","symbol_pretty","signal","price","expiry_min",
+              "evaluate_at_utc","status","score","why","result_price","outcome"]
+    exists = SIGNALS_CSV.exists() and SIGNALS_CSV.read_text().strip() != ""
+    with open(SIGNALS_CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if not exists: w.writeheader()
+        w.writerow(row)
+
+# ========= Indicators / Logic =========
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if "close" not in df.columns:
+        if "Close" in df.columns:
+            df = df.rename(columns={"Close":"close"})
+        else:
+            raise RuntimeError("DataFrame lacks 'close' column")
+    df = df.dropna().copy()
+    df["ema50"]  = ta.ema(df["close"], length=50)
+    df["ema200"] = ta.ema(df["close"], length=200)
+    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
+    df["macd"]  = macd["MACD_12_26_9"]
+    df["macds"] = macd["MACDs_12_26_9"]
+    df["rsi14"] = ta.rsi(df["close"], length=14)
+    return df.dropna()
+
+def confluence(prev, cur):
+    score=0; reasons=[]
+    uptrend = cur["ema50"] > cur["ema200"]
+    reasons.append("EMA50>EMA200" if uptrend else "EMA50<EMA200")
+    macd_up   = (prev["macd"] <= prev["macds"]) and (cur["macd"] > cur["macds"])
+    macd_down = (prev["macd"] >= prev["macds"]) and (cur["macd"] < cur["macds"])
+    if macd_up:   reasons.append("MACD↑"); score+=1
+    if macd_down: reasons.append("MACD↓"); score+=1
+    if cur["rsi14"] <= RSI_BUY:  reasons.append(f"RSI≤{RSI_BUY}");  score+=1
+    if cur["rsi14"] >= RSI_SELL: reasons.append(f"RSI≥{RSI_SELL}"); score+=1
+    return score, ", ".join(reasons), uptrend, macd_up, macd_down
+
+def classify(prev, cur):
+    score, why, up, m_up, m_down = confluence(prev, cur)
+    side=None
+    if up and m_up: side="BUY"
+    if (not up) and m_down: side="SELL"
+    if side is None:
+        if cur["rsi14"] <= RSI_BUY: side="BUY"
+        elif cur["rsi14"] >= RSI_SELL: side="SELL"
+    return side, score, why
+
+# ========= Main =========
+def main():
+    apply_tuning()
+    t0 = time.time()
+    now = datetime.now(timezone.utc)
+
+    header = f"📡 Pocket Option Signals — {now:%Y-%m-%d %H:%M UTC}\nCandle: {INTERVAL} | Expiry: {EXPIRY_MIN}m\n"
+    lines = [header]
+
+    symbols = load_symbols()
+    any_signal=False
+    errors=[]
+
+    for sym in symbols:
+        pretty = sym.get("name") or sym.get("oanda") or sym.get("binance") or sym.get("yf") or "?"
+        try:
+            df = fetch_df_from_symbol(sym, INTERVAL, LOOKBACK)
+            df = add_indicators(df)
+            prev, cur = df.iloc[-2], df.iloc[-1]
+            px  = float(cur["close"])
+
+            side, score, why = classify(prev, cur)
+            if side and score >= MIN_SCORE:
+                emoji = "🟢" if side=="BUY" else "🔴"
+                lines.append(f"{emoji} *{pretty}* — {side} @ `{px:.5f}`\n• {why} (score {score})")
+                any_signal=True
+
+                evaluate_at = now + timedelta(minutes=EXPIRY_MIN)
+                write_signal_row({
+                    "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol_yf": sym.get("yf") or sym.get("oanda") or sym.get("binance") or pretty,
+                    "symbol_pretty": pretty,
+                    "signal": side,
+                    "price": f"{px:.8f}",
+                    "expiry_min": EXPIRY_MIN,
+                    "evaluate_at_utc": evaluate_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "open",
+                    "score": score,
+                    "why": why,
+                    "result_price": "",
+                    "outcome": ""
+                })
+            else:
+                if not SUPPRESS_EMPTY:
+                    lines.append(f"⚪ {pretty} — No setup (score {score if side else 0})")
+
+        except Exception as e:
+            msg = f"⚠️ {pretty} error: {e}"
+            errors.append(msg)
+            if not SUPPRESS_EMPTY:
+                lines.append(msg)
+
+    if (not any_signal) and MUST_TRADE:
+        lines.append("\n🧪 *TEST SIGNAL* — forced pick (MUST_TRADE=1)")
+
+    build_time = time.time() - t0
+    lines.append(f"\n⏱ Build time: `{build_time:.1f}s`")
+
+    if SUPPRESS_EMPTY and not any_signal and not errors and not MUST_TRADE:
+        return ["⚠️ No signals generated (debug)."]
+
+    return lines
+
+if __name__ == "__main__":
+    try:
+        out = main() or ["⚠️ No signals generated (debug)."]
+        full = "\n\n".join(out)
+        send_to_tiers(full)
+        print("✅ Signals run completed.")
+    except Exception as e:
+        import traceback
+        print("❌ Fatal error in signals.py:", e)
+        traceback.print_exc()
+
+from telegram_send import send_telegram as _ST, send_to_tiers as _STT
+send_telegram = _ST
+send_to_tiers = _STT

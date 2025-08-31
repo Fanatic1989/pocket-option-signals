@@ -1,0 +1,172 @@
+import os, sys
+from datetime import datetime, timezone
+import yaml
+import pandas as pd
+
+from telegram_send import send_to_tiers, send_confirmed
+from scalper import add_indicators, classify
+from oanda_utils import oanda_fetch_m1  # uses OANDA_API_KEY + OANDA_ENV
+
+# ------- Config from env -------
+INTERVAL     = os.getenv("INTERVAL", "1m")       # we fetch M1 only
+EXPIRY_MIN   = int(os.getenv("EXPIRY_MIN", "5")) # fixed 5m expiry by default
+MIN_SCORE    = int(os.getenv("MIN_SCORE", "1"))
+SUPPRESS_EMPTY = int(os.getenv("SUPPRESS_EMPTY", "1"))
+
+# ------- Helpers -------
+def yf_to_oanda(yf_sym: str) -> str | None:
+    """
+    Map Yahoo FX symbols like 'EURUSD=X', 'USDJPY=X', 'XAUUSD=X' to OANDA instruments 'EUR_USD', 'USD_JPY', 'XAU_USD'.
+    Non-FX (stocks/indices/most crypto) are skipped here.
+    """
+    if not isinstance(yf_sym, str):
+        return None
+    if yf_sym.endswith("=X"):
+        core = yf_sym[:-2]  # EURUSD
+        if len(core) >= 6:
+            base, quote = core[:3], core[3:6]
+            return f"{base}_{quote}"
+    return None
+
+def _safe_prev_cur(df: pd.DataFrame):
+    """Return previous/current rows or (None, None) safely."""
+    if df is None or len(df) < 2:
+        return None, None
+    try:
+        return df.iloc[-2], df.iloc[-1]
+    except Exception:
+        return None, None
+
+def load_symbols():
+    cfg = yaml.safe_load(open("symbols.yaml"))
+    syms = []
+    for s in cfg.get("symbols", []):
+        if not s.get("enabled", True): 
+            continue
+        yf = s.get("yf")
+        pretty = s.get("name", yf)
+        o_inst = yf_to_oanda(yf)
+        if o_inst:
+            syms.append((yf, pretty, o_inst))
+    return syms
+
+def format_price(px: float) -> str:
+    # simple formatting that works well for FX & metals
+    if px >= 100:
+        return f"{px:.3f}"
+    elif px >= 10:
+        return f"{px:.4f}"
+    else:
+        return f"{px:.5f}"
+
+# ------- Main -------
+def main():
+    now = datetime.now(timezone.utc)
+    header = [
+        f"📡 Pocket Option Signals — {now:%Y-%m-%d %H:%M UTC}",
+        f"Candle: {INTERVAL} | Expiry: {EXPIRY_MIN}m",
+        ""
+    ]
+    lines = []
+
+    symbols = load_symbols()
+    if not symbols:
+        lines.append("⚠️ No enabled FX symbols in symbols.yaml")
+    for yf_sym, pretty, o_inst in symbols:
+        try:
+            # Fetch last ~220 M1 candles
+            df = oanda_fetch_m1(o_inst, count=220)
+            if df is None or df.empty or len(df) < 2:
+                lines.append(f"⚪ {pretty} — no/short data")
+                continue
+
+            # Indicators & guard again
+            df = add_indicators(df)
+            if df is None or df.empty or len(df) < 2:
+                lines.append(f"⚪ {pretty} — no/short data")
+                continue
+
+            prev, cur = _safe_prev_cur(df)
+            if prev is None:
+                lines.append(f"⚪ {pretty} — no/short data")
+                continue
+
+            side, score, why = classify(prev, cur, min_score=MIN_SCORE)
+            if not side or score < MIN_SCORE:
+                lines.append(f"⚪ {pretty} — no setup")
+                continue
+
+            emoji = "🟢" if side == "BUY" else "🔴"
+            entry = format_price(float(cur["close"]))
+            lines.append(f"{emoji} {pretty} — {side} @ {entry}")
+            lines.append(f"• {why} (score {score})")
+            lines.append("")  # spacing between pairs
+
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            lines.append(f"⚠️ {pretty} — error: {e}")
+
+    # If we only have neutral lines and SUPPRESS_EMPTY=1, telegram_send will suppress.
+    msg = "\n".join(header + lines).strip()
+        # --- STRICT CONFIRMED-ONLY FILTER ---
+    _SUP = 1 if os.getenv("SUPPRESS_EMPTY","1")=="1" else 0
+    _keep = []
+    for i,ln in enumerate(lines):
+        if i < 3:                      # keep header lines
+            _keep.append(ln)
+            continue
+        s = ln.lstrip()
+        if s.startswith("🟢") or s.startswith("🔴"):
+            _keep.append(ln)
+            _next_is_reason = True
+            continue
+        if "_next_is_reason" in locals() and _next_is_reason and s.startswith("•"):
+            _keep.append(ln)
+            _keep.append("")  # spacer after reason
+            _next_is_reason = False
+            continue
+    _has = any(l.lstrip().startswith(("🟢","🔴")) for l in _keep[3:])
+    _msg = "
+".join([l for l in _keep if l is not None]).strip()
+    if _has or not _SUP:
+            # --- STRICT CONFIRMED-ONLY FILTER ---
+    import os
+    _SUP = 1 if os.getenv("SUPPRESS_EMPTY","1")=="1" else 0
+    _keep = []
+    _next_is_reason = False
+    for i, ln in enumerate(lines):
+        if i < 3:  # keep header lines
+            _keep.append(ln)
+            continue
+        s = ln.lstrip()
+        if s.startswith("🟢") or s.startswith("🔴"):
+            _keep.append(ln)
+            _next_is_reason = True
+            continue
+        if _next_is_reason and s.startswith("•"):
+            _keep.append(ln)
+            _keep.append("")  # spacer
+            _next_is_reason = False
+            continue
+    _has = any(l.lstrip().startswith(("🟢","🔴")) for l in _keep[3:])
+    _msg = "
+".join([l for l in _keep if l is not None]).strip()
+    if _has or not _SUP:
+        send_confirmed(_msg)
+    else:
+        print("✋ suppressed empty (no confirmed signals).")
+
+    else:
+        print("✋ suppressed empty (no confirmed signals).")
+
+    return lines
+
+if __name__ == "__main__":
+    try:
+        main()
+        print("✅ Signals run completed.")
+    except Exception as e:
+        import traceback
+        print("❌ Fatal error in signals_live.py:", e, file=sys.stderr)
+        traceback.print_exc()

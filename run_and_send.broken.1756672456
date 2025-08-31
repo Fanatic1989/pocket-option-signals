@@ -1,0 +1,28 @@
+import os, traceback
+from telegram_send import send_to_tiers
+import quota, send_confirmed
+
+def _count_confirmed(msg:str)->int:
+    c=0
+    for ln in msg.splitlines():
+        s=ln.lstrip()
+        if s.startswith('🟢') or s.startswith('🔴'):
+            c+=1
+    return c
+
+def main():
+    try:
+        import signals_live
+        lines = signals_live.main() or []
+        msg = "\n".join(lines).strip()
+        filt = send_confirmed(msg)
+        if filt is None:
+            print("✋ suppressed empty (no confirmed signals).")
+            return
+        send_to_tiers(filt)
+    except Exception as e:
+        print("❌ run_and_send.py fatal:", e)
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
