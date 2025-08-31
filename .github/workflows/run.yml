@@ -17,6 +17,7 @@ jobs:
       SUPPRESS_EMPTY: "1"
       INTERVAL: "1m"
       EXPIRY_MIN: "5"
+      MIN_SCORE: "2"
       OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
       OANDA_ENV:     ${{ secrets.OANDA_ENV }}     # "practice" or "live"
       FX_HOURS_UTC:        "0700-1700"
