@@ -26,6 +26,12 @@ def _send_plain(text: str, chat_id: str):
     return ok
 
 def send_to_tiers(msg: str):
+    # suppress empty messages entirely
+    if not isinstance(msg, str):
+        msg = str(msg or "")
+    if not msg.strip() or msg.strip() == "(empty)":
+        print("✋ suppressed empty (no confirmed signals).")
+        return False
     """Broadcast to all tier chats (FREE, BASIC, PRO, VIP)."""
     if not isinstance(msg, str):
         msg = str(msg or "")
