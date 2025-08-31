@@ -39,3 +39,4 @@ signals_test.py
 *.tmp
 .env.save
 .github/workflows/_bak/
+.env
