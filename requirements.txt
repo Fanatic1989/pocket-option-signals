@@ -13,4 +13,9 @@ python-dateutil==2.9.0.post0
 pytz==2025.2
 tzdata==2025.2
 
+# ensure pkg_resources exists
+setuptools>=70.0.0
+wheel>=0.43.0
+packaging>=23.2
+
 gunicorn==22.0.0
