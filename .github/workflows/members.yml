@@ -1,0 +1,26 @@
+name: Membership Maintenance (every minute)
+
+on:
+  schedule:
+    - cron: "* * * * *"        # every minute (UTC)
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_FREE:  ${{ secrets.TELEGRAM_CHAT_FREE }}
+      TELEGRAM_CHAT_BASIC: ${{ secrets.TELEGRAM_CHAT_BASIC }}
+      TELEGRAM_CHAT_PRO:   ${{ secrets.TELEGRAM_CHAT_PRO }}
+      TELEGRAM_CHAT_VIP:   ${{ secrets.TELEGRAM_CHAT_VIP }}
+      NOWPAY_API_KEY:      ${{ secrets.NOWPAY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Run membership maintenance (poll payments + remove expired)
+        run: python manage_members.py --once
