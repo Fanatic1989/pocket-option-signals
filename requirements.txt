@@ -1,3 +1,7 @@
+fastapi==0.112.2
+uvicorn==0.30.6
+python-telegram-bot==21.6
+
 numpy==1.26.4
 pandas==2.2.2
 pandas_ta==0.3.14b0
@@ -6,12 +10,6 @@ PyYAML==6.0.2
 python-dateutil==2.9.0.post0
 pytz==2025.2
 tzdata==2025.2
-python-telegram-bot==21.6
-Flask==3.0.3
+
 gunicorn==22.0.0
 psycopg2-binary==2.9.9
-fastapi==0.112.2
-uvicorn==0.30.6
-python-telegram-bot==21.6
-gunicorn==22.0.0
-
