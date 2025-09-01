@@ -6,4 +6,6 @@ PyYAML==6.0.2
 python-dateutil==2.9.0.post0
 pytz==2025.2
 tzdata==2025.2
+python-telegram-bot==21.6
+sqlite3-binary; python_version >= "3.11"
 # we *do not* depend on yfinance anymore
