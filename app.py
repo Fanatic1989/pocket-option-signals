@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple, Set
 
 import pandas as pd
 import pandas_ta as ta
@@ -22,13 +22,27 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # =============================================================================
 # ENV
 # =============================================================================
-# Telegram / Webhook
+# Webhook / Telegram
 TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_GROUP_ID    = os.getenv("TELEGRAM_GROUP_ID", "").strip()
 BASE_URL             = os.getenv("BASE_URL", "").rstrip("/")
 WEBHOOK_PATH         = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
 WEBHOOK_SECRET       = os.getenv("WEBHOOK_SECRET", "change-me").strip()
 ENABLE_BOT_POLLING   = os.getenv("ENABLE_BOT_POLLING", "0").strip()  # keep 0 for webhook mode
+
+# Single old-style group id (optional / backward compat). If you keep this, it will receive VIP (∞) by default.
+TELEGRAM_GROUP_ID    = os.getenv("TELEGRAM_GROUP_ID", "").strip()
+
+# Tiered chat IDs (each optional)
+TELEGRAM_CHAT_FREE   = os.getenv("TELEGRAM_CHAT_FREE", "").strip()   # gets 3/day
+TELEGRAM_CHAT_BASIC  = os.getenv("TELEGRAM_CHAT_BASIC", "").strip()  # gets 6/day
+TELEGRAM_CHAT_PRO    = os.getenv("TELEGRAM_CHAT_PRO", "").strip()    # gets 15/day
+TELEGRAM_CHAT_VIP    = os.getenv("TELEGRAM_CHAT_VIP", "").strip()    # unlimited/day
+
+# Per-tier caps (override if you want different numbers later)
+LIMIT_FREE           = int(os.getenv("LIMIT_FREE", "3"))
+LIMIT_BASIC          = int(os.getenv("LIMIT_BASIC", "6"))
+LIMIT_PRO            = int(os.getenv("LIMIT_PRO", "15"))
+# VIP = unlimited
 
 # OANDA
 OANDA_API_KEY        = os.getenv("OANDA_API_KEY", "").strip()
@@ -39,7 +53,7 @@ OANDA_GRANULARITY    = os.getenv("OANDA_GRANULARITY", "M1").strip().upper()  # M
 
 # Pocket Option guidance
 PO_EXPIRY_MIN        = int(os.getenv("PO_EXPIRY_MIN", "5"))      # suggested expiry (min)
-PO_ENTRY_DELAY_SEC   = int(os.getenv("PO_ENTRY_DELAY_SEC", "2")) # wait a couple seconds after close
+PO_ENTRY_DELAY_SEC   = int(os.getenv("PO_ENTRY_DELAY_SEC", "2")) # seconds after candle close
 ALERT_COOLDOWN_MIN   = int(os.getenv("ALERT_COOLDOWN_MIN", "10"))
 
 # Signal tuning
@@ -50,18 +64,18 @@ EMA_SLOW             = int(os.getenv("EMA_SLOW", "21"))
 ATR_FILTER_MULT      = float(os.getenv("ATR_FILTER_MULT", "0.0"))
 
 # OTC control
-# If PO treats weekends as OTC, block signals automatically on Sat/Sun.
 PO_BLOCK_DURING_OTC  = int(os.getenv("PO_BLOCK_DURING_OTC", "1"))  # 1=block, 0=ignore
-# Optional weekday OTC hours (UTC) like "21:00-23:59,00:00-03:00" — leave empty to skip
-PO_OTC_UTC_WINDOWS   = os.getenv("PO_OTC_UTC_WINDOWS", "").strip()
+PO_OTC_UTC_WINDOWS   = os.getenv("PO_OTC_UTC_WINDOWS", "").strip()  # e.g., "21:00-23:59,00:00-03:00"
 
 # Scheduler TZ (OANDA timestamps are UTC)
 SCHED_TZ             = timezone.utc
 
-# Files (ephemeral, but fine for daily/weekly tallies on Render)
+# Files (ephemeral; OK for daily/weekly counters)
 DATA_DIR             = os.getenv("DATA_DIR", "./data").strip()
 STATS_FILE           = os.path.join(DATA_DIR, "stats.json")
 OPEN_TRADES_FILE     = os.path.join(DATA_DIR, "open_trades.json")
+QUOTA_FILE           = os.path.join(DATA_DIR, "quota.json")       # per-chat daily counters
+UNSUPPORTED_FILE     = os.path.join(DATA_DIR, "unsupported.json") # instruments to skip
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -76,9 +90,13 @@ _last_candle_time: Dict[str, datetime] = {}  # instrument -> last processed comp
 # In-memory stores, persisted to JSON
 _stats_lock = asyncio.Lock()
 _trades_lock = asyncio.Lock()
-_stats: Dict[str, Any] = {}       # {'daily': {'YYYY-MM-DD': {'win':..,'loss':..,'draw':..}}, 'weekly': {'YYYY-W##': {...}}}
-_open_trades: List[Dict[str, Any]] = []  # pending settlements
+_quota_lock = asyncio.Lock()
+_unsupported_lock = asyncio.Lock()
 
+_stats: Dict[str, Any] = {}         # {'daily': {'YYYY-MM-DD': {'win':..,'loss':..,'draw':..}}, 'weekly': {...}}
+_open_trades: List[Dict[str, Any]] = []
+_quota: Dict[str, Dict[str, int]] = {}      # {chat_id: { 'YYYY-MM-DD': count }}
+_unsupported: Set[str] = set()               # instruments that produced 400/invalid; we skip them
 
 # =============================================================================
 # Utilities: FS
@@ -92,7 +110,7 @@ def _week_key(dt: datetime) -> str:
 
 async def load_state():
     _ensure_dirs()
-    global _stats, _open_trades
+    global _stats, _open_trades, _quota, _unsupported
     try:
         if os.path.exists(STATS_FILE):
             with open(STATS_FILE, "r") as f:
@@ -111,6 +129,24 @@ async def load_state():
     except Exception as e:
         log.error(f"Failed to load open_trades: {e}")
         _open_trades = []
+    try:
+        if os.path.exists(QUOTA_FILE):
+            with open(QUOTA_FILE, "r") as f:
+                _quota = json.load(f)
+        else:
+            _quota = {}
+    except Exception as e:
+        log.error(f"Failed to load quota: {e}")
+        _quota = {}
+    try:
+        if os.path.exists(UNSUPPORTED_FILE):
+            with open(UNSUPPORTED_FILE, "r") as f:
+                _unsupported = set(json.load(f))
+        else:
+            _unsupported = set()
+    except Exception as e:
+        log.error(f"Failed to load unsupported: {e}")
+        _unsupported = set()
 
 async def save_stats():
     _ensure_dirs()
@@ -128,12 +164,27 @@ async def save_open_trades():
     except Exception as e:
         log.error(f"Failed to save open_trades: {e}")
 
+async def save_quota():
+    _ensure_dirs()
+    try:
+        with open(QUOTA_FILE, "w") as f:
+            json.dump(_quota, f)
+    except Exception as e:
+        log.error(f"Failed to save quota: {e}")
+
+async def save_unsupported():
+    _ensure_dirs()
+    try:
+        with open(UNSUPPORTED_FILE, "w") as f:
+            json.dump(sorted(list(_unsupported)), f)
+    except Exception as e:
+        log.error(f"Failed to save unsupported: {e}")
 
 # =============================================================================
 # Telegram Handlers
 # =============================================================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Pocket Option Signals — OANDA candles, webhook, OTC-aware, with W/L/D & tallies.")
+    await update.message.reply_text("✅ Pocket Option Signals — tiers, OTC-aware, W/L/D, quota caps.")
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
@@ -143,7 +194,6 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping",  ping_cmd))
     return app
-
 
 # =============================================================================
 # OANDA Helpers
@@ -159,68 +209,52 @@ async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 30
     params = {"count": str(count), "granularity": granularity, "price": "M"}
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.get(url, params=params, headers=_auth_headers())
+        # If instrument invalid/disabled → 400; mark as unsupported once
+        if r.status_code == 400:
+            async with _unsupported_lock:
+                if instrument not in _unsupported:
+                    _unsupported.add(instrument)
+                    log.error(f"{instrument} marked unsupported (400).")
+                    await save_unsupported()
+            r.raise_for_status()
         r.raise_for_status()
         data = r.json()
 
     rows = []
     for c in data.get("candles", []):
         mid = c.get("mid", {})
-        rows.append({
-            "time":   pd.to_datetime(c["time"]),
-            "o":      float(mid["o"]),
-            "h":      float(mid["h"]),
-            "l":      float(mid["l"]),
-            "c":      float(mid["c"]),
-            "volume": int(c.get("volume", 0)),
-            "complete": bool(c.get("complete", False)),
-        })
-    df = pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
+        # some exotic pairs can sometimes omit fields -> guard
+        if "time" not in c or not mid:
+            continue
+        try:
+            rows.append({
+                "time":   pd.to_datetime(c["time"]),
+                "o":      float(mid.get("o", "nan")),
+                "h":      float(mid.get("h", "nan")),
+                "l":      float(mid.get("l", "nan")),
+                "c":      float(mid.get("c", "nan")),
+                "volume": int(c.get("volume", 0)),
+                "complete": bool(c.get("complete", False)),
+            })
+        except Exception:
+            continue
+    df = pd.DataFrame(rows).dropna().sort_values("time").reset_index(drop=True)
     return df
 
 def last_completed(df: pd.DataFrame) -> Optional[int]:
     if df.empty:
         return None
-    # If last is complete, use it; otherwise use previous if complete
-    if df.iloc[-1]["complete"]:
+    if df.iloc[-1].get("complete", False):
         return int(df.index[-1])
-    if len(df) >= 2 and df.iloc[-2]["complete"]:
+    if len(df) >= 2 and bool(df.iloc[-2].get("complete", False)):
         return int(df.index[-2])
     return None
-
-async def price_at_or_after(instrument: str, when_utc: datetime) -> Optional[float]:
-    """
-    Return the close price of the first candle WHOSE time >= when_utc,
-    falling back to the most recent close before when_utc if needed.
-    """
-    df = await fetch_oanda_candles(instrument, "M1", count=400)
-    # Find candle at/after when_utc, else take last before
-    df_times = df["time"].dt.tz_convert("UTC")
-    after = df[df_times >= pd.Timestamp(when_utc)]
-    if not after.empty:
-        return float(after.iloc[0]["c"])
-    # fallback
-    before = df[df_times <= pd.Timestamp(when_utc)]
-    if not before.empty:
-        return float(before.iloc[-1]["c"])
-    return None
-
 
 # =============================================================================
 # PO mapping & signals
 # =============================================================================
 def pocket_asset_name(instrument: str) -> str:
-    m = {
-        "EUR_USD": "EUR/USD", "GBP_USD": "GBP/USD", "USD_JPY": "USD/JPY",
-        "AUD_USD": "AUD/USD", "AUD_CAD": "AUD/CAD", "AUD_CHF": "AUD/CHF",
-        "AUD_JPY": "AUD/JPY", "AUD_NZD": "AUD/NZD", "CAD_CHF": "CAD/CHF",
-        "CAD_JPY": "CAD/JPY", "CHF_JPY": "CHF/JPY", "EUR_CHF": "EUR/CHF",
-        "EUR_GBP": "EUR/GBP", "EUR_JPY": "EUR/JPY", "EUR_NZD": "EUR/NZD",
-        "GBP_AUD": "GBP/AUD", "GBP_JPY": "GBP/JPY", "NZD_JPY": "NZD/JPY",
-        "NZD_USD": "NZD/USD", "USD_CAD": "USD/CAD", "USD_CHF": "USD/CHF",
-        "USD_RUB": "USD/RUB", "EUR_RUB": "EUR/RUB", "ZAR_USD": "ZAR/USD",
-        "UAH_USD": "UAH/USD",
-    }
-    return m.get(instrument, instrument.replace("_", "/"))
+    return instrument.replace("_", "/")
 
 def compute_signal_row(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
     close = df["c"].astype(float)
@@ -241,11 +275,8 @@ def compute_signal_row(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
     cur  = df.iloc[idx]
     prev = df.iloc[idx - 1]
 
-    # Optional volatility filter
-    if ATR_FILTER_MULT > 0:
-        # very simple threshold: ATR vs. price magnitude
-        if (cur["atr14"] or 0) < ATR_FILTER_MULT * (cur["c"] * 1e-5):
-            return {"signal": "HOLD", "reason": "Low volatility (ATR filter)"}
+    if ATR_FILTER_MULT > 0 and (cur["atr14"] or 0) < ATR_FILTER_MULT * (cur["c"] * 1e-5):
+        return {"signal": "HOLD", "reason": "Low volatility (ATR filter)"}
 
     signal = "HOLD"; reason = "No cross"; direction = None
     if (prev["ema_fast"] <= prev["ema_slow"]) and (cur["ema_fast"] > cur["ema_slow"]) and (cur["rsi14"] >= RSI_MIN_BUY):
@@ -260,12 +291,11 @@ def compute_signal_row(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
         "ema_fast": float(cur["ema_fast"]), "ema_slow": float(cur["ema_slow"]), "rsi14": float(cur["rsi14"]),
     }
 
-
 # =============================================================================
 # OTC detection
 # =============================================================================
-def _parse_windows(spec: str) -> List[tuple]:
-    wins: List[tuple] = []
+def _parse_windows(spec: str) -> List[Tuple[str, str]]:
+    wins: List[Tuple[str, str]] = []
     if not spec:
         return wins
     parts = [p.strip() for p in spec.split(",") if p.strip()]
@@ -284,34 +314,91 @@ def _in_window(now: datetime, start_hm: str, end_hm: str) -> bool:
     end   = now.replace(hour=eh, minute=em, second=59, microsecond=999999)
     if end >= start:
         return start <= now <= end
-    # window wraps midnight
     return now >= start or now <= end
 
 def is_otc_now(now_utc: Optional[datetime] = None) -> bool:
     if PO_BLOCK_DURING_OTC != 1:
         return False
-    now = now_utc or datetime.now(timezone.utc)
-    # Weekend OTC block
-    if now.weekday() in (5, 6):  # Sat=5, Sun=6
+    now = (now_utc or datetime.now(timezone.utc))
+    if now.weekday() in (5, 6):  # Sat/Sun
         return True
-    # Optional weekday OTC windows
     for (s, e) in _parse_windows(PO_OTC_UTC_WINDOWS):
         if _in_window(now, s, e):
             return True
     return False
 
+# =============================================================================
+# QUOTA / TIERS
+# =============================================================================
+def _tiers() -> List[Tuple[str, Optional[int], str]]:
+    """
+    Returns list of (chat_id, cap or None, label)
+    VIP and TELEGRAM_GROUP_ID (legacy) are unlimited (cap=None).
+    """
+    out: List[Tuple[str, Optional[int], str]] = []
+    if TELEGRAM_CHAT_FREE:  out.append((TELEGRAM_CHAT_FREE,  LIMIT_FREE,  "FREE"))
+    if TELEGRAM_CHAT_BASIC: out.append((TELEGRAM_CHAT_BASIC, LIMIT_BASIC, "BASIC"))
+    if TELEGRAM_CHAT_PRO:   out.append((TELEGRAM_CHAT_PRO,   LIMIT_PRO,   "PRO"))
+    if TELEGRAM_CHAT_VIP:   out.append((TELEGRAM_CHAT_VIP,   None,        "VIP"))
+    if TELEGRAM_GROUP_ID:   out.append((TELEGRAM_GROUP_ID,   None,        "VIP"))  # legacy treated as VIP
+    return out
+
+def _today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+async def _quota_get(chat_id: str) -> int:
+    async with _quota_lock:
+        day = _today_key()
+        return int(_quota.get(chat_id, {}).get(day, 0))
+
+async def _quota_inc(chat_id: str) -> int:
+    async with _quota_lock:
+        day = _today_key()
+        _quota.setdefault(chat_id, {})
+        _quota[chat_id][day] = int(_quota[chat_id].get(day, 0)) + 1
+        await save_quota()
+        return _quota[chat_id][day]
+
+async def _quota_reset_if_new_day():
+    # Optional: clean old days occasionally; we rely on new keys per day.
+    return
+
+async def send_to_tiers(text: str):
+    targets = _tiers()
+    if not targets:
+        log.warning("No Telegram chats configured; skipping send.")
+        return
+    for chat_id, cap, label in targets:
+        # Enforce cap per day (cap=None => unlimited)
+        can_send = True
+        if cap is not None:
+            used = await _quota_get(chat_id)
+            can_send = used < cap
+        if not can_send:
+            log.info(f"Quota reached for {label} ({chat_id}). Skipping.")
+            continue
+        try:
+            suffix = "" if cap is None else f" [{label} {await _quota_get(chat_id)+1}/{cap}]"
+            await telegram_app.bot.send_message(chat_id=chat_id, text=text + suffix, disable_web_page_preview=True)
+            await _quota_inc(chat_id)
+        except Exception as e:
+            log.error(f"Telegram send error ({label}/{chat_id}): {e}")
 
 # =============================================================================
-# Telegram send + W/L/D stats
+# W/L/D settlement & stats
 # =============================================================================
-async def send_text(msg: str):
-    if not TELEGRAM_GROUP_ID:
-        log.warning("TELEGRAM_GROUP_ID not set; skipping send.")
-        return
-    try:
-        await telegram_app.bot.send_message(chat_id=TELEGRAM_GROUP_ID, text=msg, disable_web_page_preview=True)
-    except Exception as e:
-        log.error(f"Telegram send error: {e}")
+async def price_at_or_after(instrument: str, when_utc: datetime) -> Optional[float]:
+    df = await fetch_oanda_candles(instrument, "M1", count=400)
+    if df.empty or "time" not in df.columns:
+        return None
+    df_times = df["time"].dt.tz_convert("UTC")
+    after = df[df_times >= pd.Timestamp(when_utc)]
+    if not after.empty:
+        return float(after.iloc[0]["c"])
+    before = df[df_times <= pd.Timestamp(when_utc)]
+    if not before.empty:
+        return float(before.iloc[-1]["c"])
+    return None
 
 async def record_open_trade(inst: str, direction: str, entry_price: float, entry_time: datetime, expiry_min: int):
     expiry_time = entry_time + timedelta(minutes=expiry_min)
@@ -322,7 +409,7 @@ async def record_open_trade(inst: str, direction: str, entry_price: float, entry
         "entry_time": entry_time.isoformat(),
         "expiry_time": expiry_time.isoformat(),
         "settled": False,
-        "result": None,          # WIN/LOSS/DRAW
+        "result": None,
     }
     async with _trades_lock:
         _open_trades.append(trade)
@@ -346,10 +433,9 @@ async def settle_due_trades():
             expiry = datetime.fromisoformat(t["expiry_time"]).astimezone(timezone.utc)
             if now < expiry + timedelta(seconds=5):
                 continue
-            # Fetch price at/after expiry
             px = await price_at_or_after(t["instrument"], expiry)
             if px is None:
-                continue  # try next minute
+                continue
             entry = float(t["entry_price"])
             if px > entry:
                 result = "WIN"  if t["direction"] == "CALL" else "LOSS"
@@ -374,22 +460,26 @@ async def send_daily_weekly_reports():
         d = _stats.get("daily", {}).get(dkey, {"win": 0, "loss": 0, "draw": 0})
         w = _stats.get("weekly", {}).get(wkey, {"win": 0, "loss": 0, "draw": 0})
     msg = (
-        "📈 *Pocket Option Results*\n"
-        f"**Daily ({dkey})** — W:{d['win']} L:{d['loss']} D:{d['draw']}\n"
-        f"**Weekly ({wkey})** — W:{w['win']} L:{w['loss']} D:{w['draw']}"
+        "📈 Pocket Option Results\n"
+        f"Daily ({dkey}) — W:{d['win']} L:{d['loss']} D:{d['draw']}\n"
+        f"Weekly ({wkey}) — W:{w['win']} L:{w['loss']} D:{w['draw']}"
     )
-    await send_text(msg)
+    await send_to_tiers(msg)
 
 # =============================================================================
 # Engine
 # =============================================================================
+def is_supported(instrument: str) -> bool:
+    return instrument not in _unsupported
+
 async def process_instrument(inst: str) -> None:
+    if not is_supported(inst):
+        return
     try:
         df = await fetch_oanda_candles(inst, OANDA_GRANULARITY, count=300)
         idx = last_completed(df)
         if idx is None:
             return
-
         last_time = df.iloc[idx]["time"].to_pydatetime().replace(tzinfo=timezone.utc)
         if _last_candle_time.get(inst) == last_time:
             return  # already processed this completed candle
@@ -398,30 +488,37 @@ async def process_instrument(inst: str) -> None:
         res = compute_signal_row(df, idx)
         sig = res.get("signal", "HOLD")
         if sig in ("CALL", "PUT"):
-            # OTC block?
             if is_otc_now():
                 return
-            # cooldown per instrument
             entry_time = datetime.now(timezone.utc) + timedelta(seconds=PO_ENTRY_DELAY_SEC)
             asset = pocket_asset_name(inst)
             msg = (
-                f"⚡️ *PO Signal* — {asset}\n"
-                f"• Action: *{sig}* ({res['direction']})\n"
+                f"⚡️ PO Signal — {asset}\n"
+                f"• Action: {sig} ({res['direction']})\n"
                 f"• Price: {res['price']}\n"
                 f"• TF: {OANDA_GRANULARITY}\n"
-                f"• Entry: {entry_time.strftime('%H:%M:%S UTC')} (in {PO_ENTRY_DELAY_SEC}s)\n"
+                f"• Entry: {entry_time.strftime('%H:%M:%S UTC')} (+{PO_ENTRY_DELAY_SEC}s)\n"
                 f"• Expiry: {PO_EXPIRY_MIN} min\n"
                 f"• EMA{EMA_FAST}/{EMA_SLOW}: {res['ema_fast']:.5f}/{res['ema_slow']:.5f}\n"
                 f"• RSI14: {res['rsi14']:.2f}\n"
                 f"• Reason: {res['reason']}\n"
-                f"• Candle Time: {res['time'].strftime('%Y-%m-%d %H:%M UTC')}\n"
-                f"• Mode: OANDA→PO"
+                f"• Candle: {res['time'].strftime('%Y-%m-%d %H:%M UTC')}\n"
+                f"• Source: OANDA→PO"
             )
-            await send_text(msg)
-            # Record for settlement using the candle close price as entry (conservative)
+            await send_to_tiers(msg)
             await record_open_trade(inst, sig, float(res["price"]), entry_time, PO_EXPIRY_MIN)
         else:
             log.info(f"{inst}: {sig} ({res.get('reason')})")
+    except httpx.HTTPStatusError as e:
+        # Extra guard: 400 -> mark unsupported
+        if e.response is not None and e.response.status_code == 400:
+            async with _unsupported_lock:
+                if inst not in _unsupported:
+                    _unsupported.add(inst)
+                    await save_unsupported()
+            log.error(f"{inst} marked unsupported (400): {e}")
+        else:
+            log.error(f"{inst} HTTP error: {e}")
     except Exception as e:
         log.error(f"{inst} error: {e}")
 
@@ -430,11 +527,9 @@ async def run_engine():
         log.warning("OANDA credentials missing; engine skipped.")
         return
     if is_otc_now():
-        # Send once per OTC session start? Keep simple: just skip signals
         log.info("OTC detected — signals paused.")
         return
     await asyncio.gather(*(process_instrument(i) for i in OANDA_INSTRUMENTS))
-
 
 # =============================================================================
 # Webhook lifecycle
@@ -469,9 +564,8 @@ async def unset_webhook():
     except Exception as e:
         log.error(f"Shutdown error: {e}")
 
-
 # =============================================================================
-# FastAPI App (lifespan: webhook + scheduler + state load)
+# FastAPI App (lifespan)
 # =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -487,21 +581,15 @@ async def lifespan(app: FastAPI):
     await set_webhook()
 
     scheduler = AsyncIOScheduler(timezone=SCHED_TZ)
-
-    # Engine: run each minute at :05 to catch completed M1 candles
+    # Engine every minute at :05
     scheduler.add_job(run_engine, CronTrigger(second=5))
-
-    # Settlement job every 30 seconds
+    # Settlement every 30s
     scheduler.add_job(settle_due_trades, CronTrigger(second="*/30"))
-
-    # Daily report: 23:59:30 UTC
+    # Reports: daily 23:59:30 UTC and weekly Sun 23:59:40 UTC
     scheduler.add_job(send_daily_weekly_reports, CronTrigger(hour=23, minute=59, second=30))
-
-    # Weekly report: extra push on Sunday 23:59:40 UTC
     scheduler.add_job(send_daily_weekly_reports, CronTrigger(day_of_week="sun", hour=23, minute=59, second=40))
-
     scheduler.start()
-    log.info("⏱️ Schedulers started: engine (minutely), settlement (30s), reports (daily+weekly)")
+    log.info("⏱️ Schedulers started (engine, settlement, reports)")
 
     yield
 
@@ -512,7 +600,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.error(f"Lifespan shutdown error: {e}")
 
-
 app = FastAPI(lifespan=lifespan)
 
 # =============================================================================
@@ -520,7 +607,7 @@ app = FastAPI(lifespan=lifespan)
 # =============================================================================
 @app.get("/", response_class=PlainTextResponse)
 async def root_get():
-    return "Pocket Option Signals — OANDA → PO (Webhook, OTC-aware, W/L/D tallies)"
+    return "Pocket Option Signals — OANDA→PO (Webhook, OTC-aware, Tiers, W/L/D)"
 
 @app.head("/")
 async def root_head():
@@ -551,22 +638,25 @@ async def telegram_webhook(
 @app.get("/status")
 async def status():
     now = datetime.now(timezone.utc)
+    dkey = now.strftime("%Y-%m-%d")
+    wkey = _week_key(now)
     async with _stats_lock:
-        # Shallow copy of today/week buckets if present
-        dkey = now.strftime("%Y-%m-%d")
-        wkey = _week_key(now)
         daily = _stats.get("daily", {}).get(dkey, {"win": 0, "loss": 0, "draw": 0})
         weekly = _stats.get("weekly", {}).get(wkey, {"win": 0, "loss": 0, "draw": 0})
+    async with _quota_lock:
+        quotas_today = {cid: _quota.get(cid, {}).get(dkey, 0) for cid, _, _ in _tiers()}
+    async with _unsupported_lock:
+        unsupported = sorted(list(_unsupported))
     return JSONResponse({
         "ok": True,
-        "mode": "webhook",
         "otc_now": is_otc_now(),
         "oanda_env": OANDA_ENV,
         "instruments": OANDA_INSTRUMENTS,
         "granularity": OANDA_GRANULARITY,
-        "po_expiry_min": PO_EXPIRY_MIN,
-        "po_entry_delay_sec": PO_ENTRY_DELAY_SEC,
+        "expiry_min": PO_EXPIRY_MIN,
+        "entry_delay_sec": PO_ENTRY_DELAY_SEC,
         "daily": daily,
         "weekly": weekly,
-        "open_trades": len([t for t in _open_trades if not t.get("settled")]),
+        "quota_today": quotas_today,
+        "unsupported": unsupported,
     })
