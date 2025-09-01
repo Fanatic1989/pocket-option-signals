@@ -3,146 +3,115 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, Request, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import Conflict
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Config (set these in Render → Environment)
+# =============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ENABLE_BOT_POLLING = os.getenv("ENABLE_BOT_POLLING", "1").strip()  # "1" to enable, "0" to disable (e.g., in CI)
-TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "").strip()     # optional, safe to keep private too
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # e.g. https://pocket-option-signals-hup9.onrender.com
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()  # route path (no trailing slash)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-secret").strip()  # any random string
+ENABLE_BOT_POLLING = os.getenv("ENABLE_BOT_POLLING", "0").strip()  # must be "0" for webhook mode
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pocket-option-signals")
 
-# Single-process globals
+# Globals
 telegram_app: Application | None = None
-bot_started: bool = False
-bot_polling_task: asyncio.Task | None = None
-bot_lock = asyncio.Lock()
 
-
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Telegram Handlers
-# -----------------------------------------------------------------------------
+# =============================================================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Pocket Option Signals bot is running.")
+    await update.message.reply_text("✅ Pocket Option Signals bot (webhook mode) is running.")
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
-
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
-    # TODO: add your signal commands/handlers here, can use TELEGRAM_GROUP_ID if needed
+    # TODO: add your command/handlers here
     return app
 
-
-# -----------------------------------------------------------------------------
-# Bot lifecycle (polling)
-# -----------------------------------------------------------------------------
-async def _start_bot_polling() -> None:
-    """
-    Ensure webhook is disabled, then start polling in the background.
-    Includes conflict backoff to avoid log storms.
-    """
+# =============================================================================
+# Webhook lifecycle
+# =============================================================================
+async def _set_webhook():
     assert telegram_app is not None
+    if not BASE_URL:
+        raise RuntimeError("BASE_URL env var is required for webhook mode (your public Render URL).")
 
-    # Make absolutely sure we are not in webhook mode
+    url = f"{BASE_URL}{WEBHOOK_PATH}"
+    # Ensure fresh start
     try:
         await telegram_app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("🧹 Deleted Telegram webhook (drop_pending_updates=True)")
+        log.info("🧹 Deleted existing webhook (drop_pending_updates=True)")
     except Exception as e:
         log.warning(f"Webhook delete warning: {e}")
 
     await telegram_app.initialize()
     await telegram_app.start()
-
-    max_attempts = 6  # ~1 minute worst case with backoff
-    delay = 2
-    for attempt in range(1, max_attempts + 1):
-        try:
-            await telegram_app.updater.start_polling(drop_pending_updates=True)
-            log.info("🤖 Telegram bot: polling started")
-            return
-        except Conflict as e:
-            log.warning(f"⚠️ Conflict starting polling (attempt {attempt}/{max_attempts}): {e}")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 20)
-
-    log.error(
-        "🛑 Gave up starting polling due to persistent Conflict. "
-        "Another instance is almost certainly running with this token."
+    # Set webhook
+    await telegram_app.bot.set_webhook(
+        url=url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=None,  # receive all update types
     )
+    log.info(f"🔗 Webhook set to: {url}")
 
-
-async def _stop_bot_polling() -> None:
+async def _unset_webhook():
     if telegram_app is None:
         return
     try:
-        await telegram_app.updater.stop()
+        await telegram_app.bot.delete_webhook(drop_pending_updates=False)
+        log.info("🧹 Webhook removed")
+    except Exception as e:
+        log.warning(f"Webhook removal warning: {e}")
+    try:
         await telegram_app.stop()
         await telegram_app.shutdown()
-        log.info("🛑 Telegram bot: polling stopped")
+        log.info("🛑 Telegram app stopped")
     except Exception as e:
-        log.error(f"Bot shutdown error: {e}")
+        log.error(f"Shutdown error: {e}")
 
-
-# -----------------------------------------------------------------------------
-# FastAPI app with lifespan—starts/stops bot inside same process
-# -----------------------------------------------------------------------------
+# =============================================================================
+# FastAPI (with lifespan)
+# =============================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global telegram_app, bot_started, bot_polling_task
-
-    if ENABLE_BOT_POLLING != "1":
-        log.info("⏸️ ENABLE_BOT_POLLING != '1' — bot will NOT start (CI-safe).")
-        yield
-        return
+    global telegram_app
 
     if not TELEGRAM_BOT_TOKEN:
-        log.warning("⚠️ TELEGRAM_BOT_TOKEN is empty; bot will NOT start.")
+        log.error("❌ TELEGRAM_BOT_TOKEN is missing. Bot will not start.")
         yield
         return
 
-    async with bot_lock:
-        if not bot_started:
-            telegram_app = build_telegram_app()
-            bot_polling_task = asyncio.create_task(_start_bot_polling())
-            bot_started = True
-            log.info("🔌 Bot launch scheduled")
-        else:
-            log.info("ℹ️ Bot already started; skipping duplicate start")
+    if ENABLE_BOT_POLLING == "1":
+        log.warning("⚠️ ENABLE_BOT_POLLING='1' but webhook mode is configured. For webhook mode set it to '0'.")
+    telegram_app = build_telegram_app()
+    await _set_webhook()
 
-    yield  # ---- app running ----
+    yield  # App is running
 
-    try:
-        if bot_started and telegram_app is not None:
-            await _stop_bot_polling()
-            bot_started = False
-        if bot_polling_task and not bot_polling_task.done():
-            bot_polling_task.cancel()
-    except Exception as e:
-        log.error(f"Lifespan shutdown error: {e}")
-
+    await _unset_webhook()
 
 app = FastAPI(lifespan=lifespan)
 
-
-# -----------------------------------------------------------------------------
-# HTTP Routes (with HEAD for UptimeRobot)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# HTTP Routes (health + webhook + uptime HEADs)
+# =============================================================================
 @app.get("/", response_class=PlainTextResponse)
 async def root_get():
-    return "Pocket Option Signals — OK"
+    return "Pocket Option Signals — OK (webhook mode)"
 
 @app.head("/")
 async def root_head():
@@ -155,3 +124,21 @@ async def healthz_get():
 @app.head("/healthz")
 async def healthz_head():
     return Response(status_code=200)
+
+# Telegram webhook receiver
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str = Header(None),
+):
+    # Verify Telegram's secret header matches ours (prevents random posts)
+    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if telegram_app is None:
+        raise HTTPException(status_code=503, detail="Bot not initialized")
+
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return {"ok": True}
