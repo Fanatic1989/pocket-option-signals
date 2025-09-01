@@ -1,5 +1,12 @@
+# app.py
+# Pocket Option Signals — OANDA→PO (Webhook, OTC-aware, Tiers, W/L/D, NOWPayments paywall)
+# Single-process Render service: web endpoints + Telegram bot + schedulers
+# ------------------------------------------------------------------------------------------
+
 import os
 import json
+import hmac
+import hashlib
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
@@ -10,7 +17,7 @@ import pandas as pd
 import pandas_ta as ta
 import httpx
 
-from fastapi import FastAPI, Response, Request, Header, HTTPException
+from fastapi import FastAPI, Response, Request, Header, HTTPException, Query
 from fastapi.responses import PlainTextResponse, JSONResponse
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -19,9 +26,9 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# =============================================================================
+# ==========================================================================================
 # ENV
-# =============================================================================
+# ==========================================================================================
 # Webhook / Telegram
 TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL             = os.getenv("BASE_URL", "").rstrip("/")
@@ -29,20 +36,25 @@ WEBHOOK_PATH         = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
 WEBHOOK_SECRET       = os.getenv("WEBHOOK_SECRET", "change-me").strip()
 ENABLE_BOT_POLLING   = os.getenv("ENABLE_BOT_POLLING", "0").strip()  # keep 0 for webhook mode
 
-# Single old-style group id (optional / backward compat). If you keep this, it will receive VIP (∞) by default.
+# Legacy single group (treated as VIP/unlimited). Optional.
 TELEGRAM_GROUP_ID    = os.getenv("TELEGRAM_GROUP_ID", "").strip()
 
-# Tiered chat IDs (each optional)
-TELEGRAM_CHAT_FREE   = os.getenv("TELEGRAM_CHAT_FREE", "").strip()   # gets 3/day
-TELEGRAM_CHAT_BASIC  = os.getenv("TELEGRAM_CHAT_BASIC", "").strip()  # gets 6/day
-TELEGRAM_CHAT_PRO    = os.getenv("TELEGRAM_CHAT_PRO", "").strip()    # gets 15/day
-TELEGRAM_CHAT_VIP    = os.getenv("TELEGRAM_CHAT_VIP", "").strip()    # unlimited/day
+# Tiered chat IDs (optional; set the ones you use)
+TELEGRAM_CHAT_FREE   = os.getenv("TELEGRAM_CHAT_FREE", "").strip()    # 3/day
+TELEGRAM_CHAT_BASIC  = os.getenv("TELEGRAM_CHAT_BASIC", "").strip()   # 6/day
+TELEGRAM_CHAT_PRO    = os.getenv("TELEGRAM_CHAT_PRO", "").strip()     # 15/day
+TELEGRAM_CHAT_VIP    = os.getenv("TELEGRAM_CHAT_VIP", "").strip()     # unlimited
 
-# Per-tier caps (override if you want different numbers later)
+# Per-tier caps (override via env if needed)
 LIMIT_FREE           = int(os.getenv("LIMIT_FREE", "3"))
 LIMIT_BASIC          = int(os.getenv("LIMIT_BASIC", "6"))
 LIMIT_PRO            = int(os.getenv("LIMIT_PRO", "15"))
 # VIP = unlimited
+
+# Invite links for paid groups (bot must be admin or use static links you generate)
+TELEGRAM_LINK_BASIC  = os.getenv("TELEGRAM_LINK_BASIC", "").strip()
+TELEGRAM_LINK_PRO    = os.getenv("TELEGRAM_LINK_PRO", "").strip()
+TELEGRAM_LINK_VIP    = os.getenv("TELEGRAM_LINK_VIP", "").strip()
 
 # OANDA
 OANDA_API_KEY        = os.getenv("OANDA_API_KEY", "").strip()
@@ -51,7 +63,7 @@ OANDA_ENV            = os.getenv("OANDA_ENV", "practice").strip().lower()  # pra
 OANDA_INSTRUMENTS    = [s.strip() for s in os.getenv("OANDA_INSTRUMENTS", "EUR_USD,GBP_USD,USD_JPY").split(",") if s.strip()]
 OANDA_GRANULARITY    = os.getenv("OANDA_GRANULARITY", "M1").strip().upper()  # M1/M5/M15 etc.
 
-# Pocket Option guidance
+# Pocket Option signal settings
 PO_EXPIRY_MIN        = int(os.getenv("PO_EXPIRY_MIN", "5"))      # suggested expiry (min)
 PO_ENTRY_DELAY_SEC   = int(os.getenv("PO_ENTRY_DELAY_SEC", "2")) # seconds after candle close
 ALERT_COOLDOWN_MIN   = int(os.getenv("ALERT_COOLDOWN_MIN", "10"))
@@ -63,19 +75,29 @@ EMA_FAST             = int(os.getenv("EMA_FAST", "9"))
 EMA_SLOW             = int(os.getenv("EMA_SLOW", "21"))
 ATR_FILTER_MULT      = float(os.getenv("ATR_FILTER_MULT", "0.0"))
 
-# OTC control
-PO_BLOCK_DURING_OTC  = int(os.getenv("PO_BLOCK_DURING_OTC", "1"))  # 1=block, 0=ignore
-PO_OTC_UTC_WINDOWS   = os.getenv("PO_OTC_UTC_WINDOWS", "").strip()  # e.g., "21:00-23:59,00:00-03:00"
+# OTC control (HARD-CODED PO LIVE WINDOW; ignore PO_OTC_UTC_WINDOWS)
+# PO Forex LIVE Mon–Fri 02:00–22:45 UTC → signals ON; otherwise OTC → OFF
+PO_BLOCK_DURING_OTC  = int(os.getenv("PO_BLOCK_DURING_OTC", "1"))
 
 # Scheduler TZ (OANDA timestamps are UTC)
 SCHED_TZ             = timezone.utc
 
-# Files (ephemeral; OK for daily/weekly counters)
+# Files (ephemeral on Render; OK for counters)
 DATA_DIR             = os.getenv("DATA_DIR", "./data").strip()
 STATS_FILE           = os.path.join(DATA_DIR, "stats.json")
 OPEN_TRADES_FILE     = os.path.join(DATA_DIR, "open_trades.json")
-QUOTA_FILE           = os.path.join(DATA_DIR, "quota.json")       # per-chat daily counters
-UNSUPPORTED_FILE     = os.path.join(DATA_DIR, "unsupported.json") # instruments to skip
+QUOTA_FILE           = os.path.join(DATA_DIR, "quota.json")        # per-chat daily counters
+UNSUPPORTED_FILE     = os.path.join(DATA_DIR, "unsupported.json")  # instruments to skip
+ORDERS_FILE          = os.path.join(DATA_DIR, "orders.json")       # invoice order_id -> context
+
+# NOWPayments (Paywall)
+NOWPAY_API_KEY       = os.getenv("NOWPAY_API_KEY", "").strip()            # header x-api-key
+NOWPAY_IPN_SECRET    = os.getenv("NOWPAY_IPN_SECRET", "").strip()         # for x-nowpayments-sig verification (HMAC-SHA512)
+NOWPAY_PRICE_CCY     = os.getenv("NOWPAY_PRICE_CCY", "USD").strip().lower()
+PRICE_BASIC          = float(os.getenv("PRICE_BASIC", "19.0"))
+PRICE_PRO            = float(os.getenv("PRICE_PRO", "39.0"))
+PRICE_VIP            = float(os.getenv("PRICE_VIP", "99.0"))
+NOWPAY_PAY_CCY       = os.getenv("NOWPAY_PAY_CCY", "").strip().lower()    # optional (let user choose if empty)
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -92,15 +114,17 @@ _stats_lock = asyncio.Lock()
 _trades_lock = asyncio.Lock()
 _quota_lock = asyncio.Lock()
 _unsupported_lock = asyncio.Lock()
+_orders_lock = asyncio.Lock()
 
 _stats: Dict[str, Any] = {}         # {'daily': {'YYYY-MM-DD': {'win':..,'loss':..,'draw':..}}, 'weekly': {...}}
 _open_trades: List[Dict[str, Any]] = []
 _quota: Dict[str, Dict[str, int]] = {}      # {chat_id: { 'YYYY-MM-DD': count }}
 _unsupported: Set[str] = set()               # instruments that produced 400/invalid; we skip them
+_orders: Dict[str, Dict[str, Any]] = {}      # order_id -> {'tier': 'BASIC', 'telegram_id': 12345, ...}
 
-# =============================================================================
+# ==========================================================================================
 # Utilities: FS
-# =============================================================================
+# ==========================================================================================
 def _ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -110,94 +134,147 @@ def _week_key(dt: datetime) -> str:
 
 async def load_state():
     _ensure_dirs()
-    global _stats, _open_trades, _quota, _unsupported
+    global _stats, _open_trades, _quota, _unsupported, _orders
     try:
-        if os.path.exists(STATS_FILE):
-            with open(STATS_FILE, "r") as f:
-                _stats = json.load(f)
-        else:
-            _stats = {"daily": {}, "weekly": {}}
+        _stats = json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {"daily": {}, "weekly": {}}
     except Exception as e:
         log.error(f"Failed to load stats: {e}")
         _stats = {"daily": {}, "weekly": {}}
     try:
-        if os.path.exists(OPEN_TRADES_FILE):
-            with open(OPEN_TRADES_FILE, "r") as f:
-                _open_trades = json.load(f)
-        else:
-            _open_trades = []
+        _open_trades = json.load(open(OPEN_TRADES_FILE)) if os.path.exists(OPEN_TRADES_FILE) else []
     except Exception as e:
         log.error(f"Failed to load open_trades: {e}")
         _open_trades = []
     try:
-        if os.path.exists(QUOTA_FILE):
-            with open(QUOTA_FILE, "r") as f:
-                _quota = json.load(f)
-        else:
-            _quota = {}
+        _quota = json.load(open(QUOTA_FILE)) if os.path.exists(QUOTA_FILE) else {}
     except Exception as e:
         log.error(f"Failed to load quota: {e}")
         _quota = {}
     try:
-        if os.path.exists(UNSUPPORTED_FILE):
-            with open(UNSUPPORTED_FILE, "r") as f:
-                _unsupported = set(json.load(f))
-        else:
-            _unsupported = set()
+        _unsupported = set(json.load(open(UNSUPPORTED_FILE))) if os.path.exists(UNSUPPORTED_FILE) else set()
     except Exception as e:
         log.error(f"Failed to load unsupported: {e}")
         _unsupported = set()
-
-async def save_stats():
-    _ensure_dirs()
     try:
-        with open(STATS_FILE, "w") as f:
-            json.dump(_stats, f)
+        _orders = json.load(open(ORDERS_FILE)) if os.path.exists(ORDERS_FILE) else {}
     except Exception as e:
-        log.error(f"Failed to save stats: {e}")
+        log.error(f"Failed to load orders: {e}")
+        _orders = {}
 
-async def save_open_trades():
+async def _save_json(path: str, data: Any):
     _ensure_dirs()
-    try:
-        with open(OPEN_TRADES_FILE, "w") as f:
-            json.dump(_open_trades, f)
-    except Exception as e:
-        log.error(f"Failed to save open_trades: {e}")
+    with open(path, "w") as f:
+        json.dump(data, f)
 
-async def save_quota():
-    _ensure_dirs()
-    try:
-        with open(QUOTA_FILE, "w") as f:
-            json.dump(_quota, f)
-    except Exception as e:
-        log.error(f"Failed to save quota: {e}")
+async def save_stats():        await _save_json(STATS_FILE, _stats)
+async def save_open_trades():  await _save_json(OPEN_TRADES_FILE, _open_trades)
+async def save_quota():        await _save_json(QUOTA_FILE, _quota)
+async def save_unsupported():  await _save_json(UNSUPPORTED_FILE, sorted(list(_unsupported)))
+async def save_orders():       await _save_json(ORDERS_FILE, _orders)
 
-async def save_unsupported():
-    _ensure_dirs()
-    try:
-        with open(UNSUPPORTED_FILE, "w") as f:
-            json.dump(sorted(list(_unsupported)), f)
-    except Exception as e:
-        log.error(f"Failed to save unsupported: {e}")
+# ==========================================================================================
+# Telegram Handlers (commands for onboarding + paywall)
+# ==========================================================================================
+HELP_TEXT = (
+    "Welcome to Pocket Option Signals 🤖\n"
+    "• 3/6/15/Unlimited signals by tier (FREE/BASIC/PRO/VIP)\n"
+    "• Live-only hours (OTC paused)\n"
+    "• W/L/D stats daily & weekly\n\n"
+    "Commands:\n"
+    "/start — intro\n"
+    "/ping — health check\n"
+    "/plans — show prices & how to upgrade\n"
+    "/upgrade <BASIC|PRO|VIP> — create a crypto invoice\n"
+)
 
-# =============================================================================
-# Telegram Handlers
-# =============================================================================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Pocket Option Signals — tiers, OTC-aware, W/L/D, quota caps.")
+    await update.message.reply_text(HELP_TEXT)
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
+
+def _plan_price(tier: str) -> Optional[float]:
+    t = tier.upper()
+    return {"BASIC": PRICE_BASIC, "PRO": PRICE_PRO, "VIP": PRICE_VIP}.get(t)
+
+def _plan_link(tier: str) -> str:
+    t = tier.upper()
+    return {"BASIC": TELEGRAM_LINK_BASIC, "PRO": TELEGRAM_LINK_PRO, "VIP": TELEGRAM_LINK_VIP}.get(t, "")
+
+async def plans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        f"Plans (paid monthly, pay in crypto via NOWPayments):\n"
+        f"• BASIC — {PRICE_BASIC:.2f} {NOWPAY_PRICE_CCY.upper()} — 6 signals/day\n"
+        f"• PRO   — {PRICE_PRO:.2f} {NOWPAY_PRICE_CCY.upper()} — 15 signals/day\n"
+        f"• VIP   — {PRICE_VIP:.2f} {NOWPAY_PRICE_CCY.upper()} — Unlimited\n\n"
+        f"Use /upgrade BASIC (or PRO/VIP) to get your payment link."
+    )
+    await update.message.reply_text(msg)
+
+async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /upgrade TIER
+    if not NOWPAY_API_KEY:
+        await update.message.reply_text("Payments are temporarily unavailable. Try later.")
+        return
+    args = context.args or []
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /upgrade BASIC|PRO|VIP")
+        return
+    tier = args[0].upper()
+    price = _plan_price(tier)
+    if price is None:
+        await update.message.reply_text("Tier not found. Use BASIC, PRO, or VIP.")
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else 0
+    order_id = f"tier:{tier}:uid:{user_id}:{int(datetime.now(timezone.utc).timestamp())}"
+    description = f"Pocket Option Signals — {tier} plan for Telegram user {user_id}"
+
+    # Create NOWPayments invoice
+    try:
+        invoice = await nowpay_create_invoice(
+            price_amount=price,
+            price_currency=NOWPAY_PRICE_CCY,
+            order_id=order_id,
+            order_description=description,
+            pay_currency=NOWPAY_PAY_CCY or None,
+            success_url=f"{BASE_URL}/pay/success?tier={tier}",
+            cancel_url=f"{BASE_URL}/pay/cancel?tier={tier}",
+            ipn_callback_url=f"{BASE_URL}/pay/ipn"
+        )
+    except Exception as e:
+        log.error(f"Invoice error: {e}")
+        await update.message.reply_text("Could not create invoice. Please try again later.")
+        return
+
+    invoice_url = invoice.get("invoice_url") or invoice.get("url") or ""
+    if not invoice_url:
+        await update.message.reply_text("Invoice link unavailable. Please try later.")
+        return
+
+    # Save minimal order context for later IPN use
+    async with _orders_lock:
+        _orders[order_id] = {"tier": tier, "telegram_id": user_id, "created_at": datetime.now(timezone.utc).isoformat()}
+        await save_orders()
+
+    await update.message.reply_text(
+        f"✅ Invoice created for {tier} ({price:.2f} {NOWPAY_PRICE_CCY.upper()}).\n"
+        f"Pay here: {invoice_url}\n\n"
+        f"Once payment is confirmed, you’ll receive your private group invite link."
+    )
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping",  ping_cmd))
+    app.add_handler(CommandHandler("plans", plans_cmd))
+    app.add_handler(CommandHandler("upgrade", upgrade_cmd))
     return app
 
-# =============================================================================
+# ==========================================================================================
 # OANDA Helpers
-# =============================================================================
+# ==========================================================================================
 def oanda_base_url() -> str:
     return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
 
@@ -209,7 +286,7 @@ async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 30
     params = {"count": str(count), "granularity": granularity, "price": "M"}
     async with httpx.AsyncClient(timeout=25) as client:
         r = await client.get(url, params=params, headers=_auth_headers())
-        # If instrument invalid/disabled → 400; mark as unsupported once
+        # If instrument invalid/disabled → 400; mark as unsupported
         if r.status_code == 400:
             async with _unsupported_lock:
                 if instrument not in _unsupported:
@@ -223,7 +300,6 @@ async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 30
     rows = []
     for c in data.get("candles", []):
         mid = c.get("mid", {})
-        # some exotic pairs can sometimes omit fields -> guard
         if "time" not in c or not mid:
             continue
         try:
@@ -244,15 +320,15 @@ async def fetch_oanda_candles(instrument: str, granularity: str, count: int = 30
 def last_completed(df: pd.DataFrame) -> Optional[int]:
     if df.empty:
         return None
-    if df.iloc[-1].get("complete", False):
+    if bool(df.iloc[-1].get("complete", False)):
         return int(df.index[-1])
     if len(df) >= 2 and bool(df.iloc[-2].get("complete", False)):
         return int(df.index[-2])
     return None
 
-# =============================================================================
+# ==========================================================================================
 # PO mapping & signals
-# =============================================================================
+# ==========================================================================================
 def pocket_asset_name(instrument: str) -> str:
     return instrument.replace("_", "/")
 
@@ -291,45 +367,25 @@ def compute_signal_row(df: pd.DataFrame, idx: int) -> Dict[str, Any]:
         "ema_fast": float(cur["ema_fast"]), "ema_slow": float(cur["ema_slow"]), "rsi14": float(cur["rsi14"]),
     }
 
-# =============================================================================
-# OTC detection
-# =============================================================================
-def _parse_windows(spec: str) -> List[Tuple[str, str]]:
-    wins: List[Tuple[str, str]] = []
-    if not spec:
-        return wins
-    parts = [p.strip() for p in spec.split(",") if p.strip()]
-    for p in parts:
-        try:
-            a, b = p.split("-")
-            wins.append((a.strip(), b.strip()))
-        except Exception:
-            continue
-    return wins
-
-def _in_window(now: datetime, start_hm: str, end_hm: str) -> bool:
-    sh, sm = [int(x) for x in start_hm.split(":")]
-    eh, em = [int(x) for x in end_hm.split(":")]
-    start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-    end   = now.replace(hour=eh, minute=em, second=59, microsecond=999999)
-    if end >= start:
-        return start <= now <= end
-    return now >= start or now <= end
-
+# ==========================================================================================
+# OTC detection (HARD rule for PO: Live Mon–Fri 02:00–22:45 UTC)
+# ==========================================================================================
 def is_otc_now(now_utc: Optional[datetime] = None) -> bool:
     if PO_BLOCK_DURING_OTC != 1:
         return False
     now = (now_utc or datetime.now(timezone.utc))
-    if now.weekday() in (5, 6):  # Sat/Sun
+    wd = now.weekday()  # Monday=0, Sunday=6
+    if wd in (5, 6):  # Sat, Sun
         return True
-    for (s, e) in _parse_windows(PO_OTC_UTC_WINDOWS):
-        if _in_window(now, s, e):
-            return True
-    return False
+    live_start = now.replace(hour=2, minute=0, second=0, microsecond=0)
+    live_end   = now.replace(hour=22, minute=45, second=0, microsecond=0)
+    if live_start <= now <= live_end:
+        return False  # live hours → signals ON
+    return True        # outside live → OTC → signals OFF
 
-# =============================================================================
+# ==========================================================================================
 # QUOTA / TIERS
-# =============================================================================
+# ==========================================================================================
 def _tiers() -> List[Tuple[str, Optional[int], str]]:
     """
     Returns list of (chat_id, cap or None, label)
@@ -359,17 +415,12 @@ async def _quota_inc(chat_id: str) -> int:
         await save_quota()
         return _quota[chat_id][day]
 
-async def _quota_reset_if_new_day():
-    # Optional: clean old days occasionally; we rely on new keys per day.
-    return
-
 async def send_to_tiers(text: str):
     targets = _tiers()
     if not targets:
         log.warning("No Telegram chats configured; skipping send.")
         return
     for chat_id, cap, label in targets:
-        # Enforce cap per day (cap=None => unlimited)
         can_send = True
         if cap is not None:
             used = await _quota_get(chat_id)
@@ -384,9 +435,9 @@ async def send_to_tiers(text: str):
         except Exception as e:
             log.error(f"Telegram send error ({label}/{chat_id}): {e}")
 
-# =============================================================================
+# ==========================================================================================
 # W/L/D settlement & stats
-# =============================================================================
+# ==========================================================================================
 async def price_at_or_after(instrument: str, when_utc: datetime) -> Optional[float]:
     df = await fetch_oanda_candles(instrument, "M1", count=400)
     if df.empty or "time" not in df.columns:
@@ -466,9 +517,9 @@ async def send_daily_weekly_reports():
     )
     await send_to_tiers(msg)
 
-# =============================================================================
+# ==========================================================================================
 # Engine
-# =============================================================================
+# ==========================================================================================
 def is_supported(instrument: str) -> bool:
     return instrument not in _unsupported
 
@@ -510,7 +561,6 @@ async def process_instrument(inst: str) -> None:
         else:
             log.info(f"{inst}: {sig} ({res.get('reason')})")
     except httpx.HTTPStatusError as e:
-        # Extra guard: 400 -> mark unsupported
         if e.response is not None and e.response.status_code == 400:
             async with _unsupported_lock:
                 if inst not in _unsupported:
@@ -531,9 +581,89 @@ async def run_engine():
         return
     await asyncio.gather(*(process_instrument(i) for i in OANDA_INSTRUMENTS))
 
-# =============================================================================
+# ==========================================================================================
+# NOWPayments helper
+# ==========================================================================================
+NOWPAY_BASE = "https://api.nowpayments.io/v1"
+
+async def nowpay_create_invoice(
+    *,
+    price_amount: float,
+    price_currency: str,
+    order_id: str,
+    order_description: str,
+    pay_currency: Optional[str],
+    success_url: str,
+    cancel_url: str,
+    ipn_callback_url: str,
+) -> Dict[str, Any]:
+    """
+    Creates a NOWPayments invoice and returns JSON (expects 'invoice_url').
+    Headers: x-api-key
+    Endpoint: POST /v1/invoice
+    """
+    payload = {
+        "price_amount": float(price_amount),
+        "price_currency": price_currency.lower(),
+        "order_id": order_id,
+        "order_description": order_description,
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "ipn_callback_url": ipn_callback_url,
+    }
+    if pay_currency:
+        payload["pay_currency"] = pay_currency.lower()
+
+    headers = {"x-api-key": NOWPAY_API_KEY, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.post(f"{NOWPAY_BASE}/invoice", headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+def nowpay_verify_signature(raw_body: bytes, signature: str) -> bool:
+    """
+    Verify x-nowpayments-sig using HMAC-SHA512 with NOWPAY_IPN_SECRET over
+    the canonical JSON string (sorted keys). We accept raw_body as-is.
+    NOWPayments sends the body JSON; we recompute hash on sorted JSON.
+
+    If NOWPAY_IPN_SECRET is missing, fail closed (return False).
+    """
+    try:
+        if not NOWPAY_IPN_SECRET:
+            return False
+        # Load JSON, re-dump with sorted keys (canonical)
+        body = json.loads(raw_body.decode("utf-8"))
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        calc = hmac.new(
+            NOWPAY_IPN_SECRET.encode("utf-8"),
+            msg=canonical.encode("utf-8"),
+            digestmod=hashlib.sha512,
+        ).hexdigest()
+        return hmac.compare_digest(calc, (signature or "").lower())
+    except Exception as e:
+        log.error(f"IPN verify error: {e}")
+        return False
+
+def _invite_for_tier(tier: str) -> str:
+    t = tier.upper()
+    return {"BASIC": TELEGRAM_LINK_BASIC, "PRO": TELEGRAM_LINK_PRO, "VIP": TELEGRAM_LINK_VIP}.get(t, "")
+
+async def _notify_user_paid(tier: str, telegram_id: int):
+    link = _invite_for_tier(tier)
+    if not telegram_id:
+        return
+    try:
+        text = (
+            f"✅ Payment confirmed for *{tier}*.\n"
+            f"Join your private group: {link if link else '(ask admin for invite link)'}"
+        )
+        await telegram_app.bot.send_message(chat_id=telegram_id, text=text, disable_web_page_preview=True, parse_mode=None)
+    except Exception as e:
+        log.error(f"Failed to DM user {telegram_id}: {e}")
+
+# ==========================================================================================
 # Webhook lifecycle
-# =============================================================================
+# ==========================================================================================
 async def set_webhook():
     assert telegram_app is not None
     if not BASE_URL:
@@ -564,9 +694,9 @@ async def unset_webhook():
     except Exception as e:
         log.error(f"Shutdown error: {e}")
 
-# =============================================================================
+# ==========================================================================================
 # FastAPI App (lifespan)
-# =============================================================================
+# ==========================================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global telegram_app, scheduler
@@ -602,12 +732,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# =============================================================================
+# ==========================================================================================
 # Routes
-# =============================================================================
+# ==========================================================================================
 @app.get("/", response_class=PlainTextResponse)
 async def root_get():
-    return "Pocket Option Signals — OANDA→PO (Webhook, OTC-aware, Tiers, W/L/D)"
+    return "Pocket Option Signals — OANDA→PO (Webhook, OTC-aware, Tiers, W/L/D, NOWPayments)"
 
 @app.head("/")
 async def root_head():
@@ -660,3 +790,83 @@ async def status():
         "quota_today": quotas_today,
         "unsupported": unsupported,
     })
+
+# ------------------------------------------------------------------------------------------
+# Payments: simple helpers to sanity-check env and create demo invoices via HTTP GET (optional)
+# ------------------------------------------------------------------------------------------
+@app.get("/pay/create")
+async def pay_create(
+    tier: str = Query(..., pattern="^(?i)(BASIC|PRO|VIP)$"),
+    telegram_id: int = Query(..., description="Telegram user id to DM invite after payment"),
+):
+    if not NOWPAY_API_KEY:
+        raise HTTPException(503, "NOWPayments unavailable")
+    t = tier.upper()
+    amt = _plan_price(t)
+    if not amt:
+        raise HTTPException(400, "Unknown tier")
+    order_id = f"tier:{t}:uid:{telegram_id}:{int(datetime.now(timezone.utc).timestamp())}"
+    desc = f"Pocket Option Signals — {t} plan for Telegram user {telegram_id}"
+    try:
+        invoice = await nowpay_create_invoice(
+            price_amount=amt,
+            price_currency=NOWPAY_PRICE_CCY,
+            order_id=order_id,
+            order_description=desc,
+            pay_currency=NOWPAY_PAY_CCY or None,
+            success_url=f"{BASE_URL}/pay/success?tier={t}",
+            cancel_url=f"{BASE_URL}/pay/cancel?tier={t}",
+            ipn_callback_url=f"{BASE_URL}/pay/ipn",
+        )
+    except Exception as e:
+        log.error(f"Invoice error: {e}")
+        raise HTTPException(500, "Could not create invoice")
+    async with _orders_lock:
+        _orders[order_id] = {"tier": t, "telegram_id": telegram_id, "created_at": datetime.now(timezone.utc).isoformat()}
+        await save_orders()
+    return invoice
+
+@app.get("/pay/success", response_class=PlainTextResponse)
+async def pay_success(tier: str = "UNKNOWN"):
+    return f"Payment success page placeholder. Tier={tier}"
+
+@app.get("/pay/cancel", response_class=PlainTextResponse)
+async def pay_cancel(tier: str = "UNKNOWN"):
+    return f"Payment canceled. Tier={tier}"
+
+# ------------------------------------------------------------------------------------------
+# IPN endpoint — NOWPayments callback (verify HMAC, mark paid, DM user invite link)
+# ------------------------------------------------------------------------------------------
+@app.post("/pay/ipn")
+async def pay_ipn(request: Request, x_nowpayments_sig: str = Header(None)):
+    raw = await request.body()
+    if not nowpay_verify_signature(raw, x_nowpayments_sig or ""):
+        raise HTTPException(403, "Bad signature")
+
+    body = json.loads(raw.decode("utf-8"))
+    # NOWPayments sends fields like: payment_status, payment_id, order_id, price_amount, price_currency, actually_paid, pay_currency, etc.
+    order_id = body.get("order_id") or body.get("orderId") or ""
+    status   = (body.get("payment_status") or body.get("paymentStatus") or "").lower()
+
+    # Accept statuses when funds are confirmed/finished
+    paid_ok = status in ("finished", "confirmed", "partially_paid", "sending")  # broadened; you may restrict to finished/confirmed
+
+    if not order_id:
+        return {"ok": False, "reason": "missing order_id", "status": status}
+
+    async with _orders_lock:
+        ctx = _orders.get(order_id, {})
+    tier = (ctx.get("tier") or "VIP").upper()
+    telegram_id = int(ctx.get("telegram_id") or 0)
+
+    if paid_ok and telegram_id:
+        await _notify_user_paid(tier, telegram_id)
+
+    # Optionally mark as fulfilled
+    async with _orders_lock:
+        if order_id in _orders:
+            _orders[order_id]["last_status"] = status
+            _orders[order_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await save_orders()
+
+    return {"ok": True, "order_id": order_id, "status": status, "notified": bool(paid_ok and telegram_id)}
