@@ -14,6 +14,8 @@ from telegram.error import Conflict
 # Config
 # -----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ENABLE_BOT_POLLING = os.getenv("ENABLE_BOT_POLLING", "1").strip()  # "1" to enable, "0" to disable (e.g., in CI)
+TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "").strip()     # optional, safe to keep private too
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +42,7 @@ def build_telegram_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
-    # TODO: add your signal commands/handlers here
+    # TODO: add your signal commands/handlers here, can use TELEGRAM_GROUP_ID if needed
     return app
 
 
@@ -100,6 +102,11 @@ async def _stop_bot_polling() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global telegram_app, bot_started, bot_polling_task
+
+    if ENABLE_BOT_POLLING != "1":
+        log.info("⏸️ ENABLE_BOT_POLLING != '1' — bot will NOT start (CI-safe).")
+        yield
+        return
 
     if not TELEGRAM_BOT_TOKEN:
         log.warning("⚠️ TELEGRAM_BOT_TOKEN is empty; bot will NOT start.")
