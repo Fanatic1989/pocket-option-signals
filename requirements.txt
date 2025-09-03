@@ -19,3 +19,4 @@ wheel>=0.43.0
 packaging>=23.2
 
 gunicorn==22.0.0
+websockets==12.0
