@@ -1,14 +1,20 @@
 # app.py
 # Pocket Option Signals — BLW M1→5 Main Strategy (FX live only)
-# - Exact pairs locked to your winners list
-# - 1m candles, 5m expiry, 10m per-instrument cooldown
-# - Per-tier quotas (FREE/BASIC/PRO/VIP)
-# - Auto block outside FX live session (Mon–Fri, 08:00–16:00 America/Port_of_Spain)
-# - Auto daily & weekly tallies sent to all groups
-# ------------------------------------------------------------------------------
+# Features KEPT from earlier build:
+# - NOWPayments paywall (invoice + IPN), auto-tier routing (FREE/BASIC/PRO/VIP)
+# - Per-tier quotas (FREE/BASIC/PRO; VIP=∞)
+# - FX live-hours guard (Mon–Fri 08:00–16:00 America/Port_of_Spain)
+# - Per-instrument cooldown (10 min default)
+# - W/L/D settlement after fixed expiry (5 min default)
+# - Auto daily & weekly tallies to all groups
+# - Works in single-process on Render (web + Telegram bot)
+# Strategy change ONLY: BLW-like M1 trigger, 5-min expiry, winners-only pairs
+# ---------------------------------------------------------------------------------
 
 import os
 import json
+import hmac
+import hashlib
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone, time as dtime
@@ -18,8 +24,8 @@ import pandas as pd
 import pandas_ta as ta
 import httpx
 
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import PlainTextResponse, JSONResponse
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -36,11 +42,16 @@ WEBHOOK_PATH         = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
 WEBHOOK_SECRET       = os.getenv("WEBHOOK_SECRET", "change-me").strip()
 ENABLE_BOT_POLLING   = os.getenv("ENABLE_BOT_POLLING", "0").strip()
 
-# Chats
-TELEGRAM_CHAT_FREE   = os.getenv("TELEGRAM_CHAT_FREE", "").strip()
+# Chats (send signals to these)
+TELEGRAM_CHAT_FREE   = os.getenv("TELEGRAM_CHAT_FREE", "").strip()    # e.g. -100xxxxxxxxxx
 TELEGRAM_CHAT_BASIC  = os.getenv("TELEGRAM_CHAT_BASIC", "").strip()
 TELEGRAM_CHAT_PRO    = os.getenv("TELEGRAM_CHAT_PRO", "").strip()
 TELEGRAM_CHAT_VIP    = os.getenv("TELEGRAM_CHAT_VIP", "").strip()
+
+# Optional static invite links (auto-sent after payment)
+TELEGRAM_LINK_BASIC  = os.getenv("TELEGRAM_LINK_BASIC", "").strip()
+TELEGRAM_LINK_PRO    = os.getenv("TELEGRAM_LINK_PRO", "").strip()
+TELEGRAM_LINK_VIP    = os.getenv("TELEGRAM_LINK_VIP", "").strip()
 
 # Quotas
 LIMIT_FREE           = int(os.getenv("LIMIT_FREE", "3"))
@@ -52,14 +63,14 @@ LIMIT_PRO            = int(os.getenv("LIMIT_PRO", "15"))
 OANDA_API_KEY        = os.getenv("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID     = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_ENV            = os.getenv("OANDA_ENV", "practice").strip().lower()
-# EXACT PAIRS (winners)
+# EXACT “winners” PAIRS (from your backtest results)
 OANDA_INSTRUMENTS    = [s.strip() for s in os.getenv(
     "OANDA_INSTRUMENTS",
     "AUD_USD,EUR_GBP,EUR_JPY,AUD_CHF,CAD_JPY,GBP_AUD,EUR_CAD,EUR_CHF,AUD_CAD,CAD_CHF,CHF_JPY,USD_CHF,GBP_CHF"
 ).split(",") if s.strip()]
 OANDA_GRANULARITY    = os.getenv("OANDA_GRANULARITY", "M1").strip().upper()
 
-# Strategy (BLW M1→5 tuned)
+# BLW M1→5 Strategy knobs
 PO_EXPIRY_MIN        = int(os.getenv("PO_EXPIRY_MIN", "5"))
 ALERT_COOLDOWN_MIN   = int(os.getenv("ALERT_COOLDOWN_MIN", "10"))
 ADX_MIN              = float(os.getenv("ADX_MIN", "18"))
@@ -69,10 +80,20 @@ ATR_PCTL_MAX         = float(os.getenv("ATR_PCTL_MAX", "0.92"))
 RSI_UP               = float(os.getenv("RSI_UP", "52"))
 RSI_DN               = float(os.getenv("RSI_DN", "48"))
 
-# Session / OTC guard (FX live only)
+# Session / FX live guard
 SESSION_TZ_NAME      = os.getenv("SESSION_TZ", "America/Port_of_Spain")
-LIVE_START_LOCAL     = os.getenv("LIVE_START_LOCAL", "08:00")  # 08:00 local
-LIVE_END_LOCAL       = os.getenv("LIVE_END_LOCAL", "16:00")    # 16:00 local
+LIVE_START_LOCAL     = os.getenv("LIVE_START_LOCAL", "08:00")  # local time
+LIVE_END_LOCAL       = os.getenv("LIVE_END_LOCAL", "16:00")
+
+# NOWPayments
+NOWPAY_API_KEY       = os.getenv("NOWPAY_API_KEY", "").strip()
+NOWPAY_IPN_SECRET    = os.getenv("NOWPAY_IPN_SECRET", "").strip()
+NOWPAY_PRICE_CCY     = os.getenv("NOWPAY_PRICE_CCY", "usd").strip().lower()
+NOWPAY_PAY_CCY       = os.getenv("NOWPAY_PAY_CCY", "usdttrc20").strip().lower()
+
+PRICE_BASIC          = float(os.getenv("PRICE_BASIC", "29.0"))
+PRICE_PRO            = float(os.getenv("PRICE_PRO", "49.0"))
+PRICE_VIP            = float(os.getenv("PRICE_VIP", "79.0"))
 
 # Storage
 DATA_DIR             = os.getenv("DATA_DIR", "./data").strip()
@@ -81,6 +102,7 @@ OPEN_TRADES_FILE     = os.path.join(DATA_DIR, "open_trades.json")
 QUOTA_FILE           = os.path.join(DATA_DIR, "quota.json")
 LAST_SIGNAL_FILE     = os.path.join(DATA_DIR, "last_signal.json")
 UNSUPPORTED_FILE     = os.path.join(DATA_DIR, "unsupported.json")
+ORDERS_FILE          = os.path.join(DATA_DIR, "orders.json")
 
 # Scheduler / globals
 logging.basicConfig(level=logging.INFO)
@@ -95,12 +117,14 @@ _trades_lock = asyncio.Lock()
 _quota_lock = asyncio.Lock()
 _io_lock = asyncio.Lock()
 _unsupported_lock = asyncio.Lock()
+_orders_lock = asyncio.Lock()
 
 _stats: Dict[str, Any] = {"daily": {}, "weekly": {}}
 _open_trades: List[Dict[str, Any]] = []
 _quota: Dict[str, Dict[str, int]] = {}
 _last_signal_time: Dict[str, str] = {}
 _unsupported: Set[str] = set()
+_orders: Dict[str, Dict[str, Any]] = {}  # order_id -> {tier, telegram_id, created_at}
 
 # =========================
 # Utils & FS
@@ -128,24 +152,20 @@ async def _write_json(path: str, data: Any):
         log.error(f"Write error {path}: {e}")
 
 async def load_state():
-    global _stats, _open_trades, _quota, _last_signal_time, _unsupported
+    global _stats, _open_trades, _quota, _last_signal_time, _unsupported, _orders
     _stats = await _read_json(STATS_FILE, {"daily": {}, "weekly": {}})
     _open_trades = await _read_json(OPEN_TRADES_FILE, [])
     _quota = await _read_json(QUOTA_FILE, {})
     _last_signal_time = await _read_json(LAST_SIGNAL_FILE, {})
     _unsupported = set(await _read_json(UNSUPPORTED_FILE, []))
+    _orders = await _read_json(ORDERS_FILE, {})
 
 async def save_stats():        await _write_json(STATS_FILE, _stats)
 async def save_open_trades():  await _write_json(OPEN_TRADES_FILE, _open_trades)
 async def save_quota():        await _write_json(QUOTA_FILE, _quota)
 async def save_last_signal():  await _write_json(LAST_SIGNAL_FILE, _last_signal_time)
 async def save_unsupported():  await _write_json(UNSUPPORTED_FILE, sorted(list(_unsupported)))
-
-def oanda_base_url() -> str:
-    return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
-
-def auth_headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {OANDA_API_KEY}", "Content-Type": "application/json"}
+async def save_orders():       await _write_json(ORDERS_FILE, _orders)
 
 # =========================
 # Time / Session guard
@@ -153,7 +173,7 @@ def auth_headers() -> Dict[str, str]:
 try:
     from zoneinfo import ZoneInfo
 except Exception:
-    from backports.zoneinfo import ZoneInfo  # fallback if needed
+    from backports.zoneinfo import ZoneInfo  # py<3.9 fallback
 
 def _parse_hhmm(s: str) -> dtime:
     hh, mm = s.split(":")
@@ -174,6 +194,12 @@ def fx_live_now(now_utc: Optional[datetime] = None) -> bool:
 # =========================
 # OANDA: fetch candles
 # =========================
+def oanda_base_url() -> str:
+    return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
+
+def auth_headers() -> Dict[str, str]:
+    return {"Authorization": f"Bearer {OANDA_API_KEY}", "Content-Type": "application/json"}
+
 async def fetch_oanda(instrument: str, granularity: str, count: int = 500) -> pd.DataFrame:
     url = f"{oanda_base_url()}/v3/instruments/{instrument}/candles"
     params = {"count": str(count), "granularity": granularity, "price": "M"}
@@ -235,7 +261,6 @@ def compute_blw_m1x5(inst: str, m1: pd.DataFrame, idx: int) -> Dict[str, Any]:
     Core BLW-like logic:
       - M1 trigger: EMA9/21 cross + RSI(14) side + body >= BODY_ATR_MIN * ATR(14)
       - Filters: ADX(14) >= ADX_MIN, ATR percentile window, candle must be complete
-      - Per-instrument cooldown handled outside
     Returns {signal: CALL|PUT|HOLD, direction, reason, time, price}
     """
     if idx is None or idx < 1 or m1.empty:
@@ -248,7 +273,8 @@ def compute_blw_m1x5(inst: str, m1: pd.DataFrame, idx: int) -> Dict[str, Any]:
     df["ema21"] = ta.ema(close, length=21)
     df["rsi"]   = ta.rsi(close, length=14)
     df["atr"]   = ta.atr(df["h"], df["l"], close, length=14)
-    df["adx"]   = ta.adx(df["h"], df["l"], close, length=14)["ADX_14"]
+    adx_df      = ta.adx(df["h"], df["l"], close, length=14)
+    df["adx"]   = adx_df["ADX_14"] if adx_df is not None and "ADX_14" in adx_df else pd.Series([None]*len(df))
 
     if idx >= len(df):
         idx = len(df) - 1
@@ -300,6 +326,8 @@ HELP_TEXT = (
     "/start — intro\n"
     "/ping  — health\n"
     "/limits — today’s remaining quota\n"
+    "/plans — pricing\n"
+    "/upgrade <BASIC|PRO|VIP> — create invoice\n"
 )
 
 def build_telegram_app() -> Application:
@@ -307,6 +335,8 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("limits", limits_cmd))
+    app.add_handler(CommandHandler("plans", plans_cmd))
+    app.add_handler(CommandHandler("upgrade", upgrade_cmd))
     return app
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,6 +353,63 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     used = await quota_get_today(str(chat_id))
     rem = "∞" if lim is None else max(lim - used, 0)
     await update.message.reply_text(f"Tier: {tier}\nUsed today: {used}\nRemaining: {rem}")
+
+async def plans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        f"Plans (monthly, pay in {NOWPAY_PAY_CCY.upper()}):\n"
+        f"• BASIC — {PRICE_BASIC:.2f} {NOWPAY_PRICE_CCY.upper()} — 6/day\n"
+        f"• PRO   — {PRICE_PRO:.2f} {NOWPAY_PRICE_CCY.upper()} — 15/day\n"
+        f"• VIP   — {PRICE_VIP:.2f} {NOWPAY_PRICE_CCY.upper()} — Unlimited\n\n"
+        f"Use /upgrade BASIC|PRO|VIP to get your invoice."
+    )
+    await update.message.reply_text(msg)
+
+def _plan_price(tier: str) -> Optional[float]:
+    return {"BASIC": PRICE_BASIC, "PRO": PRICE_PRO, "VIP": PRICE_VIP}.get(tier.upper())
+
+async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not NOWPAY_API_KEY:
+        await update.message.reply_text("Payments unavailable. Try again later.")
+        return
+    args = context.args or []
+    if len(args) < 1:
+        await update.message.reply_text("Usage: /upgrade BASIC|PRO|VIP")
+        return
+    tier = args[0].upper()
+    price = _plan_price(tier)
+    if price is None:
+        await update.message.reply_text("Unknown tier. Use BASIC, PRO, or VIP.")
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else 0
+    order_id = f"tier:{tier}:uid:{user_id}:{int(datetime.now(timezone.utc).timestamp())}"
+    description = f"Pocket Option Signals — {tier} plan for Telegram user {user_id}"
+
+    try:
+        invoice = await nowpay_create_invoice(
+            price_amount=price,
+            price_currency=NOWPAY_PRICE_CCY,
+            order_id=order_id,
+            order_description=description,
+            pay_currency=NOWPAY_PAY_CCY or None,
+            success_url=f"{BASE_URL}/pay/success?tier={tier}",
+            cancel_url=f"{BASE_URL}/pay/cancel?tier={tier}",
+            ipn_callback_url=f"{BASE_URL}/pay/ipn"
+        )
+    except Exception as e:
+        log.error(f"Invoice error: {e}")
+        await update.message.reply_text("Could not create invoice. Please try later.")
+        return
+
+    invoice_url = invoice.get("invoice_url") or invoice.get("url") or ""
+    async with _orders_lock:
+        _orders[order_id] = {"tier": tier, "telegram_id": user_id, "created_at": datetime.now(timezone.utc).isoformat()}
+        await save_orders()
+    await update.message.reply_text(
+        f"✅ Invoice for {tier}: {price:.2f} {NOWPAY_PRICE_CCY.upper()}\nPay here: {invoice_url}\n"
+        f"You'll receive your private invite link after confirmation."
+    )
 
 async def tg_send(chat_id: str, text: str):
     if not telegram_app:
@@ -342,8 +429,51 @@ def resolve_tier_and_limit(chat_id: str) -> Tuple[str, Optional[int]]:
         return ("BASIC", LIMIT_BASIC)
     if TELEGRAM_CHAT_FREE and chat_id == TELEGRAM_CHAT_FREE:
         return ("FREE", LIMIT_FREE)
-    # unknown chat → treat as FREE by default
     return ("FREE", LIMIT_FREE)
+
+# =========================
+# NOWPayments helpers
+# =========================
+async def nowpay_create_invoice(
+    price_amount: float,
+    price_currency: str,
+    order_id: str,
+    order_description: str,
+    pay_currency: Optional[str],
+    success_url: str,
+    cancel_url: str,
+    ipn_callback_url: str,
+) -> Dict[str, Any]:
+    url = "https://api.nowpayments.io/v1/invoice"
+    payload = {
+        "price_amount": price_amount,
+        "price_currency": price_currency,
+        "order_id": order_id,
+        "order_description": order_description,
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "ipn_callback_url": ipn_callback_url,
+    }
+    if pay_currency:
+        payload["pay_currency"] = pay_currency
+    headers = {"x-api-key": NOWPAY_API_KEY, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+def verify_nowpay_sig(raw_body: bytes, sig_header: str) -> bool:
+    if not NOWPAY_IPN_SECRET or not sig_header:
+        return False
+    h = hmac.new(NOWPAY_IPN_SECRET.encode(), raw_body, hashlib.sha512).hexdigest()
+    return h.lower() == sig_header.lower()
+
+def tier_to_link(tier: str) -> str:
+    return {
+        "BASIC": TELEGRAM_LINK_BASIC,
+        "PRO": TELEGRAM_LINK_PRO,
+        "VIP": TELEGRAM_LINK_VIP,
+    }.get(tier.upper(), "")
 
 # =========================
 # Quotas & stats (daily / weekly)
@@ -367,8 +497,7 @@ async def quota_get_today(chat_id: str) -> int:
     async with _quota_lock:
         return _quota.get(today, {}).get(chat_id, 0)
 
-async def stats_on_open(inst: str, outcome: Optional[str] = None, chat_ids: Optional[List[str]] = None):
-    # Increment "signals" per day/week; W/L/D handled at settlement
+async def stats_on_open(inst: str):
     now = datetime.now(timezone.utc)
     dk, wk = _day_key(now), _week_key(now)
     async with _stats_lock:
@@ -381,14 +510,13 @@ async def stats_on_open(inst: str, outcome: Optional[str] = None, chat_ids: Opti
 async def stats_on_settle(result: str):
     now = datetime.now(timezone.utc)
     dk, wk = _day_key(now), _week_key(now)
-    key = result  # "W" | "L" | "D"
-    if key not in ("W", "L", "D"):
+    if result not in ("W", "L", "D"):
         return
     async with _stats_lock:
         _stats["daily"].setdefault(dk, {"signals": 0, "W": 0, "L": 0, "D": 0})
         _stats["weekly"].setdefault(wk, {"signals": 0, "W": 0, "L": 0, "D": 0})
-        _stats["daily"][dk][key] += 1
-        _stats["weekly"][wk][key] += 1
+        _stats["daily"][dk][result] += 1
+        _stats["weekly"][wk][result] += 1
         await save_stats()
 
 async def send_tally(scope: str):
@@ -416,7 +544,7 @@ async def send_tally(scope: str):
             await tg_send(cid, text)
 
 # =========================
-# Engine: signal, quota, cooldown, settlement
+# Engine: signal, cooldown, settlement
 # =========================
 def _cooldown_ok(inst: str) -> bool:
     last_iso = _last_signal_time.get(inst)
@@ -435,7 +563,6 @@ async def settle_due_trades():
     async with _trades_lock:
         for i, tr in enumerate(list(_open_trades)):
             if now >= datetime.fromisoformat(tr["settle_at"]):
-                # fetch last price around settle_at
                 inst = tr["instrument"]
                 try:
                     df = await fetch_oanda(inst, "M1", 15)
@@ -461,7 +588,6 @@ async def settle_due_trades():
                     to_remove.append(i)
                 except Exception as e:
                     log.error(f"Settlement error {inst}: {e}")
-        # remove settled (reverse order)
         for idx in reversed(to_remove):
             _open_trades.pop(idx)
         if to_remove:
@@ -469,14 +595,10 @@ async def settle_due_trades():
 
 async def try_send_signal(inst: str):
     """Called inside scheduler for each instrument."""
-    # live-session guard
     if not fx_live_now():
         return
-
-    # cooldown guard
     if not _cooldown_ok(inst):
         return
-
     try:
         m1 = await fetch_oanda(inst, "M1", 400)
         idx = last_completed_idx(m1)
@@ -484,7 +606,7 @@ async def try_send_signal(inst: str):
         if sig.get("signal") not in ("CALL", "PUT"):
             return
 
-        # choose target chats in order VIP -> PRO -> BASIC -> FREE (send to all existing)
+        # choose target chats VIP -> PRO -> BASIC -> FREE (send to all that still have quota)
         targets: List[Tuple[str, Optional[int]]] = []
         ordered = [
             (TELEGRAM_CHAT_VIP, None),
@@ -502,7 +624,6 @@ async def try_send_signal(inst: str):
         if not targets:
             return  # all quotas hit
 
-        # Build message & broadcast
         direction_arrow = "🟢CALL" if sig["direction"] == "UP" else "🔴PUT"
         msg = (
             f"⚡ {inst} | {direction_arrow}\n"
@@ -511,7 +632,7 @@ async def try_send_signal(inst: str):
             f"Why: {sig['reason']}"
         )
         deliver_to: List[str] = []
-        for cid, lim in targets:
+        for cid, _ in targets:
             await tg_send(cid, msg)
             await quota_inc_today(cid)
             deliver_to.append(cid)
@@ -540,15 +661,13 @@ async def try_send_signal(inst: str):
 # Scheduler jobs
 # =========================
 async def run_engine():
-    # iterate instruments sequentially (keep light for free tier)
     for inst in OANDA_INSTRUMENTS:
         await try_send_signal(inst)
 
-async def daily_reset_and_tally():
-    # Send yesterday tally at 16:05 local, then clear daily rolling only (we keep storage as-is; new day key will be used)
+async def daily_tally_job():
     await send_tally("daily")
 
-async def weekly_tally():
+async def weekly_tally_job():
     await send_tally("weekly")
 
 # =========================
@@ -578,7 +697,77 @@ async def status():
         "expiry_min": PO_EXPIRY_MIN,
     }
 
-# (Optional) Telegram webhook (kept minimal; polling is default)
+# --- Payments: optional HTTP create (same as /upgrade), plus IPN ---
+@app_fastapi.post("/pay/create")
+async def pay_create(request: Request):
+    if not NOWPAY_API_KEY:
+        return JSONResponse({"error": "payments-disabled"}, status_code=503)
+    data = await request.json()
+    tier = str(data.get("tier", "")).upper()
+    telegram_id = int(data.get("telegram_id", 0))
+    price = _plan_price(tier)
+    if price is None or telegram_id <= 0:
+        return JSONResponse({"error": "bad-args"}, status_code=400)
+
+    order_id = f"tier:{tier}:uid:{telegram_id}:{int(datetime.now(timezone.utc).timestamp())}"
+    description = f"Pocket Option Signals — {tier} plan for Telegram user {telegram_id}"
+
+    invoice = await nowpay_create_invoice(
+        price_amount=price,
+        price_currency=NOWPAY_PRICE_CCY,
+        order_id=order_id,
+        order_description=description,
+        pay_currency=NOWPAY_PAY_CCY or None,
+        success_url=f"{BASE_URL}/pay/success?tier={tier}",
+        cancel_url=f"{BASE_URL}/pay/cancel?tier={tier}",
+        ipn_callback_url=f"{BASE_URL}/pay/ipn"
+    )
+    async with _orders_lock:
+        _orders[order_id] = {"tier": tier, "telegram_id": telegram_id, "created_at": datetime.now(timezone.utc).isoformat()}
+        await save_orders()
+    return invoice
+
+@app_fastapi.post("/pay/ipn")
+async def pay_ipn(request: Request, x_nowpayments_sig: str = Header(default="")):
+    raw = await request.body()
+    if not verify_nowpay_sig(raw, x_nowpayments_sig):
+        return PlainTextResponse("bad-sig", status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return PlainTextResponse("bad-json", status_code=400)
+
+    order_id = str(payload.get("order_id", ""))
+    payment_status = str(payload.get("payment_status", "")).lower()
+
+    # only grant on confirmed/finished/partially_paid status (per NOWPayments docs)
+    if payment_status not in ("finished", "confirmed", "partially_paid"):
+        return PlainTextResponse("ignored", status_code=200)
+
+    async with _orders_lock:
+        order = _orders.get(order_id)
+    if not order:
+        return PlainTextResponse("unknown-order", status_code=200)
+
+    tier = order.get("tier", "BASIC")
+    tg_id = order.get("telegram_id")
+    link = tier_to_link(tier)
+    if not link:
+        # If no static link configured, just DM user with a generic message.
+        try:
+            await telegram_app.bot.send_message(chat_id=int(tg_id), text=f"✅ Payment confirmed for {tier}. Please contact admin for your invite.")
+        except Exception:
+            pass
+        return PlainTextResponse("ok", status_code=200)
+
+    try:
+        await telegram_app.bot.send_message(chat_id=int(tg_id), text=f"✅ Payment confirmed for {tier}.\nJoin here: {link}")
+    except Exception as e:
+        log.error(f"DM invite failed: {e}")
+
+    return PlainTextResponse("ok", status_code=200)
+
+# Telegram webhook (if you run webhook mode)
 @app_fastapi.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     if not telegram_app:
@@ -602,27 +791,24 @@ async def on_startup():
     # Telegram
     telegram_app = build_telegram_app()
     await telegram_app.initialize()
+    await telegram_app.start()
     if ENABLE_BOT_POLLING == "1":
-        # polling mode
-        await telegram_app.start()
         await telegram_app.bot.delete_webhook(drop_pending_updates=True)
         log.info("🤖 Telegram bot: polling started")
     else:
-        # webhook mode
-        await telegram_app.start()
         await telegram_app.bot.set_webhook(url=f"{BASE_URL}{WEBHOOK_PATH}", secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
         log.info(f"🤖 Telegram bot: webhook set {BASE_URL}{WEBHOOK_PATH}")
 
-    # Scheduler
+    # Scheduler (UTC)
     scheduler = AsyncIOScheduler(timezone=timezone.utc)
     # Engine: every minute at second 5
     scheduler.add_job(run_engine, CronTrigger(second="5"))
     # Settlement: every 30s
     scheduler.add_job(settle_due_trades, CronTrigger(second="*/30"))
-    # Daily tally: schedule 20:05 UTC ≈ 16:05 America/Port_of_Spain (UTC-4) (no DST)
-    scheduler.add_job(daily_reset_and_tally, CronTrigger(hour="20", minute="5"))
+    # Daily tally: 20:05 UTC ≈ 16:05 Port_of_Spain (UTC-4, no DST)
+    scheduler.add_job(daily_tally_job, CronTrigger(hour="20", minute="5"))
     # Weekly tally: Sunday 20:10 UTC
-    scheduler.add_job(weekly_tally, CronTrigger(day_of_week="sun", hour="20", minute="10"))
+    scheduler.add_job(weekly_tally_job, CronTrigger(day_of_week="sun", hour="20", minute="10"))
     scheduler.start()
     log.info("⏰ Scheduler started")
 
@@ -634,6 +820,6 @@ async def on_shutdown():
         await telegram_app.stop()
 
 # =========================
-# Uvicorn entry (Render: 'uvicorn app:app_fastapi ...')
+# Uvicorn entry (Render Procfile uses `app:app_fastapi`)
 # =========================
 app = app_fastapi
