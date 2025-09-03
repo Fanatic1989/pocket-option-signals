@@ -1,15 +1,14 @@
 # app.py
-# Pocket Option Signals — BLW M1→5 Main Strategy (FX live only)
-# Features KEPT from earlier build:
-# - NOWPayments paywall (invoice + IPN), auto-tier routing (FREE/BASIC/PRO/VIP)
-# - Per-tier quotas (FREE/BASIC/PRO; VIP=∞)
-# - FX live-hours guard (Mon–Fri 08:00–16:00 America/Port_of_Spain)
-# - Per-instrument cooldown (10 min default)
-# - W/L/D settlement after fixed expiry (5 min default)
-# - Auto daily & weekly tallies to all groups
-# - Works in single-process on Render (web + Telegram bot)
-# Strategy change ONLY: BLW-like M1 trigger, 5-min expiry, winners-only pairs
-# ---------------------------------------------------------------------------------
+# Pocket Option Signals — Dual Strategy (Trend BLW + Chop Mean-Reversion)
+# FX live session only (Mon–Fri 08:00–16:00 America/Port_of_Spain), 1m candles, 5m expiry
+# Features:
+# - Regime detection (trend vs chop) + confidence
+# - BLW M1→5 for trend / Bollinger+Stoch mean-rev for chop
+# - Per-tier quotas FREE/BASIC/PRO/VIP; per-instrument cooldown
+# - W/L/D settlement tracking; auto daily + weekly tallies to all groups
+# - NOWPayments paywall: /plans, /upgrade, IPN, per-user invite links, auto expiry removal
+# - Polling or Webhook (configurable)
+# ------------------------------------------------------------------------------
 
 import os
 import json
@@ -17,6 +16,7 @@ import hmac
 import hashlib
 import asyncio
 import logging
+import math
 from datetime import datetime, timedelta, timezone, time as dtime
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -40,49 +40,62 @@ TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL             = os.getenv("BASE_URL", "").rstrip("/")
 WEBHOOK_PATH         = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip()
 WEBHOOK_SECRET       = os.getenv("WEBHOOK_SECRET", "change-me").strip()
-ENABLE_BOT_POLLING   = os.getenv("ENABLE_BOT_POLLING", "0").strip()
+ENABLE_BOT_POLLING   = os.getenv("ENABLE_BOT_POLLING", "1").strip()
 
-# Chats (send signals to these)
-TELEGRAM_CHAT_FREE   = os.getenv("TELEGRAM_CHAT_FREE", "").strip()    # e.g. -100xxxxxxxxxx
+# Chats (supergroup/channel IDs as strings, e.g. "-1003034515272")
+TELEGRAM_CHAT_FREE   = os.getenv("TELEGRAM_CHAT_FREE", "").strip()
 TELEGRAM_CHAT_BASIC  = os.getenv("TELEGRAM_CHAT_BASIC", "").strip()
 TELEGRAM_CHAT_PRO    = os.getenv("TELEGRAM_CHAT_PRO", "").strip()
 TELEGRAM_CHAT_VIP    = os.getenv("TELEGRAM_CHAT_VIP", "").strip()
 
-# Optional static invite links (auto-sent after payment)
+# Optional static invite links (fallback if per-user link fails)
 TELEGRAM_LINK_BASIC  = os.getenv("TELEGRAM_LINK_BASIC", "").strip()
 TELEGRAM_LINK_PRO    = os.getenv("TELEGRAM_LINK_PRO", "").strip()
 TELEGRAM_LINK_VIP    = os.getenv("TELEGRAM_LINK_VIP", "").strip()
 
-# Quotas
+# Quotas (VIP is unlimited)
 LIMIT_FREE           = int(os.getenv("LIMIT_FREE", "3"))
 LIMIT_BASIC          = int(os.getenv("LIMIT_BASIC", "6"))
 LIMIT_PRO            = int(os.getenv("LIMIT_PRO", "15"))
-# VIP is unlimited
 
 # OANDA
 OANDA_API_KEY        = os.getenv("OANDA_API_KEY", "").strip()
 OANDA_ACCOUNT_ID     = os.getenv("OANDA_ACCOUNT_ID", "").strip()
 OANDA_ENV            = os.getenv("OANDA_ENV", "practice").strip().lower()
-# EXACT “winners” PAIRS (from your backtest results)
-OANDA_INSTRUMENTS    = [s.strip() for s in os.getenv(
+
+# Exact winners list (edit in .env if needed)
+OANDA_INSTRUMENTS = [s.strip() for s in os.getenv(
     "OANDA_INSTRUMENTS",
     "AUD_USD,EUR_GBP,EUR_JPY,AUD_CHF,CAD_JPY,GBP_AUD,EUR_CAD,EUR_CHF,AUD_CAD,CAD_CHF,CHF_JPY,USD_CHF,GBP_CHF"
 ).split(",") if s.strip()]
 OANDA_GRANULARITY    = os.getenv("OANDA_GRANULARITY", "M1").strip().upper()
 
-# BLW M1→5 Strategy knobs
+# Strategy knobs (shared filters)
 PO_EXPIRY_MIN        = int(os.getenv("PO_EXPIRY_MIN", "5"))
 ALERT_COOLDOWN_MIN   = int(os.getenv("ALERT_COOLDOWN_MIN", "10"))
-ADX_MIN              = float(os.getenv("ADX_MIN", "18"))
 BODY_ATR_MIN         = float(os.getenv("BODY_ATR_MIN", "0.30"))
 ATR_PCTL_MIN         = float(os.getenv("ATR_PCTL_MIN", "0.30"))
 ATR_PCTL_MAX         = float(os.getenv("ATR_PCTL_MAX", "0.92"))
+
+# BLW (trend) thresholds
 RSI_UP               = float(os.getenv("RSI_UP", "52"))
 RSI_DN               = float(os.getenv("RSI_DN", "48"))
+ADX_MIN_TREND        = float(os.getenv("ADX_MIN_TREND", "20"))
+M15_EMA_SLOPE_MIN_PIPS = float(os.getenv("M15_EMA_SLOPE_MIN_PIPS", "0.2"))
 
-# Session / FX live guard
+# Mean-rev (chop) thresholds
+ADX_MAX_CHOP         = float(os.getenv("ADX_MAX_CHOP", "18"))
+BB_LEN               = int(os.getenv("BB_LEN", "20"))
+BB_STD               = float(os.getenv("BB_STD", "2.0"))
+STOCH_LEN            = int(os.getenv("STOCH_LEN", "14"))
+STOCH_K              = int(os.getenv("STOCH_K", "3"))
+STOCH_D              = int(os.getenv("STOCH_D", "3"))
+STOCH_OS             = float(os.getenv("STOCH_OS", "20"))
+STOCH_OB             = float(os.getenv("STOCH_OB", "80"))
+
+# Session (FX live only)
 SESSION_TZ_NAME      = os.getenv("SESSION_TZ", "America/Port_of_Spain")
-LIVE_START_LOCAL     = os.getenv("LIVE_START_LOCAL", "08:00")  # local time
+LIVE_START_LOCAL     = os.getenv("LIVE_START_LOCAL", "08:00")
 LIVE_END_LOCAL       = os.getenv("LIVE_END_LOCAL", "16:00")
 
 # NOWPayments
@@ -90,10 +103,10 @@ NOWPAY_API_KEY       = os.getenv("NOWPAY_API_KEY", "").strip()
 NOWPAY_IPN_SECRET    = os.getenv("NOWPAY_IPN_SECRET", "").strip()
 NOWPAY_PRICE_CCY     = os.getenv("NOWPAY_PRICE_CCY", "usd").strip().lower()
 NOWPAY_PAY_CCY       = os.getenv("NOWPAY_PAY_CCY", "usdttrc20").strip().lower()
-
-PRICE_BASIC          = float(os.getenv("PRICE_BASIC", "29.0"))
-PRICE_PRO            = float(os.getenv("PRICE_PRO", "49.0"))
-PRICE_VIP            = float(os.getenv("PRICE_VIP", "79.0"))
+PRICE_BASIC          = float(os.getenv("PRICE_BASIC", "29"))
+PRICE_PRO            = float(os.getenv("PRICE_PRO", "49"))
+PRICE_VIP            = float(os.getenv("PRICE_VIP", "79"))
+SUB_DURATION_DAYS    = int(os.getenv("SUB_DURATION_DAYS", "30"))
 
 # Storage
 DATA_DIR             = os.getenv("DATA_DIR", "./data").strip()
@@ -103,8 +116,11 @@ QUOTA_FILE           = os.path.join(DATA_DIR, "quota.json")
 LAST_SIGNAL_FILE     = os.path.join(DATA_DIR, "last_signal.json")
 UNSUPPORTED_FILE     = os.path.join(DATA_DIR, "unsupported.json")
 ORDERS_FILE          = os.path.join(DATA_DIR, "orders.json")
+SUBS_FILE            = os.path.join(DATA_DIR, "subs.json")
 
-# Scheduler / globals
+# ================
+# Setup / Globals
+# ================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pocket-option-signals")
 
@@ -118,13 +134,15 @@ _quota_lock = asyncio.Lock()
 _io_lock = asyncio.Lock()
 _unsupported_lock = asyncio.Lock()
 _orders_lock = asyncio.Lock()
+_subs_lock = asyncio.Lock()
 
 _stats: Dict[str, Any] = {"daily": {}, "weekly": {}}
 _open_trades: List[Dict[str, Any]] = []
 _quota: Dict[str, Dict[str, int]] = {}
 _last_signal_time: Dict[str, str] = {}
 _unsupported: Set[str] = set()
-_orders: Dict[str, Dict[str, Any]] = {}  # order_id -> {tier, telegram_id, created_at}
+_orders: Dict[str, Dict[str, Any]] = {}
+_subs: Dict[str, Dict[str, Any]] = {}
 
 # =========================
 # Utils & FS
@@ -152,13 +170,14 @@ async def _write_json(path: str, data: Any):
         log.error(f"Write error {path}: {e}")
 
 async def load_state():
-    global _stats, _open_trades, _quota, _last_signal_time, _unsupported, _orders
+    global _stats, _open_trades, _quota, _last_signal_time, _unsupported, _orders, _subs
     _stats = await _read_json(STATS_FILE, {"daily": {}, "weekly": {}})
     _open_trades = await _read_json(OPEN_TRADES_FILE, [])
     _quota = await _read_json(QUOTA_FILE, {})
     _last_signal_time = await _read_json(LAST_SIGNAL_FILE, {})
     _unsupported = set(await _read_json(UNSUPPORTED_FILE, []))
     _orders = await _read_json(ORDERS_FILE, {})
+    _subs = await _read_json(SUBS_FILE, {})
 
 async def save_stats():        await _write_json(STATS_FILE, _stats)
 async def save_open_trades():  await _write_json(OPEN_TRADES_FILE, _open_trades)
@@ -166,14 +185,15 @@ async def save_quota():        await _write_json(QUOTA_FILE, _quota)
 async def save_last_signal():  await _write_json(LAST_SIGNAL_FILE, _last_signal_time)
 async def save_unsupported():  await _write_json(UNSUPPORTED_FILE, sorted(list(_unsupported)))
 async def save_orders():       await _write_json(ORDERS_FILE, _orders)
+async def save_subs():         await _write_json(SUBS_FILE, _subs)
 
 # =========================
-# Time / Session guard
+# Time & Session
 # =========================
 try:
     from zoneinfo import ZoneInfo
 except Exception:
-    from backports.zoneinfo import ZoneInfo  # py<3.9 fallback
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 def _parse_hhmm(s: str) -> dtime:
     hh, mm = s.split(":")
@@ -184,27 +204,25 @@ LIVE_START = _parse_hhmm(LIVE_START_LOCAL)
 LIVE_END   = _parse_hhmm(LIVE_END_LOCAL)
 
 def fx_live_now(now_utc: Optional[datetime] = None) -> bool:
-    """FX live window ONLY: Mon–Fri, 08:00–16:00 local (America/Port_of_Spain)."""
     now = (now_utc or datetime.now(timezone.utc)).astimezone(LOCAL_TZ)
-    if now.weekday() > 4:  # Sat(5), Sun(6) → OTC only
+    if now.weekday() > 4:  # Sat(5), Sun(6)
         return False
-    t = now.time()
-    return LIVE_START <= t <= LIVE_END
+    return LIVE_START <= now.time() <= LIVE_END
 
 # =========================
-# OANDA: fetch candles
+# OANDA helpers
 # =========================
 def oanda_base_url() -> str:
     return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
 
-def auth_headers() -> Dict[str, str]:
+def _auth_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {OANDA_API_KEY}", "Content-Type": "application/json"}
 
 async def fetch_oanda(instrument: str, granularity: str, count: int = 500) -> pd.DataFrame:
     url = f"{oanda_base_url()}/v3/instruments/{instrument}/candles"
     params = {"count": str(count), "granularity": granularity, "price": "M"}
     async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.get(url, params=params, headers=auth_headers())
+        r = await client.get(url, params=params, headers=_auth_headers())
         if r.status_code == 400:
             async with _unsupported_lock:
                 if instrument not in _unsupported:
@@ -254,56 +272,102 @@ def atr_percentile(series: pd.Series, lookback: int = 300) -> float:
     return float(rank)
 
 # =========================
-# BLW M1→5 Strategy (1m trigger, 5m expiry)
+# Regime detection
+# =========================
+def regime_detect(m1: pd.DataFrame, m5: pd.DataFrame, m15: pd.DataFrame) -> Tuple[str, float, Dict[str, float]]:
+    """
+    Returns ("trend"|"chop", confidence 0..100, details)
+    Trend if: ADX(M1)>=ADX_MIN_TREND, ADX(M5)>=ADX_MAX_CHOP, |EMA200 slope on M15| >= slope_min
+    Else chop if ADX(M1)<=ADX_MAX_CHOP and low slope.
+    Confidence blends normalized ADX & slope and ATR pctl.
+    """
+    det = {"adx1": 0.0, "adx5": 0.0, "slope_pips": 0.0, "atrp": 0.0}
+
+    c1 = m1["c"].astype(float)
+    c5 = m5["c"].astype(float)
+    c15= m15["c"].astype(float)
+
+    adx1 = ta.adx(m1["h"], m1["l"], c1, length=14)["ADX_14"]
+    adx5 = ta.adx(m5["h"], m5["l"], c5, length=14)["ADX_14"]
+    ema200_15 = ta.ema(c15, length=200)
+
+    if len(ema200_15) >= 6:
+        slope_pips = (ema200_15.iloc[-1] - ema200_15.iloc[-6]) * 10000.0
+    else:
+        slope_pips = 0.0
+
+    atr1 = ta.atr(m1["h"], m1["l"], c1, length=14)
+    atrp = atr_percentile(atr1)
+
+    det["adx1"] = float(adx1.iloc[-1]) if not pd.isna(adx1.iloc[-1]) else 0.0
+    det["adx5"] = float(adx5.iloc[-1]) if not pd.isna(adx5.iloc[-1]) else 0.0
+    det["slope_pips"] = float(slope_pips)
+    det["atrp"] = float(atrp)
+
+    trend = (det["adx1"] >= ADX_MIN_TREND) and (det["adx5"] >= ADX_MAX_CHOP) and (abs(det["slope_pips"]) >= M15_EMA_SLOPE_MIN_PIPS)
+    chop  = (det["adx1"] <= ADX_MAX_CHOP) and (abs(det["slope_pips"]) < M15_EMA_SLOPE_MIN_PIPS)
+
+    # confidence
+    # normalize: adx1/35, adx5/35, slope/slope_min clipped 0..1, ATR window weight if inside band
+    conf = 0.0
+    if trend:
+        conf = (
+            min(det["adx1"]/35.0, 1.0)*0.35 +
+            min(det["adx5"]/35.0, 1.0)*0.35 +
+            min(abs(det["slope_pips"])/(M15_EMA_SLOPE_MIN_PIPS+1e-9), 1.0)*0.20 +
+            (ATR_PCTL_MIN <= det["atrp"] <= ATR_PCTL_MAX)*0.10
+        ) * 100.0
+        return "trend", float(conf), det
+    if chop:
+        # inverse confidence (lower adx, lower slope)
+        conf = (
+            (1.0 - min(det["adx1"]/35.0, 1.0))*0.45 +
+            (1.0 - min(abs(det["slope_pips"])/(M15_EMA_SLOPE_MIN_PIPS+1e-9), 1.0))*0.35 +
+            (ATR_PCTL_MIN <= det["atrp"] <= ATR_PCTL_MAX)*0.20
+        ) * 100.0
+        return "chop", float(conf), det
+
+    # neutral
+    return "chop", 35.0, det  # default to chop, low confidence
+
+# =========================
+# Strategy: BLW M1→5 (trend)
 # =========================
 def compute_blw_m1x5(inst: str, m1: pd.DataFrame, idx: int) -> Dict[str, Any]:
-    """
-    Core BLW-like logic:
-      - M1 trigger: EMA9/21 cross + RSI(14) side + body >= BODY_ATR_MIN * ATR(14)
-      - Filters: ADX(14) >= ADX_MIN, ATR percentile window, candle must be complete
-    Returns {signal: CALL|PUT|HOLD, direction, reason, time, price}
-    """
     if idx is None or idx < 1 or m1.empty:
-        return {"signal": "HOLD", "reason": "insufficient data"}
+        return {"signal": "HOLD", "reason": "insufficient"}
 
     df = m1.copy()
     close = df["c"].astype(float)
-
     df["ema9"]  = ta.ema(close, length=9)
     df["ema21"] = ta.ema(close, length=21)
     df["rsi"]   = ta.rsi(close, length=14)
     df["atr"]   = ta.atr(df["h"], df["l"], close, length=14)
-    adx_df      = ta.adx(df["h"], df["l"], close, length=14)
-    df["adx"]   = adx_df["ADX_14"] if adx_df is not None and "ADX_14" in adx_df else pd.Series([None]*len(df))
+    df["adx"]   = ta.adx(df["h"], df["l"], close, length=14)["ADX_14"]
 
-    if idx >= len(df):
-        idx = len(df) - 1
-    cur, prev = df.iloc[idx], df.iloc[idx - 1]
-
-    # must be completed candle
+    cur, prev = df.iloc[idx], df.iloc[idx-1]
     if not bool(cur.get("complete", False)):
-        return {"signal": "HOLD", "reason": "last candle not complete"}
+        return {"signal": "HOLD", "reason": "incomplete candle"}
 
-    # body filter
+    # body vs ATR
     body = abs(float(cur["c"]) - float(cur["o"]))
     if float(cur["atr"]) <= 0 or body < BODY_ATR_MIN * float(cur["atr"]):
-        return {"signal": "HOLD", "reason": "small body vs ATR"}
+        return {"signal": "HOLD", "reason": "small body"}
 
-    # volatility percentile
+    # ATR percentile band
     p_atr = atr_percentile(df["atr"])
     if not (ATR_PCTL_MIN <= p_atr <= ATR_PCTL_MAX):
-        return {"signal": "HOLD", "reason": f"ATR pct {p_atr:.2f} out of window"}
+        return {"signal": "HOLD", "reason": f"atrp {p_atr:.2f} out"}
 
     # trend strength
-    if pd.isna(cur["adx"]) or float(cur["adx"]) < ADX_MIN:
-        return {"signal": "HOLD", "reason": f"ADX {float(cur['adx']) if not pd.isna(cur['adx']) else 'nan'} < {ADX_MIN}"}
+    if pd.isna(cur["adx"]) or float(cur["adx"]) < ADX_MIN_TREND:
+        return {"signal": "HOLD", "reason": f"adx {float(cur['adx']) if not pd.isna(cur['adx']) else 'nan'} < {ADX_MIN_TREND}"}
 
-    # EMA cross + RSI side
     signal, direction, reason = "HOLD", None, "no cross"
     if (prev["ema9"] <= prev["ema21"]) and (cur["ema9"] > cur["ema21"]) and float(cur["rsi"]) >= RSI_UP:
-        signal, direction, reason = "CALL", "UP", f"EMA9↑EMA21 + RSI≥{RSI_UP}"
+        signal, direction, reason = "CALL", "UP", f"EMA9↑21 + RSI≥{RSI_UP}"
     elif (prev["ema9"] >= prev["ema21"]) and (cur["ema9"] < cur["ema21"]) and float(cur["rsi"]) <= RSI_DN:
-        signal, direction, reason = "PUT", "DOWN", f"EMA9↓EMA21 + RSI≤{RSI_DN}"
+        signal, direction, reason = "PUT", "DOWN", f"EMA9↓21 + RSI≤{RSI_DN}"
 
     return {
         "signal": signal,
@@ -314,20 +378,85 @@ def compute_blw_m1x5(inst: str, m1: pd.DataFrame, idx: int) -> Dict[str, Any]:
     }
 
 # =========================
-# Telegram bits
+# Strategy: Mean-Reversion M1→5 (chop)
+# =========================
+def compute_meanrev_m1x5(inst: str, m1: pd.DataFrame, idx: int) -> Dict[str, Any]:
+    if idx is None or idx < 1 or m1.empty:
+        return {"signal": "HOLD", "reason": "insufficient"}
+
+    df = m1.copy()
+    close = df["c"].astype(float)
+    high  = df["h"].astype(float)
+    low   = df["l"].astype(float)
+    open_ = df["o"].astype(float)
+
+    bb = ta.bbands(close, length=BB_LEN, std=BB_STD)
+    stoch = ta.stoch(high, low, close, k=STOCH_LEN, d=STOCH_K, smooth_k=STOCH_D)
+    atr = ta.atr(high, low, close, length=14)
+    adx = ta.adx(high, low, close, length=14)["ADX_14"]
+
+    df["bb_low"]  = bb["BBL_20_2.0"]
+    df["bb_mid"]  = bb["BBM_20_2.0"]
+    df["bb_high"] = bb["BBU_20_2.0"]
+    df["stoch_k"] = stoch["STOCHk_14_3_3"]
+    df["stoch_d"] = stoch["STOCHd_14_3_3"]
+    df["atr"]     = atr
+    df["adx"]     = adx
+
+    cur = df.iloc[idx]
+    if not bool(cur.get("complete", False)):
+        return {"signal": "HOLD", "reason": "incomplete candle"}
+
+    # must be choppy: adx low
+    if pd.isna(cur["adx"]) or float(cur["adx"]) > ADX_MAX_CHOP:
+        return {"signal": "HOLD", "reason": f"adx {float(cur['adx']) if not pd.isna(cur['adx']) else 'nan'} > {ADX_MAX_CHOP}"}
+
+    # body vs ATR
+    body = abs(float(cur["c"]) - float(cur["o"]))
+    if float(cur["atr"]) <= 0 or body < BODY_ATR_MIN * float(cur["atr"]):
+        return {"signal": "HOLD", "reason": "small body"}
+
+    # ATR percentile gate
+    p_atr = atr_percentile(df["atr"])
+    if not (ATR_PCTL_MIN <= p_atr <= ATR_PCTL_MAX):
+        return {"signal": "HOLD", "reason": f"atrp {p_atr:.2f} out"}
+
+    # mean-rev triggers: close beyond bands + stoch extreme + reversal body
+    c = float(cur["c"])
+    o = float(cur["o"])
+    bbl = float(cur["bb_low"]) if not pd.isna(cur["bb_low"]) else math.inf
+    bbh = float(cur["bb_high"]) if not pd.isna(cur["bb_high"]) else -math.inf
+    k = float(cur["stoch_k"]) if not pd.isna(cur["stoch_k"]) else 50.0
+    d = float(cur["stoch_d"]) if not pd.isna(cur["stoch_d"]) else 50.0
+
+    signal, direction, reason = "HOLD", None, "no extreme"
+    # CALL: below lower band + K<OS + bullish body
+    if (c < bbl) and (k < STOCH_OS) and (c > o):
+        signal, direction, reason = "CALL", "UP", f"BB lower pierce + Stoch<{STOCH_OS} + bull"
+    # PUT: above upper band + K>OB + bearish body
+    elif (c > bbh) and (k > STOCH_OB) and (c < o):
+        signal, direction, reason = "PUT", "DOWN", f"BB upper pierce + Stoch>{STOCH_OB} + bear"
+
+    return {
+        "signal": signal,
+        "direction": direction,
+        "reason": reason,
+        "time": pd.to_datetime(cur["time"]).to_pydatetime().replace(tzinfo=timezone.utc),
+        "price": float(c),
+    }
+
+# =========================
+# Telegram helpers & commands
 # =========================
 HELP_TEXT = (
-    "Pocket Option BLW (M1→5) 🤖\n"
+    "Pocket Option Signals (Dual) 🤖\n"
     "• FX live only (Mon–Fri 08:00–16:00 America/Port_of_Spain)\n"
-    "• Tiers: FREE(3/d), BASIC(6/d), PRO(15/d), VIP(∞)\n"
-    "• 1m candles, 5m expiry, 10m per-pair cooldown\n"
-    "• Auto daily & weekly tallies\n\n"
+    "• Regime AI: Trend→BLW / Chop→MeanRev\n"
+    "• 1m candles, 5m expiry, 10m cooldown\n"
+    "• Tiers: FREE(3/d) BASIC(6/d) PRO(15/d) VIP(∞)\n"
+    "• Auto W/L/D tallies (daily/weekly)\n\n"
     "Commands:\n"
-    "/start — intro\n"
-    "/ping  — health\n"
-    "/limits — today’s remaining quota\n"
-    "/plans — pricing\n"
-    "/upgrade <BASIC|PRO|VIP> — create invoice\n"
+    "/start, /ping, /limits, /plans, /upgrade <BASIC|PRO|VIP>\n"
 )
 
 def build_telegram_app() -> Application:
@@ -345,14 +474,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
-async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None:
-        return
-    tier, lim = resolve_tier_and_limit(str(chat_id))
-    used = await quota_get_today(str(chat_id))
-    rem = "∞" if lim is None else max(lim - used, 0)
-    await update.message.reply_text(f"Tier: {tier}\nUsed today: {used}\nRemaining: {rem}")
+def _plan_price(tier: str) -> Optional[float]:
+    return {"BASIC": PRICE_BASIC, "PRO": PRICE_PRO, "VIP": PRICE_VIP}.get(tier.upper())
 
 async def plans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -364,12 +487,9 @@ async def plans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
-def _plan_price(tier: str) -> Optional[float]:
-    return {"BASIC": PRICE_BASIC, "PRO": PRICE_PRO, "VIP": PRICE_VIP}.get(tier.upper())
-
 async def upgrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not NOWPAY_API_KEY:
-        await update.message.reply_text("Payments unavailable. Try again later.")
+        await update.message.reply_text("Payments unavailable.")
         return
     args = context.args or []
     if len(args) < 1:
@@ -419,7 +539,6 @@ async def tg_send(chat_id: str, text: str):
     except Exception as e:
         log.error(f"Telegram send failed to {chat_id}: {e}")
 
-# Resolve tier & limit
 def resolve_tier_and_limit(chat_id: str) -> Tuple[str, Optional[int]]:
     if TELEGRAM_CHAT_VIP and chat_id == TELEGRAM_CHAT_VIP:
         return ("VIP", None)
@@ -431,52 +550,17 @@ def resolve_tier_and_limit(chat_id: str) -> Tuple[str, Optional[int]]:
         return ("FREE", LIMIT_FREE)
     return ("FREE", LIMIT_FREE)
 
-# =========================
-# NOWPayments helpers
-# =========================
-async def nowpay_create_invoice(
-    price_amount: float,
-    price_currency: str,
-    order_id: str,
-    order_description: str,
-    pay_currency: Optional[str],
-    success_url: str,
-    cancel_url: str,
-    ipn_callback_url: str,
-) -> Dict[str, Any]:
-    url = "https://api.nowpayments.io/v1/invoice"
-    payload = {
-        "price_amount": price_amount,
-        "price_currency": price_currency,
-        "order_id": order_id,
-        "order_description": order_description,
-        "success_url": success_url,
-        "cancel_url": cancel_url,
-        "ipn_callback_url": ipn_callback_url,
-    }
-    if pay_currency:
-        payload["pay_currency"] = pay_currency
-    headers = {"x-api-key": NOWPAY_API_KEY, "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
-
-def verify_nowpay_sig(raw_body: bytes, sig_header: str) -> bool:
-    if not NOWPAY_IPN_SECRET or not sig_header:
-        return False
-    h = hmac.new(NOWPAY_IPN_SECRET.encode(), raw_body, hashlib.sha512).hexdigest()
-    return h.lower() == sig_header.lower()
-
-def tier_to_link(tier: str) -> str:
-    return {
-        "BASIC": TELEGRAM_LINK_BASIC,
-        "PRO": TELEGRAM_LINK_PRO,
-        "VIP": TELEGRAM_LINK_VIP,
-    }.get(tier.upper(), "")
+async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return
+    tier, lim = resolve_tier_and_limit(str(chat_id))
+    used = await quota_get_today(str(chat_id))
+    rem = "∞" if lim is None else max(lim - used, 0)
+    await update.message.reply_text(f"Tier: {tier}\nUsed today: {used}\nRemaining: {rem}")
 
 # =========================
-# Quotas & stats (daily / weekly)
+# Quotas & stats
 # =========================
 def _day_key(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
@@ -497,7 +581,7 @@ async def quota_get_today(chat_id: str) -> int:
     async with _quota_lock:
         return _quota.get(today, {}).get(chat_id, 0)
 
-async def stats_on_open(inst: str):
+async def stats_on_open():
     now = datetime.now(timezone.utc)
     dk, wk = _day_key(now), _week_key(now)
     async with _stats_lock:
@@ -508,10 +592,10 @@ async def stats_on_open(inst: str):
         await save_stats()
 
 async def stats_on_settle(result: str):
-    now = datetime.now(timezone.utc)
-    dk, wk = _day_key(now), _week_key(now)
     if result not in ("W", "L", "D"):
         return
+    now = datetime.now(timezone.utc)
+    dk, wk = _day_key(now), _week_key(now)
     async with _stats_lock:
         _stats["daily"].setdefault(dk, {"signals": 0, "W": 0, "L": 0, "D": 0})
         _stats["weekly"].setdefault(wk, {"signals": 0, "W": 0, "L": 0, "D": 0})
@@ -520,7 +604,6 @@ async def stats_on_settle(result: str):
         await save_stats()
 
 async def send_tally(scope: str):
-    """scope: 'daily' or 'weekly' → send to all known groups"""
     now = datetime.now(timezone.utc)
     if scope == "daily":
         key = _day_key(now)
@@ -530,21 +613,15 @@ async def send_tally(scope: str):
         key = _week_key(now)
         bucket = _stats.get("weekly", {}).get(key, {"signals": 0, "W": 0, "L": 0, "D": 0})
         title = f"📈 Weekly Tally ({key})"
-
     s, w, l, d = bucket.get("signals", 0), bucket.get("W", 0), bucket.get("L", 0), bucket.get("D", 0)
     wr = (w / max(w + l, 1)) * 100.0
-    text = (
-        f"{title}\n"
-        f"Signals: {s}\n"
-        f"Results: ✅ {w} | ❌ {l} | ➖ {d}\n"
-        f"Win rate: {wr:.2f}%"
-    )
+    text = f"{title}\nSignals: {s}\nResults: ✅ {w} | ❌ {l} | ➖ {d}\nWin rate: {wr:.2f}%"
     for cid in [TELEGRAM_CHAT_FREE, TELEGRAM_CHAT_BASIC, TELEGRAM_CHAT_PRO, TELEGRAM_CHAT_VIP]:
         if cid:
             await tg_send(cid, text)
 
 # =========================
-# Engine: signal, cooldown, settlement
+# Cooldown & settlement
 # =========================
 def _cooldown_ok(inst: str) -> bool:
     last_iso = _last_signal_time.get(inst)
@@ -557,7 +634,6 @@ def _mark_cooldown(inst: str):
     _last_signal_time[inst] = datetime.now(timezone.utc).isoformat()
 
 async def settle_due_trades():
-    """After expiry time, fetch closing price and decide W/L/D, then tally + notify."""
     now = datetime.now(timezone.utc)
     to_remove = []
     async with _trades_lock:
@@ -568,7 +644,6 @@ async def settle_due_trades():
                     df = await fetch_oanda(inst, "M1", 15)
                     if df.empty:
                         continue
-                    # pick candle at or just before settle_at
                     df2 = df[df["time"] <= pd.to_datetime(tr["settle_at"])].tail(1)
                     if df2.empty:
                         continue
@@ -593,20 +668,34 @@ async def settle_due_trades():
         if to_remove:
             await save_open_trades()
 
+# =========================
+# Engine
+# =========================
 async def try_send_signal(inst: str):
-    """Called inside scheduler for each instrument."""
     if not fx_live_now():
         return
     if not _cooldown_ok(inst):
         return
+
     try:
         m1 = await fetch_oanda(inst, "M1", 400)
+        m5 = await fetch_oanda(inst, "M5", 200)
+        m15= await fetch_oanda(inst, "M15", 200)
         idx = last_completed_idx(m1)
-        sig = compute_blw_m1x5(inst, m1, idx)
+        if idx is None:
+            return
+
+        regime, conf, det = regime_detect(m1, m5, m15)
+
+        if regime == "trend":
+            sig = compute_blw_m1x5(inst, m1, idx)
+        else:
+            sig = compute_meanrev_m1x5(inst, m1, idx)
+
         if sig.get("signal") not in ("CALL", "PUT"):
             return
 
-        # choose target chats VIP -> PRO -> BASIC -> FREE (send to all that still have quota)
+        # Build candidate target chats (VIP→PRO→BASIC→FREE)
         targets: List[Tuple[str, Optional[int]]] = []
         ordered = [
             (TELEGRAM_CHAT_VIP, None),
@@ -620,24 +709,25 @@ async def try_send_signal(inst: str):
             used = await quota_get_today(cid)
             if (lim is None) or (used < lim):
                 targets.append((cid, lim))
-
         if not targets:
-            return  # all quotas hit
+            return
 
-        direction_arrow = "🟢CALL" if sig["direction"] == "UP" else "🔴PUT"
+        arrow = "🟢CALL" if sig["direction"] == "UP" else "🔴PUT"
+        regime_tag = "📈 TREND / BLW" if regime == "trend" else "🔁 CHOP / MeanRev"
         msg = (
-            f"⚡ {inst} | {direction_arrow}\n"
-            f"Entry: {sig['price']:.5f}\n"
-            f"Expiry: {PO_EXPIRY_MIN} min\n"
+            f"⚡ {inst} | {arrow}\n"
+            f"{regime_tag}  •  Confidence: {conf:.0f}%\n"
+            f"Entry: {sig['price']:.5f}  •  Expiry: {PO_EXPIRY_MIN} min\n"
             f"Why: {sig['reason']}"
         )
-        deliver_to: List[str] = []
-        for cid, _ in targets:
+
+        delivered: List[str] = []
+        for cid, lim in targets:
             await tg_send(cid, msg)
             await quota_inc_today(cid)
-            deliver_to.append(cid)
+            delivered.append(cid)
 
-        # track open trade for settlement after expiry minutes
+        # open trade for settlement
         settle_at = (datetime.now(timezone.utc) + timedelta(minutes=PO_EXPIRY_MIN)).isoformat()
         trade = {
             "instrument": inst,
@@ -645,21 +735,18 @@ async def try_send_signal(inst: str):
             "entry": sig["price"],
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "settle_at": settle_at,
-            "targets": deliver_to,
+            "targets": delivered,
         }
         async with _trades_lock:
             _open_trades.append(trade)
             await save_open_trades()
 
-        await stats_on_open(inst)
+        await stats_on_open()
         _mark_cooldown(inst)
 
     except Exception as e:
         log.error(f"{inst} signal error: {e}")
 
-# =========================
-# Scheduler jobs
-# =========================
 async def run_engine():
     for inst in OANDA_INSTRUMENTS:
         await try_send_signal(inst)
@@ -671,11 +758,106 @@ async def weekly_tally_job():
     await send_tally("weekly")
 
 # =========================
+# NOWPayments
+# =========================
+async def nowpay_create_invoice(price_amount: float, price_currency: str, order_id: str,
+                                order_description: str, pay_currency: Optional[str],
+                                success_url: str, cancel_url: str, ipn_callback_url: str) -> Dict[str, Any]:
+    headers = {"x-api-key": NOWPAY_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "price_amount": float(price_amount),
+        "price_currency": price_currency.lower(),
+        "order_id": order_id,
+        "order_description": order_description,
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "ipn_callback_url": ipn_callback_url
+    }
+    if pay_currency:
+        payload["pay_currency"] = pay_currency.lower()
+    async with httpx.AsyncClient(timeout=25) as client:
+        r = await client.post("https://api.nowpayments.io/v1/invoice", headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+def _ipn_valid(sig: str, body: bytes) -> bool:
+    if not NOWPAY_IPN_SECRET:
+        return False
+    calc = hmac.new(NOWPAY_IPN_SECRET.encode(), body, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(calc, sig)
+
+def _chat_for_tier(tier: str) -> Optional[str]:
+    t = tier.upper()
+    if t == "VIP": return TELEGRAM_CHAT_VIP or None
+    if t == "PRO": return TELEGRAM_CHAT_PRO or None
+    if t == "BASIC": return TELEGRAM_CHAT_BASIC or None
+    return None
+
+async def _invite_user_to_tier(telegram_id: int, tier: str) -> str:
+    """Create 1-use, time-limited invite for the tier chat. Fallback to static link."""
+    if not telegram_app:
+        return ""
+    chat_id = _chat_for_tier(tier)
+    if not chat_id:
+        return ""
+    try:
+        expire_unix = int((datetime.now(timezone.utc) + timedelta(days=SUB_DURATION_DAYS)).timestamp())
+        link = await telegram_app.bot.create_chat_invite_link(
+            chat_id=chat_id,
+            name=f"{tier}-{telegram_id}",
+            expire_date=expire_unix,
+            member_limit=1
+        )
+        return link.invite_link
+    except Exception as e:
+        log.error(f"Invite link error: {e}")
+        # fallback
+        return {
+            "BASIC": TELEGRAM_LINK_BASIC,
+            "PRO": TELEGRAM_LINK_PRO,
+            "VIP": TELEGRAM_LINK_VIP
+        }.get(tier.upper(), "")
+
+async def _record_subscription(telegram_id: int, tier: str):
+    chat_id = _chat_for_tier(tier)
+    if not chat_id:
+        return
+    async with _subs_lock:
+        _subs[str(telegram_id)] = {
+            "tier": tier.upper(),
+            "chat_id": chat_id,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=SUB_DURATION_DAYS)).isoformat()
+        }
+        await save_subs()
+
+async def _expire_subscriptions():
+    """Kick users whose subs expired (bot must be admin with restrict perms)."""
+    if not telegram_app:
+        return
+    now = datetime.now(timezone.utc)
+    expired: List[str] = []
+    async with _subs_lock:
+        for uid, sub in list(_subs.items()):
+            exp = datetime.fromisoformat(sub.get("expires_at", now.isoformat()))
+            if now >= exp:
+                chat_id = sub.get("chat_id")
+                try:
+                    await telegram_app.bot.ban_chat_member(chat_id=chat_id, user_id=int(uid))
+                    await telegram_app.bot.unban_chat_member(chat_id=chat_id, user_id=int(uid))  # unban to allow future rejoin
+                except Exception as e:
+                    log.error(f"Expire kick failed uid={uid}: {e}")
+                expired.append(uid)
+        for uid in expired:
+            _subs.pop(uid, None)
+        if expired:
+            await save_subs()
+
+# =========================
 # FastAPI endpoints
 # =========================
 @app_fastapi.get("/", response_class=PlainTextResponse)
 async def root():
-    return "Pocket Option BLW M1→5 — FX live only"
+    return "Pocket Option Signals — Dual Strategy (BLW + MeanRev) • FX live only"
 
 @app_fastapi.get("/healthz", response_class=PlainTextResponse)
 async def healthz():
@@ -688,86 +870,15 @@ async def healthz():
 
 @app_fastapi.get("/status")
 async def status():
-    now = datetime.now(timezone.utc).isoformat()
     return {
-        "now": now,
+        "now_utc": datetime.now(timezone.utc).isoformat(),
         "fx_live_now": fx_live_now(),
         "pairs": OANDA_INSTRUMENTS,
         "cooldown_min": ALERT_COOLDOWN_MIN,
         "expiry_min": PO_EXPIRY_MIN,
     }
 
-# --- Payments: optional HTTP create (same as /upgrade), plus IPN ---
-@app_fastapi.post("/pay/create")
-async def pay_create(request: Request):
-    if not NOWPAY_API_KEY:
-        return JSONResponse({"error": "payments-disabled"}, status_code=503)
-    data = await request.json()
-    tier = str(data.get("tier", "")).upper()
-    telegram_id = int(data.get("telegram_id", 0))
-    price = _plan_price(tier)
-    if price is None or telegram_id <= 0:
-        return JSONResponse({"error": "bad-args"}, status_code=400)
-
-    order_id = f"tier:{tier}:uid:{telegram_id}:{int(datetime.now(timezone.utc).timestamp())}"
-    description = f"Pocket Option Signals — {tier} plan for Telegram user {telegram_id}"
-
-    invoice = await nowpay_create_invoice(
-        price_amount=price,
-        price_currency=NOWPAY_PRICE_CCY,
-        order_id=order_id,
-        order_description=description,
-        pay_currency=NOWPAY_PAY_CCY or None,
-        success_url=f"{BASE_URL}/pay/success?tier={tier}",
-        cancel_url=f"{BASE_URL}/pay/cancel?tier={tier}",
-        ipn_callback_url=f"{BASE_URL}/pay/ipn"
-    )
-    async with _orders_lock:
-        _orders[order_id] = {"tier": tier, "telegram_id": telegram_id, "created_at": datetime.now(timezone.utc).isoformat()}
-        await save_orders()
-    return invoice
-
-@app_fastapi.post("/pay/ipn")
-async def pay_ipn(request: Request, x_nowpayments_sig: str = Header(default="")):
-    raw = await request.body()
-    if not verify_nowpay_sig(raw, x_nowpayments_sig):
-        return PlainTextResponse("bad-sig", status_code=401)
-    try:
-        payload = await request.json()
-    except Exception:
-        return PlainTextResponse("bad-json", status_code=400)
-
-    order_id = str(payload.get("order_id", ""))
-    payment_status = str(payload.get("payment_status", "")).lower()
-
-    # only grant on confirmed/finished/partially_paid status (per NOWPayments docs)
-    if payment_status not in ("finished", "confirmed", "partially_paid"):
-        return PlainTextResponse("ignored", status_code=200)
-
-    async with _orders_lock:
-        order = _orders.get(order_id)
-    if not order:
-        return PlainTextResponse("unknown-order", status_code=200)
-
-    tier = order.get("tier", "BASIC")
-    tg_id = order.get("telegram_id")
-    link = tier_to_link(tier)
-    if not link:
-        # If no static link configured, just DM user with a generic message.
-        try:
-            await telegram_app.bot.send_message(chat_id=int(tg_id), text=f"✅ Payment confirmed for {tier}. Please contact admin for your invite.")
-        except Exception:
-            pass
-        return PlainTextResponse("ok", status_code=200)
-
-    try:
-        await telegram_app.bot.send_message(chat_id=int(tg_id), text=f"✅ Payment confirmed for {tier}.\nJoin here: {link}")
-    except Exception as e:
-        log.error(f"DM invite failed: {e}")
-
-    return PlainTextResponse("ok", status_code=200)
-
-# Telegram webhook (if you run webhook mode)
+# Telegram webhook (if using webhook mode)
 @app_fastapi.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     if not telegram_app:
@@ -780,8 +891,52 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return PlainTextResponse("ok")
 
+# NOWPayments IPN
+@app_fastapi.post("/pay/ipn")
+async def nowpay_ipn(request: Request, x_nowpayments_sig: str = Header(default="")):
+    raw = await request.body()
+    if not _ipn_valid(x_nowpayments_sig, raw):
+        return PlainTextResponse("invalid signature", status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return PlainTextResponse("bad-json", status_code=400)
+
+    status = (payload.get("payment_status") or payload.get("payment_status_description") or "").lower()
+    order_id = payload.get("order_id", "")
+    if not order_id.startswith("tier:"):
+        return PlainTextResponse("ignored", status_code=200)
+
+    # parse order_id "tier:TIER:uid:USERID:ts"
+    try:
+        parts = order_id.split(":")
+        tier = parts[1]
+        user_id = int(parts[3])
+    except Exception:
+        return PlainTextResponse("bad-order-id", status_code=200)
+
+    if status in ("finished", "confirmed", "complete", "paid"):
+        # grant access
+        invite = await _invite_user_to_tier(user_id, tier)
+        await _record_subscription(user_id, tier)
+        try:
+            await telegram_app.bot.send_message(chat_id=user_id,
+                                                text=f"✅ Payment confirmed for {tier}.\nJoin your private group: {invite}")
+        except Exception as e:
+            log.error(f"DM failed user={user_id}: {e}")
+        return PlainTextResponse("ok")
+    return PlainTextResponse("ignored", status_code=200)
+
+@app_fastapi.get("/pay/success", response_class=PlainTextResponse)
+async def pay_success(tier: str = ""):
+    return f"Payment success received. Tier={tier}"
+
+@app_fastapi.get("/pay/cancel", response_class=PlainTextResponse)
+async def pay_cancel(tier: str = ""):
+    return f"Payment cancelled. Tier={tier}"
+
 # =========================
-# Lifespan: start scheduler & telegram
+# Lifespan
 # =========================
 @app_fastapi.on_event("startup")
 async def on_startup():
@@ -803,12 +958,14 @@ async def on_startup():
     scheduler = AsyncIOScheduler(timezone=timezone.utc)
     # Engine: every minute at second 5
     scheduler.add_job(run_engine, CronTrigger(second="5"))
-    # Settlement: every 30s
+    # Settlement: every 30 seconds
     scheduler.add_job(settle_due_trades, CronTrigger(second="*/30"))
-    # Daily tally: 20:05 UTC ≈ 16:05 Port_of_Spain (UTC-4, no DST)
+    # Daily tally: 20:05 UTC (~16:05 Port_of_Spain)
     scheduler.add_job(daily_tally_job, CronTrigger(hour="20", minute="5"))
-    # Weekly tally: Sunday 20:10 UTC
+    # Weekly tally: Sun 20:10 UTC
     scheduler.add_job(weekly_tally_job, CronTrigger(day_of_week="sun", hour="20", minute="10"))
+    # Subs expiration check: every 15 minutes
+    scheduler.add_job(_expire_subscriptions, CronTrigger(minute="*/15"))
     scheduler.start()
     log.info("⏰ Scheduler started")
 
@@ -820,6 +977,6 @@ async def on_shutdown():
         await telegram_app.stop()
 
 # =========================
-# Uvicorn entry (Render Procfile uses `app:app_fastapi`)
+# Uvicorn entrypoint
 # =========================
 app = app_fastapi
