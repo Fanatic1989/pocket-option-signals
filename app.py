@@ -12,6 +12,7 @@ import ssl
 import signal
 import logging
 import threading
+import html
 from math import sqrt
 from datetime import datetime, timezone
 from collections import deque, defaultdict
@@ -110,21 +111,16 @@ def _parse_chat_id_field(val: str):
     """
     if not val:
         return []
-    # Strip inline comments
-    # If env value has inline '# ...', keep left side only
-    val = val.split('#', 1)[0]
+    val = val.split('#', 1)[0]  # strip inline comments
     parts = [p.strip() for p in val.split(",") if p.strip()]
     return parts
 
 def _collect_telegram_chat_ids():
-    # 1) Preferred legacy key: TELEGRAM_CHAT_ID
     ids = _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_ID", ""))
-    # 2) Tiered keys (FREE/BASIC/PRO/VIP) — each may contain comma-separated IDs
     ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_FREE", ""))
     ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_BASIC", ""))
     ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_PRO", ""))
     ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_VIP", ""))
-    # Deduplicate while preserving order
     seen, out = set(), []
     for i in ids:
         if i not in seen:
@@ -365,16 +361,23 @@ def ensure_symbol_state(sym: str):
 
 
 # ===========
-# TELEGRAM
+# TELEGRAM (HTML-safe)
 # ===========
 def tg_send(text: str):
+    # Sends as HTML; caller must build only allowed tags (<b>, <i>, <code>, <a>, etc.).
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
         logger.warning("Telegram not configured; skipping send")
         return
     for chat_id in TELEGRAM_CHAT_IDS:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=10)
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            r = requests.post(url, json=payload, timeout=10)
             if r.status_code != 200:
                 logger.error(f"Telegram send failed ({chat_id}): {r.status_code} {r.text}")
         except Exception as e:
@@ -457,19 +460,26 @@ def quotas_ok(sym: str):
 # STRATEGY EMITTERS
 # ===========
 def send_signal(sym: str, direction: str, price: float, when: datetime, strategy_name: str, extra_lines=None):
-    extra = "\n".join(extra_lines or [])
+    """Compose a safe HTML message and send to all chats (escape dynamic text)."""
+    esc = lambda s: html.escape(str(s), quote=False)
+
+    safe_extra = ""
+    if extra_lines:
+        safe_extra = "\n" + "\n".join(esc(line) for line in extra_lines)
+
     text = (
-        f"⚡ <b>Pocket Option Signal</b>\n"
-        f"Symbol: <b>{sym}</b>\n"
-        f"Direction: <b>{direction}</b>\n"
+        "⚡ <b>Pocket Option Signal</b>\n"
+        f"Symbol: <b>{esc(sym)}</b>\n"
+        f"Direction: <b>{esc(direction)}</b>\n"
         f"Price: <code>{price:.5f}</code>\n"
-        f"Time: {fmt_dt(when)}\n"
+        f"Time: {esc(fmt_dt(when))}\n"
         f"Granularity: {CANDLE_GRANULARITY}s\n"
-        f"Strategy: {strategy_name}\n"
-        f"{extra}"
-        f"AppID: {DERIV_APP_ID}\n"
+        f"Strategy: {esc(strategy_name)}"
+        f"{safe_extra}\n"
+        f"AppID: {esc(DERIV_APP_ID)}\n"
         f"Cooldown: {COOLDOWN_SECONDS}s"
     )
+
     DBH.save_signal(sym, direction, price, when, strategy_name)
     DBH.inc_quota(sym, 1)
     DBH.inc_tally("signals_sent", 1)
@@ -803,7 +813,9 @@ def dashboard():
 @app.route("/send_test", methods=["POST", "GET"])
 def send_test():
     msg = flask_request.args.get("m") or "Test signal ✅"
-    tg_send(f"🔔 <b>Test</b>\n{msg}\nUTC: {fmt_dt(now_utc())}")
+    safe_msg = html.escape(msg, quote=False)
+    text = f"🔔 <b>Test</b>\n{safe_msg}\nUTC: {html.escape(fmt_dt(now_utc()), quote=False)}"
+    tg_send(text)
     return jsonify({"ok": True, "sent": msg})
 
 
@@ -814,7 +826,6 @@ INIT_LOCK = threading.Lock()
 INIT_DONE = False
 
 def housekeeping():
-    # ensure WS thread
     global WS_THREAD
     if WS_THREAD is None or not WS_THREAD.is_alive():
         try:
@@ -860,6 +871,7 @@ def shutdown(signum=None, frame=None):
         pass
     time.sleep(0.3)
     sys.exit(0)
+
 
 # ===========
 # WS THREAD LAUNCHERS
