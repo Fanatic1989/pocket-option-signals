@@ -20,3 +20,4 @@ packaging>=23.2
 
 gunicorn==22.0.0
 websockets==12.0
+Flask==3.0.3
