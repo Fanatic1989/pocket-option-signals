@@ -1,7 +1,8 @@
 # app.py
 # Pocket Option Signals — single-file deploy (Flask 3.1+ safe)
-# Flask + Deriv streaming + TREND & CHOP strategies + quotas/cooldowns + tallies + Telegram + APScheduler + Postgres/SQLite
-# (c) 2025 Chris — built by ChatGPT
+# Loads env from Render Environment, .env, and /etc/secrets/*
+# Features: Deriv streaming (fixed "end":"latest"), TREND & CHOP strategies, BASE fallback,
+# quotas/cooldowns, tallies, Telegram, APScheduler, Postgres/SQLite.
 
 import os
 import sys
@@ -14,6 +15,37 @@ import threading
 from math import sqrt
 from datetime import datetime, timezone
 from collections import deque, defaultdict
+
+# -------- ENV BOOTSTRAP (load .env + Render Secret Files) --------
+def _bootstrap_env():
+    try:
+        from dotenv import load_dotenv
+        # 1) Load local .env (or Secret File named ".env" if present in cwd)
+        load_dotenv(override=False)
+        # 2) Load any files in /etc/secrets (Render Secret Files mount here)
+        secrets_dir = "/etc/secrets"
+        if os.path.isdir(secrets_dir):
+            for fname in os.listdir(secrets_dir):
+                fpath = os.path.join(secrets_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                # Try to parse as .env first
+                try:
+                    load_dotenv(fpath, override=False)
+                except Exception:
+                    pass
+                # Also set an env var with the filename if not already set
+                try:
+                    if fname not in os.environ:
+                        with open(fpath, "r", encoding="utf-8") as fh:
+                            os.environ[fname] = fh.read().strip()
+                except Exception:
+                    pass
+    except Exception:
+        # dotenv not installed or other issue; Render Environment still works
+        pass
+
+_bootstrap_env()
 
 import requests
 from flask import Flask, jsonify, Response, render_template_string, request as flask_request
@@ -65,24 +97,24 @@ PER_SYMBOL_DAILY_LIMIT = int(os.getenv("PER_SYMBOL_DAILY_LIMIT", "50"))
 
 # TREND/CHOP classifiers
 ENABLE_TRENDING = os.getenv("ENABLE_TRENDING", "1") == "1"
-ENABLE_CHOPPY = os.getenv("ENABLE_CHOPPY", "1") == "1"
+ENABLE_CHOPPY   = os.getenv("ENABLE_CHOPPY", "1") == "1"
 
-ATR_WINDOW = int(os.getenv("ATR_WINDOW", "14"))
-BB_WINDOW = int(os.getenv("BB_WINDOW", "20"))
-BB_STD_MULT = float(os.getenv("BB_STD_MULT", "1.0"))          # band width for CHOP signals
-SLOPE_ATR_MULT = float(os.getenv("SLOPE_ATR_MULT", "0.20"))   # trend slope threshold as % of ATR
+ATR_WINDOW     = int(os.getenv("ATR_WINDOW", "14"))
+BB_WINDOW      = int(os.getenv("BB_WINDOW", "20"))
+BB_STD_MULT    = float(os.getenv("BB_STD_MULT", "1.0"))          # band width for CHOP signals
+SLOPE_ATR_MULT = float(os.getenv("SLOPE_ATR_MULT", "0.20"))      # trend slope threshold as % of ATR
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_IDS = [x for x in os.getenv("TELEGRAM_CHAT_ID", "").replace(" ", "").split(",") if x]
+TELEGRAM_CHAT_IDS  = [x for x in os.getenv("TELEGRAM_CHAT_ID", "").replace(" ", "").split(",") if x]
 
 # DB
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_TIMEOUT = 10
 
 # Server
-PORT = int(os.getenv("PORT", "8000"))
-ENV = os.getenv("ENV", "production")
+PORT      = int(os.getenv("PORT", "8000"))
+ENV       = os.getenv("ENV", "production")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 UTC = timezone.utc
@@ -285,12 +317,7 @@ SCHED = BackgroundScheduler(timezone=UTC)
 WS_THREAD = None
 
 # Per-symbol rolling state
-# Includes:
-#  - SMA fast/slow (with rolling sums)
-#  - Close stats for BB (sum/sumsq)
-#  - ATR (rolling TR sum)
-#  - prev_fast/prev_slow, prev_close
-ROLLING = {}  # symbol -> dict of deques & sums
+ROLLING = {}  # sym -> dict of deques & sums
 CANDLES = defaultdict(lambda: deque(maxlen=CANDLE_HISTORY))  # (dt, close) for dashboard
 LAST_EPOCH = defaultdict(lambda: None)  # last ohlc epoch processed
 LAST_SIGNAL_AT = defaultdict(lambda: None)
@@ -365,7 +392,6 @@ def update_bb(sym: str, close_price: float):
     if n == 0:
         return None, None
     mean = st["sum_close"] / n
-    # pop variance
     var = max(st["sumsq_close"] / n - mean * mean, 0.0)
     std = sqrt(var)
     return mean, std
@@ -373,7 +399,6 @@ def update_bb(sym: str, close_price: float):
 def update_atr(sym: str, high: float, low: float, close: float):
     st = ROLLING[sym]
     prev_close = st["prev_close"]
-    # True Range
     if prev_close is None:
         tr = abs(high - low)
     else:
@@ -384,8 +409,7 @@ def update_atr(sym: str, high: float, low: float, close: float):
     st["sum_tr"] += tr
     st["prev_close"] = close
     n = len(st["trs"])
-    atr = (st["sum_tr"] / n) if n > 0 else None
-    return atr
+    return (st["sum_tr"] / n) if n > 0 else None
 
 
 # ===========
@@ -428,14 +452,11 @@ def send_signal(sym: str, direction: str, price: float, when: datetime, strategy
     logger.info(f"[{strategy_name}] {sym} {direction} @ {price:.5f}")
 
 def maybe_emit_trend(sym: str, close_price: float, when: datetime, fast: float, slow: float, prev_fast: float, prev_slow: float, atr: float):
-    # Need established SMAs & ATR
     if len(ROLLING[sym]["slow"]) < SMA_SLOW or atr is None:
         return
     slope = abs(slow - (prev_slow if prev_slow is not None else slow))
     slope_thresh = SLOPE_ATR_MULT * atr
-
-    # Trend condition: slow slope significant vs ATR and price not too close to mean
-    is_trending = slope >= slope_thresh and abs(close_price - slow) >= (0.25 * atr if atr > 0 else PULLBACK_MIN)
+    is_trending = slope >= slope_thresh and abs(close_price - slow) >= (0.25 * atr if atr and atr > 0 else PULLBACK_MIN)
     if not (ENABLE_TRENDING and is_trending):
         return
 
@@ -460,23 +481,16 @@ def maybe_emit_chop(sym: str, close_price: float, when: datetime, mean: float, s
         return
     if mean is None or std is None or prev_slow is None or atr is None:
         return
-    # Choppy if slow slope small vs ATR
     slope = abs(slow - prev_slow)
     slope_thresh = SLOPE_ATR_MULT * atr
     is_choppy = slope < slope_thresh
     if not is_choppy:
         return
 
-    # Bands around mean
     upper = mean + BB_STD_MULT * std
     lower = mean - BB_STD_MULT * std
-
-    direction = None
-    if close_price >= upper:
-        direction = "PUT"   # fade top of range
-    elif close_price <= lower:
-        direction = "CALL"  # fade bottom of range
-    else:
+    direction = "PUT" if close_price >= upper else ("CALL" if close_price <= lower else None)
+    if direction is None:
         return
 
     if not cooldown_ok(sym):
@@ -492,7 +506,6 @@ def maybe_emit_chop(sym: str, close_price: float, when: datetime, mean: float, s
                  f"Slope≈{slope:.6f} (< {slope_thresh:.6f})"])
 
 def maybe_emit_base(sym: str, close_price: float, when: datetime, fast: float, slow: float, prev_fast: float, prev_slow: float):
-    # Simple cross + pullback as conservative fallback when neither TREND nor CHOP fired
     if len(ROLLING[sym]["slow"]) < SMA_SLOW:
         return
     crossed_up = prev_fast is not None and prev_slow is not None and prev_fast <= prev_slow and fast > slow
@@ -536,7 +549,7 @@ async def deriv_stream(symbols):
                     else:
                         logger.info("Deriv authorized")
 
-                # subscribe per symbol (FIX: requires "end":"latest")
+                # subscribe (FIX includes "end":"latest")
                 for s in symbols:
                     sub = {
                         "ticks_history": s,
@@ -544,7 +557,7 @@ async def deriv_stream(symbols):
                         "granularity": CANDLE_GRANULARITY,
                         "count": max(SMA_SLOW * 2, 60),
                         "adjust_start_time": 1,
-                        "end": "latest",    # <<< REQUIRED
+                        "end": "latest",     # REQUIRED
                         "subscribe": 1
                     }
                     await ws.send(json.dumps(sub))
@@ -584,7 +597,6 @@ async def handle_deriv_message(msg: dict):
 
         with STATE_LOCK:
             ensure_symbol_state(sym)
-            # update rolling structures
             CANDLES[sym].append((when, c_))
             prev_fast, prev_slow, fast, slow = update_sma(sym, c_)
             mean, std = update_bb(sym, c_)
@@ -599,7 +611,7 @@ async def handle_deriv_message(msg: dict):
             maybe_emit_trend(sym, c_, when, fast, slow, prev_fast, prev_slow, atr)
         if ENABLE_CHOPPY:
             maybe_emit_chop(sym, c_, when, mean, std, slow, prev_slow, atr)
-        # BASE fallback (will only fire if its conditions pass and CHOP/TREND didn't already send due to cooldown)
+        # BASE fallback (fires only if allowed by cooldown/quotas)
         maybe_emit_base(sym, c_, when, fast, slow, prev_fast, prev_slow)
         return
 
@@ -608,7 +620,7 @@ async def handle_deriv_message(msg: dict):
         sym = his.get("symbol")
         prices = his.get("prices") or []
         times = his.get("times") or []
-        # Only closes are provided in 'history'; we'll still warm SMAs/BB but ATR waits for live ohlc
+        # Warm SMAs/BB from closes; ATR waits for live ohlc
         if sym and prices and times and len(prices) == len(times):
             with STATE_LOCK:
                 ensure_symbol_state(sym)
@@ -623,7 +635,7 @@ async def handle_deriv_message(msg: dict):
                     update_bb(sym, close)
         return
 
-    # ignore other types
+    # ignore others
 
 
 def ws_thread_target(symbols):
@@ -639,7 +651,6 @@ def ws_thread_target(symbols):
 # SCHEDULER JOBS
 # ===========
 def housekeeping():
-    # ensure WS thread is up
     global WS_THREAD
     if WS_THREAD is None or not WS_THREAD.is_alive():
         try:
@@ -787,9 +798,6 @@ def startup_event():
         INIT_DONE = True
         logger.info("Startup init complete.")
 
-startup_event()  # trigger on module import
-
-
 def shutdown(signum=None, frame=None):
     logger.warning("Shutdown signal received; stopping…")
     STOP_EVENT.set()
@@ -800,6 +808,8 @@ def shutdown(signum=None, frame=None):
     time.sleep(0.3)
     sys.exit(0)
 
+# Trigger on module import
+startup_event()
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGINT, shutdown)
 
