@@ -1,5 +1,5 @@
 # app.py
-# Pocket Option Signals - single-file deploy
+# Pocket Option Signals - single-file deploy (Flask 3.1+ safe)
 # Flask + Deriv streaming + quotas/cooldowns + tallies + Telegram + APScheduler + Postgres/SQLite
 # (c) 2025 Chris — built by ChatGPT
 
@@ -230,8 +230,8 @@ class DB:
         return rows[0]["count"] if rows else 0
 
     def reset_tallies_kind(self, kind_prefix: str):
-        # store yesterday's totals if needed (keeping simple: zeroing is enough; data is per-day keyed)
-        pass  # tallies are date-keyed; no need to reset rows
+        # tallies are date-keyed; natural rollover each day
+        pass
 
     def save_signal(self, symbol, direction, price, ts: datetime, strategy: str):
         if self.is_pg:
@@ -497,18 +497,14 @@ async def handle_deriv_message(msg: dict):
             return
 
         candle_dt = to_dt(epoch)
-        # Avoid processing the same candle twice unless it's finalized (close); Deriv streams updates during the minute
-        # We'll accept updates but only trigger signal once per new epoch when close changes.
         prev_epoch = LAST_EPOCH.get(symbol)
         LAST_EPOCH[symbol] = epoch
 
-        # Update state
         with STATE_LOCK:
             CANDLES[symbol].append((candle_dt, close))
             prev_fast, prev_slow, fast, slow = _update_sma(symbol, close)
 
-        # Only attempt signal when we see a new epoch (first frame of that candle) or if price changed but epoch stayed?
-        # Safer: trigger only when epoch changes (new candle started) — signals align with previous candle completion.
+        # trigger only when epoch changes (new candle started)
         if prev_epoch is not None and epoch == prev_epoch:
             return
 
@@ -516,7 +512,6 @@ async def handle_deriv_message(msg: dict):
         return
 
     if mtype == "history":
-        # Initial history response — can prefill buffers
         his = msg.get("history") or {}
         symbol = his.get("symbol")
         prices = his.get("prices") or []
@@ -525,15 +520,14 @@ async def handle_deriv_message(msg: dict):
             with STATE_LOCK:
                 CANDLES[symbol].clear()
                 for p, t in zip(prices, times):
-                    CANDLES[symbol].append((to_dt(t), safe_float(p)))
-                    _update_sma(symbol, safe_float(p))
+                    val = safe_float(p)
+                    if val is None:
+                        continue
+                    CANDLES[symbol].append((to_dt(t), val))
+                    _update_sma(symbol, val)
         return
 
-    if mtype in ("tick", "candles", "ohlc-stream"):
-        # Not used directly; handled in ohlc above
-        return
-
-    # other types ignored
+    # ignore other types
 
 
 def ws_thread_target(symbols):
@@ -549,7 +543,6 @@ def ws_thread_target(symbols):
 # SCHEDULER JOBS
 # ===========
 def housekeeping():
-    # purge very old in-memory candles to keep memory fresh (deque maxlen already limits)
     # ensure WS thread alive, otherwise restart
     global WS_THREAD
     if WS_THREAD is None or not WS_THREAD.is_alive():
@@ -560,13 +553,11 @@ def housekeeping():
         except Exception as e:
             logger.exception(f"Failed to start WS thread: {e}")
 
-    # log heartbeat
     total_today = DBH.get_quota_total()
     logger.info(f"housekeeping: symbols={len(DEFAULT_SYMBOLS)} signals_today={total_today}")
 
 
 def reset_daily():
-    # no explicit row reset required; per-day keys rotate naturally
     logger.info("Daily reset checkpoint reached (UTC).")
 
 
@@ -598,7 +589,6 @@ def root():
 
 @app.route("/metrics", methods=["GET"])
 def metrics():
-    # very simple text metrics
     total_today = DBH.get_quota_total()
     signals_tally = DBH.get_tally("signals_sent")
     lines = [
@@ -688,28 +678,33 @@ def send_test():
 
 
 # ===========
-# STARTUP
+# STARTUP (Flask 3.1+ safe) —— runs once per worker at import
 # ===========
+INIT_LOCK = threading.Lock()
+INIT_DONE = False
+
 def start_bot_scheduler():
-    # Housekeeping every 30s (per your earlier logs)
     SCHED.add_job(housekeeping, CronTrigger(second="*/30"))
-    # Daily reset at 00:00 UTC
     SCHED.add_job(reset_daily, CronTrigger(hour="0", minute="0"))
-    # Weekly reset Monday 00:05 UTC
     SCHED.add_job(reset_weekly, CronTrigger(day_of_week="mon", hour="0", minute="5"))
     SCHED.start()
     logger.info("Scheduler started with housekeeping/daily/weekly jobs.")
 
-
-@app.before_first_request
 def startup_event():
-    start_bot_scheduler()
-    # Start WS thread if not running
-    global WS_THREAD
-    if WS_THREAD is None or not WS_THREAD.is_alive():
-        WS_THREAD = threading.Thread(target=ws_thread_target, args=(DEFAULT_SYMBOLS,), daemon=True)
-        WS_THREAD.start()
-        logger.info("Deriv WS thread started.")
+    global WS_THREAD, INIT_DONE
+    with INIT_LOCK:
+        if INIT_DONE:
+            return
+        start_bot_scheduler()
+        if WS_THREAD is None or not WS_THREAD.is_alive():
+            WS_THREAD = threading.Thread(target=ws_thread_target, args=(DEFAULT_SYMBOLS,), daemon=True)
+            WS_THREAD.start()
+            logger.info("Deriv WS thread started.")
+        INIT_DONE = True
+        logger.info("Startup init completed.")
+
+# Trigger on module import so gunicorn workers initialize properly
+startup_event()
 
 
 def shutdown(signum=None, frame=None):
