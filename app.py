@@ -1,7 +1,7 @@
 # app.py
-# Pocket Option Signals — single-file deploy (Flask 3.1+ safe)
-# Loads env from Render Environment, .env, and /etc/secrets/*
-# Features: Deriv streaming (fixed "end":"latest"), TREND & CHOP strategies, BASE fallback,
+# Pocket Option Signals — Flask 3.1+ safe, single-file
+# Env-aware (Render Environment, .env, /etc/secrets), tiered Telegram chat IDs,
+# Deriv WS ("end":"latest"), TREND & CHOP strategies + BASE fallback,
 # quotas/cooldowns, tallies, Telegram, APScheduler, Postgres/SQLite.
 
 import os
@@ -20,21 +20,19 @@ from collections import deque, defaultdict
 def _bootstrap_env():
     try:
         from dotenv import load_dotenv
-        # 1) Load local .env (or Secret File named ".env" if present in cwd)
+        # 1) Load project .env if present
         load_dotenv(override=False)
-        # 2) Load any files in /etc/secrets (Render Secret Files mount here)
+        # 2) Load Secret Files from /etc/secrets (Render)
         secrets_dir = "/etc/secrets"
         if os.path.isdir(secrets_dir):
             for fname in os.listdir(secrets_dir):
                 fpath = os.path.join(secrets_dir, fname)
                 if not os.path.isfile(fpath):
                     continue
-                # Try to parse as .env first
                 try:
                     load_dotenv(fpath, override=False)
                 except Exception:
                     pass
-                # Also set an env var with the filename if not already set
                 try:
                     if fname not in os.environ:
                         with open(fpath, "r", encoding="utf-8") as fh:
@@ -42,7 +40,6 @@ def _bootstrap_env():
                 except Exception:
                     pass
     except Exception:
-        # dotenv not installed or other issue; Render Environment still works
         pass
 
 _bootstrap_env()
@@ -106,7 +103,36 @@ SLOPE_ATR_MULT = float(os.getenv("SLOPE_ATR_MULT", "0.20"))      # trend slope t
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_IDS  = [x for x in os.getenv("TELEGRAM_CHAT_ID", "").replace(" ", "").split(",") if x]
+
+def _parse_chat_id_field(val: str):
+    """
+    Accepts a string like "-100111, -100222 # comment" and returns ['-100111','-100222'].
+    """
+    if not val:
+        return []
+    # Strip inline comments
+    # If env value has inline '# ...', keep left side only
+    val = val.split('#', 1)[0]
+    parts = [p.strip() for p in val.split(",") if p.strip()]
+    return parts
+
+def _collect_telegram_chat_ids():
+    # 1) Preferred legacy key: TELEGRAM_CHAT_ID
+    ids = _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_ID", ""))
+    # 2) Tiered keys (FREE/BASIC/PRO/VIP) — each may contain comma-separated IDs
+    ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_FREE", ""))
+    ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_BASIC", ""))
+    ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_PRO", ""))
+    ids += _parse_chat_id_field(os.getenv("TELEGRAM_CHAT_VIP", ""))
+    # Deduplicate while preserving order
+    seen, out = set(), []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+TELEGRAM_CHAT_IDS = _collect_telegram_chat_ids()
 
 # DB
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -350,9 +376,9 @@ def tg_send(text: str):
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=10)
             if r.status_code != 200:
-                logger.error(f"Telegram send failed: {r.status_code} {r.text}")
+                logger.error(f"Telegram send failed ({chat_id}): {r.status_code} {r.text}")
         except Exception as e:
-            logger.exception(f"Telegram send exception: {e}")
+            logger.exception(f"Telegram send exception ({chat_id}): {e}")
 
 
 # ===========
@@ -683,6 +709,10 @@ def root():
         "limits": {"daily_total": DAILY_SIGNAL_LIMIT, "per_symbol": PER_SYMBOL_DAILY_LIMIT, "cooldown_seconds": COOLDOWN_SECONDS},
         "granularity_sec": CANDLE_GRANULARITY,
         "strategies": {"trend": ENABLE_TRENDING, "chop": ENABLE_CHOPPY, "base": True},
+        "telegram": {
+            "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS),
+            "chat_count": len(TELEGRAM_CHAT_IDS)
+        },
         "app_id": DERIV_APP_ID
     })
 
@@ -698,6 +728,8 @@ def metrics():
         f"sma_slow {SMA_SLOW}",
         f"trend_enabled {1 if ENABLE_TRENDING else 0}",
         f"chop_enabled {1 if ENABLE_CHOPPY else 0}",
+        f"telegram_configured {1 if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS) else 0}",
+        f"telegram_chat_count {len(TELEGRAM_CHAT_IDS)}",
     ]
     return Response("\n".join(lines) + "\n", mimetype="text/plain")
 
@@ -726,6 +758,7 @@ DASHBOARD_HTML = """
     <b>Quota Used:</b> <code>{{ quota_used }}/{{ daily_limit }}</code> (per symbol: {{ per_symbol_limit }})<br/>
     <b>Granularity:</b> <code>{{ granularity }}s</code><br/>
     <b>Cooldown:</b> <code>{{ cooldown }}s</code><br/>
+    <b>Telegram:</b> <code>configured={{ telegram_ok }}, chats={{ chat_count }}</code><br/>
     <b>Strategies:</b> <code>TREND={{ trend }}, CHOP={{ chop }}, BASE=1</code>
   </div>
 
@@ -762,6 +795,8 @@ def dashboard():
         cooldown=COOLDOWN_SECONDS,
         trend=1 if ENABLE_TRENDING else 0,
         chop=1 if ENABLE_CHOPPY else 0,
+        telegram_ok=1 if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS) else 0,
+        chat_count=len(TELEGRAM_CHAT_IDS),
         candles_map=candles_map
     )
 
@@ -777,6 +812,24 @@ def send_test():
 # ===========
 INIT_LOCK = threading.Lock()
 INIT_DONE = False
+
+def housekeeping():
+    # ensure WS thread
+    global WS_THREAD
+    if WS_THREAD is None or not WS_THREAD.is_alive():
+        try:
+            logger.warning("WS thread not alive — starting…")
+            WS_THREAD = threading.Thread(target=ws_thread_target, args=(DEFAULT_SYMBOLS,), daemon=True)
+            WS_THREAD.start()
+        except Exception as e:
+            logger.exception(f"Failed to start WS thread: {e}")
+    logger.info(f"housekeeping: symbols={len(DEFAULT_SYMBOLS)} signals_today={DBH.get_quota_total()}")
+
+def reset_daily():
+    logger.info("Daily reset (UTC).")
+
+def reset_weekly():
+    logger.info("Weekly reset (UTC).")
 
 def start_scheduler():
     SCHED.add_job(housekeeping, CronTrigger(second="*/30"))
@@ -808,7 +861,125 @@ def shutdown(signum=None, frame=None):
     time.sleep(0.3)
     sys.exit(0)
 
-# Trigger on module import
+# ===========
+# WS THREAD LAUNCHERS
+# ===========
+async def deriv_stream(symbols):
+    if websockets is None:
+        logger.error("websockets lib not available; streaming disabled")
+        return
+
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    backoff = 1
+    while not STOP_EVENT.is_set():
+        try:
+            ssl_ctx = ssl.create_default_context()
+            async with websockets.connect(uri, ssl=ssl_ctx, ping_interval=20, ping_timeout=20, max_queue=2048) as ws:
+                logger.info(f"Connected to Deriv WS: {uri}")
+
+                # optional auth
+                if DERIV_API_TOKEN:
+                    await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+                    auth = json.loads(await ws.recv())
+                    if "error" in auth:
+                        logger.error(f"Deriv authorize error: {auth['error']}")
+                    else:
+                        logger.info("Deriv authorized")
+
+                # subscribe (includes "end":"latest")
+                for s in symbols:
+                    sub = {
+                        "ticks_history": s,
+                        "style": "candles",
+                        "granularity": CANDLE_GRANULARITY,
+                        "count": max(SMA_SLOW * 2, 60),
+                        "adjust_start_time": 1,
+                        "end": "latest",
+                        "subscribe": 1
+                    }
+                    await ws.send(json.dumps(sub))
+                    await asyncio.sleep(0.05)
+
+                backoff = 1  # reset after success
+
+                while not STOP_EVENT.is_set():
+                    raw = await ws.recv()
+                    msg = json.loads(raw)
+                    await handle_deriv_message(msg)
+
+        except Exception as e:
+            logger.error(f"Deriv WS connection error: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+async def handle_deriv_message(msg: dict):
+    if "error" in msg:
+        logger.error(f"Deriv error: {msg['error']}")
+        return
+    mtype = msg.get("msg_type")
+
+    if mtype == "ohlc":
+        o = msg.get("ohlc") or {}
+        sym = o.get("symbol")
+        epoch = o.get("epoch")
+        o_, h_, l_, c_ = safe_float(o.get("open")), safe_float(o.get("high")), safe_float(o.get("low")), safe_float(o.get("close"))
+        if not sym or epoch is None or c_ is None or h_ is None or l_ is None:
+            logger.warning(f"Incomplete ohlc: {msg}")
+            return
+
+        when = to_dt(epoch)
+        prev_epoch = LAST_EPOCH.get(sym)
+        LAST_EPOCH[sym] = epoch
+
+        with STATE_LOCK:
+            ensure_symbol_state(sym)
+            CANDLES[sym].append((when, c_))
+            prev_fast, prev_slow, fast, slow = update_sma(sym, c_)
+            mean, std = update_bb(sym, c_)
+            atr = update_atr(sym, h_, l_, c_)
+
+        # only act on new candle (epoch change)
+        if prev_epoch is not None and epoch == prev_epoch:
+            return
+
+        # Strategy cascade: TREND → CHOP → BASE
+        if ENABLE_TRENDING:
+            maybe_emit_trend(sym, c_, when, fast, slow, prev_fast, prev_slow, atr)
+        if ENABLE_CHOPPY:
+            maybe_emit_chop(sym, c_, when, mean, std, slow, prev_slow, atr)
+        # BASE fallback
+        maybe_emit_base(sym, c_, when, fast, slow, prev_fast, prev_slow)
+        return
+
+    if mtype == "history":
+        his = msg.get("history") or {}
+        sym = his.get("symbol")
+        prices = his.get("prices") or []
+        times = his.get("times") or []
+        if sym and prices and times and len(prices) == len(times):
+            with STATE_LOCK:
+                ensure_symbol_state(sym)
+                CANDLES[sym].clear()
+                for p, t in zip(prices, times):
+                    close = safe_float(p)
+                    if close is None:
+                        continue
+                    dt = to_dt(t)
+                    CANDLES[sym].append((dt, close))
+                    update_sma(sym, close)
+                    update_bb(sym, close)
+        return
+
+def ws_thread_target(symbols):
+    if asyncio is None:
+        logger.error("asyncio/websockets not available; cannot start WS thread.")
+        return
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(deriv_stream(symbols))
+
+
+# Fire startup & hooks
 startup_event()
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGINT, shutdown)
