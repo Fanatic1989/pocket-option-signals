@@ -1,23 +1,23 @@
 # app.py
-# Pocket Option Signals — full app + live control panel (dashboard)
-# - All prior features preserved:
-#   * Telegram minimal messages (app name, GBP/USD — CALL/PUT, Candle 1m | Expiry 5m, UTC time)
-#   * Trinidad market-hours gate (Mon–Fri 08:00–17:00 local)
-#   * Tiers & quotas per LOCAL day (FREE=3, BASIC=6, PRO=15, VIP unlimited)
-#   * Strategies: TREND (SMA+ATR slope), CHOP (BB mean revert), BASE (pullback cross)
-#   * Per-symbol cooldown
-#   * Deriv WS candles with "end":"latest"
-#   * DB (Postgres or SQLite) with local-date tallies
-#   * /metrics + /dashboard
-# - NEW:
-#   * Settings persisted in DB (env only as defaults)
-#   * Dashboard control panel to edit settings
-#   * ADMIN_TOKEN guard (read-only if missing/wrong)
-#   * Apply changes live & restart WS stream safely
+# Pocket Option Signals — live control panel + built-in backtesting simulator
+# - Live features:
+#   * Telegram minimal messages (safe HTML)
+#   * Trinidad market-hours gate (Mon–Fri, 08:00–17:00 local)
+#   * Tiers per LOCAL day (FREE/BASIC/PRO; VIP unlimited)
+#   * TREND / CHOP / BASE strategies, cooldown, Deriv WS ("end":"latest")
+#   * Settings persisted in DB; ENV are defaults
+#   * Dashboard control panel (symbols, candle/expiry/cooldown, strategy params, tier caps, trading window)
+# - Backtesting Simulator:
+#   * On-dashboard form (symbol/date range/params)
+#   * Runs TREND→CHOP→BASE logic on historical 1m candles from Deriv WS
+#   * Summary + per-strategy stats + last 50 trades table
+#   * CSV download of full trade list
+#   * Admin token required for execution
+#   * Range capped by BACKTEST_MAX_DAYS (default 31; editable in settings)
 
-import os, sys, json, time, ssl, signal, logging, threading, html
+import os, sys, json, time, ssl, signal, logging, threading, html, io, csv
 from math import sqrt
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, date, timedelta, time as dtime, timezone
 from collections import deque, defaultdict
 from zoneinfo import ZoneInfo
 
@@ -43,7 +43,7 @@ def _bootstrap_env():
 _bootstrap_env()
 
 import requests
-from flask import Flask, jsonify, Response, render_template_string, request as flask_request, redirect, url_for
+from flask import Flask, jsonify, Response, render_template_string, request as flask_request, redirect, url_for, send_file, make_response
 
 # Optional Postgres/SQLite
 try:
@@ -61,19 +61,16 @@ except Exception:
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ---------- DEFAULT CONFIG (env as defaults; DB overrides at runtime) ----------
+# ---------- DEFAULT CONFIG (ENV defaults; DB overrides at runtime) ----------
 APP_NAME      = os.getenv("APP_NAME", "Pocket Option Signals")
-ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")  # required for write access to dashboard
+ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")  # required to edit settings / run backtests
 
-# Symbols
 DEFAULT_SYMBOLS = os.getenv("SYMBOLS", "frxAUDCAD,frxEURUSD,frxGBPUSD").replace(" ","").split(",")
 
-# Deriv
 DERIV_APP_ID    = os.getenv("DERIV_APP_ID", "99185")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN", "")
 
-# Engine
-CANDLE_GRANULARITY = int(os.getenv("CANDLE_GRANULARITY", "60"))  # seconds
+CANDLE_GRANULARITY = int(os.getenv("CANDLE_GRANULARITY", "60"))
 CANDLE_HISTORY     = int(os.getenv("CANDLE_HISTORY", "200"))
 
 SMA_FAST       = int(os.getenv("SMA_FAST", "9"))
@@ -81,17 +78,13 @@ SMA_SLOW       = int(os.getenv("SMA_SLOW", "21"))
 PULLBACK_MIN   = float(os.getenv("PULLBACK_MIN", "0.00010"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "120"))
 
-# Global caps (kept huge; tiers govern in practice)
 DAILY_SIGNAL_LIMIT       = int(os.getenv("DAILY_SIGNAL_LIMIT", "1000000"))
 PER_SYMBOL_DAILY_LIMIT   = int(os.getenv("PER_SYMBOL_DAILY_LIMIT", "1000000"))
 
-# Tier limits per LOCAL day
 FREE_DAILY_LIMIT  = int(os.getenv("FREE_DAILY_LIMIT",  "3"))
 BASIC_DAILY_LIMIT = int(os.getenv("BASIC_DAILY_LIMIT", "6"))
 PRO_DAILY_LIMIT   = int(os.getenv("PRO_DAILY_LIMIT",   "15"))
-# VIP unlimited
 
-# Strategy toggles & params
 ENABLE_TRENDING = os.getenv("ENABLE_TRENDING", "1") == "1"
 ENABLE_CHOPPY   = os.getenv("ENABLE_CHOPPY", "1") == "1"
 
@@ -100,17 +93,16 @@ BB_WINDOW      = int(os.getenv("BB_WINDOW", "20"))
 BB_STD_MULT    = float(os.getenv("BB_STD_MULT", "1.0"))
 SLOPE_ATR_MULT = float(os.getenv("SLOPE_ATR_MULT", "0.20"))
 
-# Message timing labels
 CANDLE_MIN = int(os.getenv("CANDLE_MIN", "1"))
 EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "5"))
 
-# Local market-hours (Trinidad default)
-TRADING_TZ         = os.getenv("TRADING_TZ", "America/Port_of_Spain")  # UTC-4, no DST
+TRADING_TZ         = os.getenv("TRADING_TZ", "America/Port_of_Spain")
 LOCAL_TRADING_DAYS = [d.strip() for d in os.getenv("LOCAL_TRADING_DAYS", "Mon-Fri").split(",") if d.strip()]
 LOCAL_START_LOCAL  = os.getenv("LOCAL_TRADING_START", "08:00")
 LOCAL_END_LOCAL    = os.getenv("LOCAL_TRADING_END",   "17:00")
 
-# Telegram
+BACKTEST_MAX_DAYS  = int(os.getenv("BACKTEST_MAX_DAYS", "31"))  # safe cap for UI
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 def _parse_ids(val: str):
@@ -122,15 +114,8 @@ TELEGRAM_FREE   = _parse_ids(os.getenv("TELEGRAM_CHAT_FREE",  ""))
 TELEGRAM_BASIC  = _parse_ids(os.getenv("TELEGRAM_CHAT_BASIC", ""))
 TELEGRAM_PRO    = _parse_ids(os.getenv("TELEGRAM_CHAT_PRO",   ""))
 TELEGRAM_VIP    = _parse_ids(os.getenv("TELEGRAM_CHAT_VIP",   ""))
-TELEGRAM_ALL    = []
-for _grp in (TELEGRAM_FREE, TELEGRAM_BASIC, TELEGRAM_PRO, TELEGRAM_VIP):
-    for _id in _grp:
-        if _id not in TELEGRAM_ALL:
-            TELEGRAM_ALL.append(_id)
 
-# Server / logging
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DB_TIMEOUT   = 10
 PORT         = int(os.getenv("PORT", "8000"))
 ENV          = os.getenv("ENV", "production")
 LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -145,10 +130,12 @@ logger = app.logger
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.info(f"{APP_NAME} starting…")
 
-# ---------- UTILS ----------
+# ---------- UTIL ----------
 def tz_obj():
-    try: return ZoneInfo(get_setting("TRADING_TZ", TRADING_TZ))
-    except Exception: return ZoneInfo(TRADING_TZ)
+    try:
+        return ZoneInfo(get_setting("TRADING_TZ", TRADING_TZ))
+    except Exception:
+        return ZoneInfo(TRADING_TZ)
 
 TT_TZ = tz_obj()
 
@@ -161,23 +148,6 @@ def now_local(): return now_utc().astimezone(TT_TZ)
 def fmt_dt(dt): return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC") if dt else "—"
 
 def weekday_name(i): return ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][i]
-
-def expand_day_tokens(tokens):
-    ref = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    days = set()
-    for token in tokens:
-        if "-" in token:
-            a,b = token.split("-",1)
-            ia, ib = ref.index(a), ref.index(b)
-            rng = ref[ia:ib+1] if ia<=ib else ref[ia:]+ref[:ib+1]
-            days.update(rng)
-        else:
-            days.add(token)
-    return days
-
-def parse_hhmm_local(s: str):
-    hh, mm = s.split(":")
-    return dtime(int(hh), int(mm), tzinfo=TT_TZ)
 
 def pretty_symbol(sym: str):
     if sym.startswith("frx") and len(sym) == 8:
@@ -204,11 +174,11 @@ class DB:
             if self._conn: return
             if self.is_pg:
                 if psycopg2 is None: raise RuntimeError("psycopg2 not available")
-                self._conn = psycopg2.connect(self.url, connect_timeout=DB_TIMEOUT, sslmode="require")
+                self._conn = psycopg2.connect(self.url, connect_timeout=10, sslmode="require")
                 self._conn.autocommit = True
             else:
                 path = self.url if self.url else "signals.db"
-                self._conn = sqlite3.connect(path, check_same_thread=False, timeout=DB_TIMEOUT)
+                self._conn = sqlite3.connect(path, check_same_thread=False, timeout=10)
                 self._conn.row_factory = sqlite3.Row
     def execute(self, sql, params=None, fetch=False, many=False):
         params = params or ()
@@ -226,7 +196,6 @@ class DB:
             finally:
                 cur.close()
     def _init_schema(self):
-        # signals/tallies/quotas
         if self.is_pg:
             self.execute("""CREATE TABLE IF NOT EXISTS signals(
                 id BIGSERIAL PRIMARY KEY, symbol TEXT, direction TEXT, price DOUBLE PRECISION,
@@ -247,12 +216,15 @@ class DB:
             self.execute("""CREATE TABLE IF NOT EXISTS quotas(
                 dt TEXT NOT NULL, symbol TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(dt, symbol));""")
-        # NEW: settings
+        # Settings table
         self.execute("""CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY,
-            value TEXT
+            key TEXT PRIMARY KEY, value TEXT
         );""")
-    # tallies / quotas
+        # Backtest cache (optional, store CSVs by key)
+        self.execute("""CREATE TABLE IF NOT EXISTS backtest_cache(
+            id TEXT PRIMARY KEY, created_ts TEXT NOT NULL, summary TEXT NOT NULL, csv BLOB
+        );""")
+    # Tallies/quotas
     def inc_tally(self, kind: str, amount=1, ts: datetime=None):
         dt = local_day_key(ts)
         if self.is_pg:
@@ -291,7 +263,7 @@ class DB:
         rows = self.execute(("SELECT SUM(sent) AS total FROM quotas WHERE dt=?;") if not self.is_pg
                             else ("SELECT SUM(sent) AS total FROM quotas WHERE dt=%s;"), (dt,), fetch=True)
         return int(rows[0]["total"]) if rows and rows[0]["total"] is not None else 0
-    # settings
+    # Settings
     def set_setting(self, key: str, value: str):
         if self.is_pg:
             self.execute("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;", (key, value))
@@ -304,12 +276,18 @@ class DB:
     def get_all_settings(self):
         rows = self.execute("SELECT key, value FROM settings;", fetch=True)
         return {r["key"]: r["value"] for r in rows} if rows else {}
+    # Backtest cache
+    def put_backtest(self, key: str, summary: dict, csv_bytes: bytes):
+        self.execute("INSERT OR REPLACE INTO backtest_cache(id,created_ts,summary,csv) VALUES(?,?,?,?);",
+                     (key, datetime.utcnow().isoformat(), json.dumps(summary), sqlite3.Binary(csv_bytes)))
+    def get_backtest(self, key: str):
+        rows = self.execute("SELECT summary,csv FROM backtest_cache WHERE id=?;", (key,), fetch=True)
+        if not rows: return None, None
+        return json.loads(rows[0]["summary"]), rows[0]["csv"]
 
 DBH = DB(DATABASE_URL)
 
 # ---------- SETTINGS HELPERS ----------
-SET_LOCK = threading.Lock()
-
 def get_setting(key, default_val):
     v = DBH.get_setting(key)
     return v if v is not None else default_val
@@ -392,8 +370,8 @@ def ensure_symbol_state(sym):
 
 # ---------- TELEGRAM ----------
 def tg_send_to(chat_ids, text: str):
-    if not get_setting("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN) or not chat_ids: return
     token = get_setting("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
+    if not token or not chat_ids: return
     for cid in chat_ids:
         try:
             r = requests.post(
@@ -456,7 +434,6 @@ def tier_remaining():
     }
 
 def choose_tier_targets():
-    # Chat IDs read from ENV at boot; allow overriding via settings if desired (optional)
     ids_free  = TELEGRAM_FREE
     ids_basic = TELEGRAM_BASIC
     ids_pro   = TELEGRAM_PRO
@@ -550,7 +527,7 @@ def maybe_emit_base(sym, close_price, when, fast, slow, prev_fast, prev_slow):
     direction = "CALL" if crossed_up else "PUT"
     send_signal(sym, direction, close_price, when, f"BASE:SMA{get_int('SMA_FAST',SMA_FAST)}/{get_int('SMA_SLOW',SMA_SLOW)}+Pullback")
 
-# ---------- DERIV WS ----------
+# ---------- DERIV WS (Live) ----------
 async def deriv_stream(symbols):
     if websockets is None:
         logger.error("websockets lib not available; streaming disabled"); return
@@ -572,7 +549,6 @@ async def deriv_stream(symbols):
                 gran = get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY)
                 count_hist = max(get_int("SMA_SLOW", SMA_SLOW) * 2, 60)
 
-                # Subscribe per symbol
                 for s in symbols:
                     sub = {
                         "ticks_history": s,
@@ -616,7 +592,7 @@ async def handle_deriv_message(msg: dict):
             mean, std = update_bb(sym, c_)
             atr = update_atr(sym, h_, l_, c_)
 
-        if prev_epoch is not None and epoch == prev_epoch: return  # ignore interim
+        if prev_epoch is not None and epoch == prev_epoch: return
 
         maybe_emit_trend(sym, c_, when, fast, slow, prev_fast, prev_slow, atr)
         maybe_emit_chop(sym, c_, when, mean, std, slow, prev_slow, atr)
@@ -645,9 +621,7 @@ WS_THREAD = None
 def start_ws_thread(symbols):
     global WS_THREAD
     with WS_LOCK:
-        if WS_THREAD and WS_THREAD.is_alive():
-            logger.info("WS thread already running")
-            return
+        if WS_THREAD and WS_THREAD.is_alive(): return
         if asyncio is None:
             logger.error("asyncio/websockets not available; cannot start WS thread."); return
         def _target():
@@ -657,29 +631,13 @@ def start_ws_thread(symbols):
         WS_THREAD.start()
         logger.info(f"WS thread started for symbols: {symbols}")
 
-def stop_ws_thread():
-    global WS_THREAD
-    with WS_LOCK:
-        if WS_THREAD and WS_THREAD.is_alive():
-            # Soft stop: set STOP_EVENT and wait a moment; new start will clear
-            # Here we just replace STOP_EVENT logic by restart flag:
-            pass  # The stream loop restarts on reconnect anyway
-        # We don't forcibly kill thread (Python doesn't support); we rely on new subscriptions
-
 def restart_ws_thread():
-    # Re-subscribe by starting a new thread with new symbol list;
-    # The old connection will naturally drop if we rotate process;
-    # For this app, we keep one thread and rely on reconnect – simplest is to just start if dead.
-    # To enforce new subscriptions, we reboot the process if needed, but here we'll log + rely on new state.
-    logger.info("Requested WS restart — attempting soft refresh")
-    # The simplest safe approach: nothing to kill; we start a fresh thread if none:
+    logger.info("Requested WS restart — soft-refresh")
     if not (WS_THREAD and WS_THREAD.is_alive()):
         start_ws_thread(get_symbols())
-    # Also clear rolling state so new params apply cleanly
     with STATE_LOCK:
-        ROLLING.clear()
-        for s in get_symbols():
-            ensure_symbol_state(s)
+        ROLLING.clear(); CANDLES.clear(); LAST_EPOCH.clear(); LAST_SIGNAL_AT.clear()
+        for s in get_symbols(): ensure_symbol_state(s)
     logger.info("WS soft-refresh done")
 
 # ---------- SCHED ----------
@@ -699,15 +657,233 @@ SCHED.add_job(housekeeping, CronTrigger(second="*/30"))
 SCHED.start()
 logger.info("Scheduler started.")
 
-# ---------- UI (Dashboard & Metrics) ----------
+# ---------- ADMIN ----------
 def admin_ok(req):
     need = ADMIN_TOKEN or DBH.get_setting("ADMIN_TOKEN")
     supplied = req.args.get("token") or req.form.get("token") or req.headers.get("X-Admin-Token","")
-    if not need:
-        # if no token set at all, lock write access (read-only)
-        return False
+    if not need: return False
     return supplied == need
 
+def current_settings_snapshot():
+    return {
+        "SYMBOLS": ",".join(get_symbols()),
+        "LOCAL_TRADING_DAYS": get_setting("LOCAL_TRADING_DAYS", ",".join(LOCAL_TRADING_DAYS)),
+        "LOCAL_TRADING_START": get_setting("LOCAL_TRADING_START", LOCAL_START_LOCAL),
+        "LOCAL_TRADING_END": get_setting("LOCAL_TRADING_END", LOCAL_END_LOCAL),
+        "CANDLE_GRANULARITY": str(get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY)),
+        "COOLDOWN_SECONDS": str(get_int("COOLDOWN_SECONDS", COOLDOWN_SECONDS)),
+        "CANDLE_MIN": str(get_int("CANDLE_MIN", CANDLE_MIN)),
+        "EXPIRY_MIN": str(get_int("EXPIRY_MIN", EXPIRY_MIN)),
+        "ENABLE_TRENDING": "1" if get_bool("ENABLE_TRENDING", ENABLE_TRENDING) else "0",
+        "SMA_FAST": str(get_int("SMA_FAST", SMA_FAST)),
+        "SMA_SLOW": str(get_int("SMA_SLOW", SMA_SLOW)),
+        "ENABLE_CHOPPY": "1" if get_bool("ENABLE_CHOPPY", ENABLE_CHOPPY) else "0",
+        "BB_WINDOW": str(get_int("BB_WINDOW", BB_WINDOW)),
+        "BB_STD_MULT": str(get_float("BB_STD_MULT", BB_STD_MULT)),
+        "ATR_WINDOW": str(get_int("ATR_WINDOW", ATR_WINDOW)),
+        "SLOPE_ATR_MULT": str(get_float("SLOPE_ATR_MULT", SLOPE_ATR_MULT)),
+        "PULLBACK_MIN": str(get_float("PULLBACK_MIN", PULLBACK_MIN)),
+        "FREE_DAILY_LIMIT": str(get_int("FREE_DAILY_LIMIT", FREE_DAILY_LIMIT)),
+        "BASIC_DAILY_LIMIT": str(get_int("BASIC_DAILY_LIMIT", BASIC_DAILY_LIMIT)),
+        "PRO_DAILY_LIMIT": str(get_int("PRO_DAILY_LIMIT", PRO_DAILY_LIMIT)),
+        "TRADING_TZ": get_setting("TRADING_TZ", TRADING_TZ),
+        "BACKTEST_MAX_DAYS": str(get_int("BACKTEST_MAX_DAYS", BACKTEST_MAX_DAYS)),
+    }
+
+def save_settings_from_form(form):
+    for k in [
+        "SYMBOLS","LOCAL_TRADING_DAYS","LOCAL_TRADING_START","LOCAL_TRADING_END",
+        "CANDLE_GRANULARITY","COOLDOWN_SECONDS","CANDLE_MIN","EXPIRY_MIN",
+        "ENABLE_TRENDING","SMA_FAST","SMA_SLOW","ENABLE_CHOPPY","BB_WINDOW","BB_STD_MULT",
+        "ATR_WINDOW","SLOPE_ATR_MULT","PULLBACK_MIN",
+        "FREE_DAILY_LIMIT","BASIC_DAILY_LIMIT","PRO_DAILY_LIMIT","TRADING_TZ",
+        "BACKTEST_MAX_DAYS"
+    ]:
+        if k in form:
+            DBH.set_setting(k, str(form.get(k)).strip())
+
+# ---------- BACKTEST (Core) ----------
+def decide_for_backtest(close_price, high, low, state, params):
+    # state: dict with sma/atr/bb deques and prevs; params: dict of ints/floats/bools
+    # Update indicators
+    # SMA
+    if len(state["fast"]) == state["fast"].maxlen: state["sum_fast"] -= state["fast"][0]
+    state["fast"].append(close_price); state["sum_fast"] += close_price
+    fast = state["sum_fast"]/len(state["fast"])
+    if len(state["slow"]) == state["slow"].maxlen: state["sum_slow"] -= state["slow"][0]
+    state["slow"].append(close_price); state["sum_slow"] += close_price
+    slow = state["sum_slow"]/len(state["slow"])
+    prev_fast, prev_slow = state["prev_fast"], state["prev_slow"]
+    state["prev_fast"], state["prev_slow"] = fast, slow
+    # BB
+    if len(state["closes"]) == state["closes"].maxlen:
+        old=state["closes"][0]; state["sum_close"]-=old; state["sumsq_close"]-=old*old
+    state["closes"].append(close_price); state["sum_close"]+=close_price; state["sumsq_close"]+=close_price*close_price
+    n=len(state["closes"]); mean=None; std=None
+    if n>0:
+        mean=state["sum_close"]/n; var=max(state["sumsq_close"]/n - mean*mean, 0.0); std=var**0.5
+    # ATR
+    pc = state["prev_close"]
+    tr = abs(high-low) if pc is None else max(abs(high-low), abs(high-pc), abs(low-pc))
+    if len(state["trs"]) == state["trs"].maxlen: state["sum_tr"] -= state["trs"][0]
+    state["trs"].append(tr); state["sum_tr"] += tr; state["prev_close"] = close_price
+    atr = (state["sum_tr"]/len(state["trs"])) if len(state["trs"])>0 else None
+
+    # TREND
+    if params["ENABLE_TRENDING"] and len(state["slow"])>=params["SMA_SLOW"] and atr is not None:
+        slope = abs(slow - (prev_slow if prev_slow is not None else slow))
+        slope_thresh = params["SLOPE_ATR_MULT"] * atr
+        trending = slope >= slope_thresh and abs(close_price - slow) >= (0.25*atr if atr and atr>0 else params["PULLBACK_MIN"])
+        if trending:
+            up = prev_fast is not None and prev_slow is not None and prev_fast <= prev_slow and fast > slow
+            dn = prev_fast is not None and prev_slow is not None and prev_fast >= prev_slow and fast < slow
+            if up:  return "CALL","TREND",fast,slow,mean,std,atr
+            if dn:  return "PUT","TREND",fast,slow,mean,std,atr
+
+    # CHOP
+    if params["ENABLE_CHOPPY"] and mean is not None and std is not None and prev_slow is not None and atr is not None:
+        slope = abs(slow - prev_slow)
+        if slope < params["SLOPE_ATR_MULT"] * atr:
+            upper = mean + params["BB_STD_MULT"]*std; lower = mean - params["BB_STD_MULT"]*std
+            if close_price >= upper: return "PUT","CHOP",fast,slow,mean,std,atr
+            if close_price <= lower: return "CALL","CHOP",fast,slow,mean,std,atr
+
+    # BASE
+    if len(state["slow"])>=params["SMA_SLOW"]:
+        up = prev_fast is not None and prev_slow is not None and prev_fast <= prev_slow and fast > slow
+        dn = prev_fast is not None and prev_slow is not None and prev_fast >= prev_slow and fast < slow
+        if up and abs(close_price - slow) >= params["PULLBACK_MIN"]: return "CALL","BASE",fast,slow,mean,std,atr
+        if dn and abs(close_price - slow) >= params["PULLBACK_MIN"]: return "PUT","BASE",fast,slow,mean,std,atr
+
+    return None, None, fast, slow, mean, std, atr
+
+async def fetch_candles_range(symbol: str, start_epoch: int, end_epoch: int, gran: int, app_id: str, token: str=""):
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={app_id}"
+    out = []
+    ssl_ctx = ssl.create_default_context()
+    async with websockets.connect(uri, ssl=ssl_ctx, ping_interval=20, ping_timeout=20, max_queue=1024) as ws:
+        if token:
+            await ws.send(json.dumps({"authorize": token}))
+            auth = json.loads(await ws.recv())
+            if "error" in auth: raise RuntimeError(f"Authorize error: {auth['error']}")
+
+        CHUNK = 7*86400
+        s = start_epoch
+        while s < end_epoch:
+            e = min(s + CHUNK, end_epoch)
+            req = {"ticks_history": symbol, "style": "candles", "granularity": gran, "start": s, "end": e}
+            await ws.send(json.dumps(req))
+            resp = json.loads(await ws.recv())
+            if "error" in resp: raise RuntimeError(str(resp["error"]))
+            candles = []
+            if "candles" in resp:
+                candles = resp["candles"]
+            elif "history" in resp and "prices" in resp["history"]:
+                prices=resp["history"]["prices"]; times=resp["history"]["times"]
+                candles = [{"open":p,"high":p,"low":p,"close":p,"epoch":t} for p,t in zip(prices,times)]
+            out.extend(candles)
+            s = e
+            await asyncio.sleep(0.03)
+    # dedup/sort
+    seen=set(); cleaned=[]
+    for c in out:
+        ep=int(c["epoch"])
+        if ep in seen: continue
+        seen.add(ep); cleaned.append(c)
+    cleaned.sort(key=lambda x: int(x["epoch"]))
+    return cleaned
+
+def eval_trade_result(direction, entry_close, expiry_close, tie_is_win=False):
+    if direction=="CALL":
+        if expiry_close>entry_close: return +1
+        if expiry_close==entry_close: return (+1 if tie_is_win else 0)
+        return -1
+    else:
+        if expiry_close<entry_close: return +1
+        if expiry_close==entry_close: return (+1 if tie_is_win else 0)
+        return -1
+
+def run_backtest_sync(symbol: str, start_iso: str, end_iso: str, params: dict, csv_limit=None, tie_is_win=False):
+    # dates are UTC
+    start_dt = datetime.fromisoformat(start_iso)
+    if start_dt.tzinfo is None: start_dt = start_dt.replace(tzinfo=UTC)
+    end_dt = datetime.fromisoformat(end_iso)
+    if end_dt.tzinfo is None: end_dt = end_dt.replace(hour=23, minute=59, second=59, tzinfo=UTC)
+    # range cap
+    max_days = get_int("BACKTEST_MAX_DAYS", BACKTEST_MAX_DAYS)
+    if (end_dt - start_dt).days > max_days:
+        raise ValueError(f"Range too large. Max {max_days} days.")
+
+    start_epoch, end_epoch = int(start_dt.timestamp()), int(end_dt.timestamp())
+    # fetch candles
+    if asyncio is None or websockets is None:
+        raise RuntimeError("websockets/asyncio not available on server")
+    candles = asyncio.run(fetch_candles_range(
+        symbol, start_epoch, end_epoch, params["CANDLE_GRANULARITY"],
+        get_setting("DERIV_APP_ID", DERIV_APP_ID), get_setting("DERIV_API_TOKEN", DERIV_API_TOKEN)
+    ))
+
+    # backtest
+    state = {
+        "fast": deque(maxlen=params["SMA_FAST"]), "sum_fast":0.0,
+        "slow": deque(maxlen=params["SMA_SLOW"]), "sum_slow":0.0,
+        "prev_fast": None, "prev_slow": None,
+        "closes": deque(maxlen=params["BB_WINDOW"]), "sum_close":0.0, "sumsq_close":0.0,
+        "trs": deque(maxlen=params["ATR_WINDOW"]), "sum_tr":0.0, "prev_close": None
+    }
+
+    closes = [c for c in candles if c.get("close") is not None]
+    trades = []
+    wins=losses=ties=0
+    per_strat = defaultdict(lambda: {"wins":0,"losses":0,"ties":0,"count":0})
+
+    for i, c in enumerate(closes):
+        when = to_dt(c["epoch"]); close = safe_float(c["close"])
+        high = safe_float(c.get("high"), close); low = safe_float(c.get("low"), close)
+        direction, strat, *_ = decide_for_backtest(close, high, low, state, params)
+        if direction:
+            expiry_idx = min(i + params["EXPIRY_MIN"], len(closes)-1)
+            expiry_close = safe_float(closes[expiry_idx]["close"], close)
+            r = eval_trade_result(direction, close, expiry_close, tie_is_win=tie_is_win)
+            if r>0: wins+=1; per_strat[strat]["wins"]+=1
+            elif r<0: losses+=1; per_strat[strat]["losses"]+=1
+            else: ties+=1; per_strat[strat]["ties"]+=1
+            per_strat[strat]["count"]+=1
+            trades.append({
+                "time_utc": when.strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": symbol, "symbol_pretty": pretty_symbol(symbol),
+                "strategy": strat, "direction": direction,
+                "entry": f"{close:.6f}", "expiry_min": params["EXPIRY_MIN"],
+                "expiry_close": f"{expiry_close:.6f}",
+                "result": "WIN" if r>0 else ("LOSS" if r<0 else "TIE")
+            })
+
+    total = wins + losses + ties
+    winrate = (wins / (wins + losses) * 100) if (wins+losses)>0 else 0.0
+    strat_stats = {}
+    for s in ("TREND","CHOP","BASE"):
+        st = per_strat[s]; w,l = st["wins"], st["losses"]
+        strat_stats[s] = {
+            "count": st["count"], "wins": w, "losses": l, "ties": st["ties"],
+            "winrate": (w/(w+l)*100) if (w+l)>0 else 0.0
+        }
+
+    # CSV (optional return full list; UI shows last 50)
+    csv_buf = io.StringIO()
+    writer = csv.DictWriter(csv_buf, fieldnames=["time_utc","symbol","symbol_pretty","strategy","direction","entry","expiry_min","expiry_close","result"])
+    writer.writeheader(); writer.writerows(trades)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    summary = {
+        "symbol": symbol, "symbol_pretty": pretty_symbol(symbol),
+        "start": start_dt.strftime("%Y-%m-%d %H:%M"), "end": end_dt.strftime("%Y-%m-%d %H:%M"),
+        "granularity": params["CANDLE_GRANULARITY"], "expiry": params["EXPIRY_MIN"],
+        "signals": total, "wins": wins, "losses": losses, "ties": ties, "winrate": round(winrate,2),
+        "per_strategy": strat_stats
+    }
+    return summary, trades, csv_bytes
+
+# ---------- UI (Dashboard / Backtest / Metrics) ----------
 DASHBOARD_HTML = """
 <!doctype html><html><head><meta charset="utf-8"/>
 <title>{{ app_name }} Dashboard</title>
@@ -758,7 +934,7 @@ small{color:#94a3b8}
     <textarea name="SYMBOLS" rows="3" {{ 'disabled' if not can_edit else '' }}>{{ current.SYMBOLS }}</textarea>
   </div>
   <div>
-    <label>Trading Days (e.g., Mon-Fri or Mon,Wed,Fri or *)</label>
+    <label>Trading Days (Mon-Fri, Mon,Wed,Fri or *)</label>
     <input type="text" name="LOCAL_TRADING_DAYS" value="{{ current.LOCAL_TRADING_DAYS }}" {{ 'disabled' if not can_edit else '' }}/>
     <label>Local Start (HH:MM)</label>
     <input type="text" name="LOCAL_TRADING_START" value="{{ current.LOCAL_TRADING_START }}" {{ 'disabled' if not can_edit else '' }}/>
@@ -837,6 +1013,8 @@ small{color:#94a3b8}
   <div>
     <label>Trading Timezone (IANA)</label>
     <input type="text" name="TRADING_TZ" value="{{ current.TRADING_TZ }}" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Backtest Max Days</label>
+    <input type="number" name="BACKTEST_MAX_DAYS" value="{{ current.BACKTEST_MAX_DAYS }}" min="1" step="1" {{ 'disabled' if not can_edit else '' }}/>
   </div>
 </div>
 
@@ -846,46 +1024,116 @@ small{color:#94a3b8}
 {% endif %}
 </form>
 </div>
+
+<div class="card">
+<h3>Backtesting Simulator {% if not can_edit %}<small>(read-only: add ?token=YOUR_TOKEN)</small>{% endif %}</h3>
+<form method="POST" action="{{ url_for('run_backtest') }}">
+<input type="hidden" name="token" value="{{ token }}"/>
+<div class="row">
+  <div>
+    <label>Symbol</label>
+    <select name="symbol" {{ 'disabled' if not can_edit else '' }}>
+      {% for s in symbols %}
+        <option value="{{ s }}">{{ s }}</option>
+      {% endfor %}
+    </select>
+    <label>Start (UTC, YYYY-MM-DD)</label>
+    <input type="text" name="start" placeholder="2025-08-01" {{ 'disabled' if not can_edit else '' }}/>
+    <label>End (UTC, YYYY-MM-DD)</label>
+    <input type="text" name="end" placeholder="2025-09-01" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+  <div>
+    <label>Granularity (seconds)</label>
+    <input type="number" name="gran" value="{{ granularity }}" min="5" step="5" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Expiry (minutes)</label>
+    <input type="number" name="expiry" value="{{ expiry }}" min="1" step="1" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Count tie as win?</label>
+    <select name="tiewin" {{ 'disabled' if not can_edit else '' }}>
+      <option value="0" selected>No</option>
+      <option value="1">Yes</option>
+    </select>
+  </div>
+</div>
+<div class="row">
+  <div>
+    <label>Enable TREND</label>
+    <select name="trend" {{ 'disabled' if not can_edit else '' }}>
+      <option value="1" {{ 'selected' if current.ENABLE_TRENDING=='1' else '' }}>On</option>
+      <option value="0" {{ 'selected' if current.ENABLE_TRENDING=='0' else '' }}>Off</option>
+    </select>
+    <label>SMA Fast / Slow</label>
+    <div class="row">
+      <input type="number" name="sma_fast" value="{{ current.SMA_FAST }}" min="2" step="1" {{ 'disabled' if not can_edit else '' }}/>
+      <input type="number" name="sma_slow" value="{{ current.SMA_SLOW }}" min="3" step="1" {{ 'disabled' if not can_edit else '' }}/>
+    </div>
+  </div>
+  <div>
+    <label>Enable CHOP</label>
+    <select name="chop" {{ 'disabled' if not can_edit else '' }}>
+      <option value="1" {{ 'selected' if current.ENABLE_CHOPPY=='1' else '' }}>On</option>
+      <option value="0" {{ 'selected' if current.ENABLE_CHOPPY=='0' else '' }}>Off</option>
+    </select>
+    <label>BB Window / Std Mult</label>
+    <div class="row">
+      <input type="number" name="bb_win" value="{{ current.BB_WINDOW }}" min="5" step="1" {{ 'disabled' if not can_edit else '' }}/>
+      <input type="number" step="0.1" name="bb_mult" value="{{ current.BB_STD_MULT }}" min="0.1" {{ 'disabled' if not can_edit else '' }}/>
+    </div>
+  </div>
+</div>
+<div class="row">
+  <div>
+    <label>ATR Window</label>
+    <input type="number" name="atr_win" value="{{ current.ATR_WINDOW }}" min="2" step="1" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+  <div>
+    <label>Slope ATR Mult</label>
+    <input type="number" step="0.05" name="slope_mult" value="{{ current.SLOPE_ATR_MULT }}" min="0.05" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Pullback Min</label>
+    <input type="text" name="pullback" value="{{ current.PULLBACK_MIN }}" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+</div>
+{% if can_edit %}
+  <button type="submit">Run Backtest</button>
+{% endif %}
+</form>
+
+{% if backtest %}
+<hr/>
+<h4>Backtest Summary</h4>
+<div><b>Symbol:</b> <code>{{ backtest.summary.symbol }} ({{ backtest.summary.symbol_pretty }})</code>
+ · <b>Period:</b> <code>{{ backtest.summary.start }} → {{ backtest.summary.end }} UTC</code>
+ · <b>Gran:</b> <code>{{ backtest.summary.granularity }}s</code>
+ · <b>Expiry:</b> <code>{{ backtest.summary.expiry }}m</code></div>
+<div style="margin-top:8px"><b>Signals:</b> <code>{{ backtest.summary.signals }}</code>
+ · <b>Wins:</b> <code>{{ backtest.summary.wins }}</code>
+ · <b>Losses:</b> <code>{{ backtest.summary.losses }}</code>
+ · <b>Ties:</b> <code>{{ backtest.summary.ties }}</code>
+ · <b>Winrate:</b> <code>{{ "%.2f"|format(backtest.summary.winrate) }}%</code></div>
+
+<h4 style="margin-top:12px">Per Strategy</h4>
+<table>
+  <tr><th>Strategy</th><th>Count</th><th>Wins</th><th>Losses</th><th>Ties</th><th>Winrate</th></tr>
+  {% for name, s in backtest.summary.per_strategy.items() %}
+    <tr><td>{{ name }}</td><td>{{ s.count }}</td><td>{{ s.wins }}</td><td>{{ s.losses }}</td><td>{{ s.ties }}</td><td>{{ "%.2f"|format(s.winrate) }}%</td></tr>
+  {% endfor %}
+</table>
+
+<h4 style="margin-top:12px">Recent Trades (last 50)</h4>
+<table>
+  <tr><th>Time (UTC)</th><th>Symbol</th><th>Strat</th><th>Dir</th><th>Entry</th><th>Expiry(m)</th><th>Exit</th><th>Result</th></tr>
+  {% for t in backtest.recent %}
+    <tr><td>{{ t.time_utc }}</td><td>{{ t.symbol_pretty }}</td><td>{{ t.strategy }}</td><td>{{ t.direction }}</td><td>{{ t.entry }}</td><td>{{ t.expiry_min }}</td><td>{{ t.expiry_close }}</td><td>{{ t.result }}</td></tr>
+  {% endfor %}
+</table>
+
+<p><a href="{{ url_for('download_backtest_csv', key=backtest.key) }}?token={{ token }}"><button class="secondary" type="button">Download CSV</button></a></p>
+{% endif %}
+</div>
+
 </body></html>
 """
 
-def current_settings_snapshot():
-    return {
-        "SYMBOLS": ",".join(get_symbols()),
-        "LOCAL_TRADING_DAYS": get_setting("LOCAL_TRADING_DAYS", ",".join(LOCAL_TRADING_DAYS)),
-        "LOCAL_TRADING_START": get_setting("LOCAL_TRADING_START", LOCAL_START_LOCAL),
-        "LOCAL_TRADING_END": get_setting("LOCAL_TRADING_END", LOCAL_END_LOCAL),
-        "CANDLE_GRANULARITY": str(get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY)),
-        "COOLDOWN_SECONDS": str(get_int("COOLDOWN_SECONDS", COOLDOWN_SECONDS)),
-        "CANDLE_MIN": str(get_int("CANDLE_MIN", CANDLE_MIN)),
-        "EXPIRY_MIN": str(get_int("EXPIRY_MIN", EXPIRY_MIN)),
-        "ENABLE_TRENDING": "1" if get_bool("ENABLE_TRENDING", ENABLE_TRENDING) else "0",
-        "SMA_FAST": str(get_int("SMA_FAST", SMA_FAST)),
-        "SMA_SLOW": str(get_int("SMA_SLOW", SMA_SLOW)),
-        "ENABLE_CHOPPY": "1" if get_bool("ENABLE_CHOPPY", ENABLE_CHOPPY) else "0",
-        "BB_WINDOW": str(get_int("BB_WINDOW", BB_WINDOW)),
-        "BB_STD_MULT": str(get_float("BB_STD_MULT", BB_STD_MULT)),
-        "ATR_WINDOW": str(get_int("ATR_WINDOW", ATR_WINDOW)),
-        "SLOPE_ATR_MULT": str(get_float("SLOPE_ATR_MULT", SLOPE_ATR_MULT)),
-        "PULLBACK_MIN": str(get_float("PULLBACK_MIN", PULLBACK_MIN)),
-        "FREE_DAILY_LIMIT": str(get_int("FREE_DAILY_LIMIT", FREE_DAILY_LIMIT)),
-        "BASIC_DAILY_LIMIT": str(get_int("BASIC_DAILY_LIMIT", BASIC_DAILY_LIMIT)),
-        "PRO_DAILY_LIMIT": str(get_int("PRO_DAILY_LIMIT", PRO_DAILY_LIMIT)),
-        "TRADING_TZ": get_setting("TRADING_TZ", TRADING_TZ),
-    }
-
-def save_settings_from_form(form):
-    mutable_keys = [
-        "SYMBOLS","LOCAL_TRADING_DAYS","LOCAL_TRADING_START","LOCAL_TRADING_END",
-        "CANDLE_GRANULARITY","COOLDOWN_SECONDS","CANDLE_MIN","EXPIRY_MIN",
-        "ENABLE_TRENDING","SMA_FAST","SMA_SLOW","ENABLE_CHOPPY","BB_WINDOW","BB_STD_MULT",
-        "ATR_WINDOW","SLOPE_ATR_MULT","PULLBACK_MIN",
-        "FREE_DAILY_LIMIT","BASIC_DAILY_LIMIT","PRO_DAILY_LIMIT","TRADING_TZ"
-    ]
-    for k in mutable_keys:
-        if k in form:
-            DBH.set_setting(k, str(form.get(k)).strip())
-
+# ---------- ROUTES ----------
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
@@ -921,11 +1169,15 @@ def root():
             "vip": None
         },
         "granularity_sec": get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY),
-        "message_times": {"candle_min": get_int("CANDLE_MIN", CANDLE_MIN), "expiry_min": get_int("EXPIRY_MIN", EXPIRY_MIN)},
+        "message_times": {
+            "candle_min": get_int("CANDLE_MIN", CANDLE_MIN),
+            "expiry_min": get_int("EXPIRY_MIN", EXPIRY_MIN)
+        },
         "strategies": {
             "trend": get_bool("ENABLE_TRENDING", ENABLE_TRENDING),
             "chop": get_bool("ENABLE_CHOPPY", ENABLE_CHOPPY), "base": True
         },
+        "backtest_max_days": get_int("BACKTEST_MAX_DAYS", BACKTEST_MAX_DAYS),
         "app_id": get_setting("DERIV_APP_ID", DERIV_APP_ID)
     })
 
@@ -937,19 +1189,28 @@ def dashboard():
         if not can_edit:
             return redirect(url_for("dashboard"))
         save_settings_from_form(flask_request.form)
-        # refresh TZ object
         global TT_TZ; TT_TZ = tz_obj()
         return redirect(url_for("dashboard", token=token))
 
-    # candles table
     with STATE_LOCK:
         candles_map = {}
         for s in get_symbols():
-            items = list(CANDLES[s])
-            trimmed = items[-10:]
+            items = list(CANDLES[s]); trimmed = items[-10:]
             candles_map[s] = [(fmt_dt(dt), c) for (dt, c) in trimmed]
 
     current = current_settings_snapshot()
+    # If there was a recent backtest key in querystring, load & show
+    bt_key = flask_request.args.get("bt","")
+    backtest=None
+    if bt_key:
+        summary, csv_bytes = DBH.get_backtest(bt_key)
+        if summary:
+            # show last 50 trades from csv
+            dec = csv_bytes.decode("utf-8", errors="ignore")
+            rows = list(csv.DictReader(io.StringIO(dec)))
+            recent = rows[-50:]
+            backtest = {"summary": summary, "recent": recent, "key": bt_key}
+
     return render_template_string(
         DASHBOARD_HTML,
         app_name=APP_NAME,
@@ -986,19 +1247,16 @@ def dashboard():
         candles_map=candles_map,
         can_edit=can_edit,
         token=token,
-        current=current
+        current=current,
+        backtest=backtest
     )
 
 @app.route("/apply", methods=["GET"])
 def apply_and_restart():
     if not admin_ok(flask_request):
         return jsonify({"ok": False, "error": "admin token required"}), 403
-    # Clear rolling state so new indicator windows apply, and soft-restart WS if needed
     with STATE_LOCK:
-        ROLLING.clear()
-        CANDLES.clear()
-        LAST_EPOCH.clear()
-        LAST_SIGNAL_AT.clear()
+        ROLLING.clear(); CANDLES.clear(); LAST_EPOCH.clear(); LAST_SIGNAL_AT.clear()
     restart_ws_thread()
     return redirect(url_for("dashboard", token=flask_request.args.get("token","")))
 
@@ -1022,15 +1280,72 @@ def metrics():
         f"trend_enabled {1 if get_bool('ENABLE_TRENDING', ENABLE_TRENDING) else 0}",
         f"chop_enabled {1 if get_bool('ENABLE_CHOPPY', ENABLE_CHOPPY) else 0}",
         f"cooldown_seconds {get_int('COOLDOWN_SECONDS', COOLDOWN_SECONDS)}",
+        f"backtest_max_days {get_int('BACKTEST_MAX_DAYS', BACKTEST_MAX_DAYS)}",
     ]
     return Response("\n".join(lines) + "\n", mimetype="text/plain")
 
+# ---------- Backtest endpoints ----------
+@app.route("/run_backtest", methods=["POST"])
+def run_backtest():
+    if not admin_ok(flask_request):
+        return jsonify({"ok": False, "error": "admin token required"}), 403
+    symbol = flask_request.form.get("symbol", (get_symbols() or ["frxGBPUSD"])[0])
+    start = flask_request.form.get("start","").strip()
+    end   = flask_request.form.get("end","").strip()
+    try:
+        # allow simple dates; add time
+        _ = datetime.fromisoformat(start)
+        _ = datetime.fromisoformat(end if "T" in end else end + "T23:59:59")
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid start/end format. Use YYYY-MM-DD"}), 400
+
+    params = {
+        "CANDLE_GRANULARITY": int(flask_request.form.get("gran", get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY))),
+        "EXPIRY_MIN": int(flask_request.form.get("expiry", get_int("EXPIRY_MIN", EXPIRY_MIN))),
+        "ENABLE_TRENDING": flask_request.form.get("trend", "1") == "1",
+        "ENABLE_CHOPPY": flask_request.form.get("chop", "1") == "1",
+        "SMA_FAST": int(flask_request.form.get("sma_fast", get_int("SMA_FAST", SMA_FAST))),
+        "SMA_SLOW": int(flask_request.form.get("sma_slow", get_int("SMA_SLOW", SMA_SLOW))),
+        "BB_WINDOW": int(flask_request.form.get("bb_win", get_int("BB_WINDOW", BB_WINDOW))),
+        "BB_STD_MULT": float(flask_request.form.get("bb_mult", get_float("BB_STD_MULT", BB_STD_MULT))),
+        "ATR_WINDOW": int(flask_request.form.get("atr_win", get_int("ATR_WINDOW", ATR_WINDOW))),
+        "SLOPE_ATR_MULT": float(flask_request.form.get("slope_mult", get_float("SLOPE_ATR_MULT", SLOPE_ATR_MULT))),
+        "PULLBACK_MIN": float(flask_request.form.get("pullback", get_float("PULLBACK_MIN", PULLBACK_MIN))),
+    }
+    tie_is_win = flask_request.form.get("tiewin","0") == "1"
+
+    try:
+        summary, trades, csv_bytes = run_backtest_sync(
+            symbol, start, end if "T" in end else end, params, tie_is_win=tie_is_win
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    # Cache CSV and redirect back to dashboard with results
+    key = f"{symbol}_{start}_{end}_{int(time.time())}"
+    DBH.put_backtest(key, summary, csv_bytes)
+    return redirect(url_for("dashboard", token=flask_request.form.get("token",""), bt=key))
+
+@app.route("/download_backtest_csv", methods=["GET"])
+def download_backtest_csv():
+    if not admin_ok(flask_request):
+        return jsonify({"ok": False, "error": "admin token required"}), 403
+    key = flask_request.args.get("key","")
+    summary, csv_bytes = DBH.get_backtest(key)
+    if not summary:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    resp = make_response(csv_bytes)
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    fn = f"{summary['symbol']}_{summary['start'].replace(' ','_')}_{summary['end'].replace(' ','_')}.csv"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{fn}"'
+    return resp
+
+# ---------- TEST ----------
 @app.route("/send_test", methods=["GET","POST"])
 def send_test():
     sym = flask_request.args.get("sym", "GBP/USD")
     direction = flask_request.args.get("dir", "CALL").upper()
     msg = minimal_message(sym, direction, now_utc())
-    # Send test to ALL chats (ignores tier limits)
     ids = TELEGRAM_FREE + TELEGRAM_BASIC + TELEGRAM_PRO + TELEGRAM_VIP
     tg_send_to(ids, msg)
     return jsonify({"ok": True, "sent_to": len(ids)})
@@ -1045,9 +1360,7 @@ def shutdown(signum=None, frame=None):
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGINT, shutdown)
 
-# Kick off WS on boot
 start_ws_thread(get_symbols())
 
-# ---------- MAIN ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8000")), debug=(ENV!="production"))
