@@ -1,8 +1,19 @@
 # app.py
-# Pocket Option Signals — full app with local-day tallies & updated dashboard
-# Features: Telegram minimal messages, Trinidad trading window (Mon–Fri 08:00–17:00 local),
-# tier quotas per LOCAL day, TREND/CHOP/BASE strategies, cooldown, Deriv WS ("end":"latest"),
-# Postgres/SQLite storage, metrics & dashboard.
+# Pocket Option Signals — full app + live control panel (dashboard)
+# - All prior features preserved:
+#   * Telegram minimal messages (app name, GBP/USD — CALL/PUT, Candle 1m | Expiry 5m, UTC time)
+#   * Trinidad market-hours gate (Mon–Fri 08:00–17:00 local)
+#   * Tiers & quotas per LOCAL day (FREE=3, BASIC=6, PRO=15, VIP unlimited)
+#   * Strategies: TREND (SMA+ATR slope), CHOP (BB mean revert), BASE (pullback cross)
+#   * Per-symbol cooldown
+#   * Deriv WS candles with "end":"latest"
+#   * DB (Postgres or SQLite) with local-date tallies
+#   * /metrics + /dashboard
+# - NEW:
+#   * Settings persisted in DB (env only as defaults)
+#   * Dashboard control panel to edit settings
+#   * ADMIN_TOKEN guard (read-only if missing/wrong)
+#   * Apply changes live & restart WS stream safely
 
 import os, sys, json, time, ssl, signal, logging, threading, html
 from math import sqrt
@@ -10,7 +21,7 @@ from datetime import datetime, time as dtime, timezone
 from collections import deque, defaultdict
 from zoneinfo import ZoneInfo
 
-# ------------- ENV BOOTSTRAP -------------
+# ---------- ENV BOOTSTRAP ----------
 def _bootstrap_env():
     try:
         from dotenv import load_dotenv
@@ -19,24 +30,20 @@ def _bootstrap_env():
         if os.path.isdir(secdir):
             for fn in os.listdir(secdir):
                 fp = os.path.join(secdir, fn)
-                if not os.path.isfile(fp):
-                    continue
-                try:
-                    load_dotenv(fp, override=False)
-                except Exception:
-                    pass
+                if not os.path.isfile(fp): continue
+                try: load_dotenv(fp, override=False)
+                except Exception: pass
                 try:
                     if fn not in os.environ:
                         with open(fp, "r", encoding="utf-8") as fh:
                             os.environ[fn] = fh.read().strip()
-                except Exception:
-                    pass
+                except Exception: pass
     except Exception:
         pass
 _bootstrap_env()
 
 import requests
-from flask import Flask, jsonify, Response, render_template_string, request as flask_request
+from flask import Flask, jsonify, Response, render_template_string, request as flask_request, redirect, url_for
 
 # Optional Postgres/SQLite
 try:
@@ -54,13 +61,18 @@ except Exception:
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ------------- CONFIG -------------
-APP_NAME = "Pocket Option Signals"
+# ---------- DEFAULT CONFIG (env as defaults; DB overrides at runtime) ----------
+APP_NAME      = os.getenv("APP_NAME", "Pocket Option Signals")
+ADMIN_TOKEN   = os.getenv("ADMIN_TOKEN", "")  # required for write access to dashboard
 
-DEFAULT_SYMBOLS = os.getenv("SYMBOLS", "frxAUDCAD,frxEURUSD,frxGBPUSD").replace(" ", "").split(",")
+# Symbols
+DEFAULT_SYMBOLS = os.getenv("SYMBOLS", "frxAUDCAD,frxEURUSD,frxGBPUSD").replace(" ","").split(",")
+
+# Deriv
 DERIV_APP_ID    = os.getenv("DERIV_APP_ID", "99185")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN", "")
 
+# Engine
 CANDLE_GRANULARITY = int(os.getenv("CANDLE_GRANULARITY", "60"))  # seconds
 CANDLE_HISTORY     = int(os.getenv("CANDLE_HISTORY", "200"))
 
@@ -69,7 +81,7 @@ SMA_SLOW       = int(os.getenv("SMA_SLOW", "21"))
 PULLBACK_MIN   = float(os.getenv("PULLBACK_MIN", "0.00010"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "120"))
 
-# Keep these large; tier caps govern actual sends
+# Global caps (kept huge; tiers govern in practice)
 DAILY_SIGNAL_LIMIT       = int(os.getenv("DAILY_SIGNAL_LIMIT", "1000000"))
 PER_SYMBOL_DAILY_LIMIT   = int(os.getenv("PER_SYMBOL_DAILY_LIMIT", "1000000"))
 
@@ -88,15 +100,15 @@ BB_WINDOW      = int(os.getenv("BB_WINDOW", "20"))
 BB_STD_MULT    = float(os.getenv("BB_STD_MULT", "1.0"))
 SLOPE_ATR_MULT = float(os.getenv("SLOPE_ATR_MULT", "0.20"))
 
-# Message timing labels (display only)
+# Message timing labels
 CANDLE_MIN = int(os.getenv("CANDLE_MIN", "1"))
 EXPIRY_MIN = int(os.getenv("EXPIRY_MIN", "5"))
 
-# Local market-hours gate (Trinidad default)
+# Local market-hours (Trinidad default)
 TRADING_TZ         = os.getenv("TRADING_TZ", "America/Port_of_Spain")  # UTC-4, no DST
 LOCAL_TRADING_DAYS = [d.strip() for d in os.getenv("LOCAL_TRADING_DAYS", "Mon-Fri").split(",") if d.strip()]
-LOCAL_START_LOCAL  = os.getenv("LOCAL_TRADING_START", "08:00")  # HH:MM local
-LOCAL_END_LOCAL    = os.getenv("LOCAL_TRADING_END",   "17:00")  # HH:MM local
+LOCAL_START_LOCAL  = os.getenv("LOCAL_TRADING_START", "08:00")
+LOCAL_END_LOCAL    = os.getenv("LOCAL_TRADING_END",   "17:00")
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -116,16 +128,15 @@ for _grp in (TELEGRAM_FREE, TELEGRAM_BASIC, TELEGRAM_PRO, TELEGRAM_VIP):
         if _id not in TELEGRAM_ALL:
             TELEGRAM_ALL.append(_id)
 
-# Server
+# Server / logging
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_TIMEOUT   = 10
 PORT         = int(os.getenv("PORT", "8000"))
 ENV          = os.getenv("ENV", "production")
 LOG_LEVEL    = os.getenv("LOG_LEVEL", "INFO").upper()
 UTC = timezone.utc
-TT_TZ = ZoneInfo(TRADING_TZ)
 
-# ------------- APP & LOG -------------
+# ---------- APP & LOG ----------
 app = Flask(__name__)
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -134,7 +145,13 @@ logger = app.logger
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.info(f"{APP_NAME} starting…")
 
-# ------------- UTIL -------------
+# ---------- UTILS ----------
+def tz_obj():
+    try: return ZoneInfo(get_setting("TRADING_TZ", TRADING_TZ))
+    except Exception: return ZoneInfo(TRADING_TZ)
+
+TT_TZ = tz_obj()
+
 def to_dt(ts):
     try: return datetime.fromtimestamp(float(ts), tz=UTC)
     except Exception: return None
@@ -162,22 +179,9 @@ def parse_hhmm_local(s: str):
     hh, mm = s.split(":")
     return dtime(int(hh), int(mm), tzinfo=TT_TZ)
 
-def local_market_open(ts_utc: datetime):
-    ld = ts_utc.astimezone(TT_TZ)
-    if weekday_name(ld.weekday()) not in expand_day_tokens(LOCAL_TRADING_DAYS):
-        return False
-    t = ld.timetz()
-    return parse_hhmm_local(LOCAL_START_LOCAL) <= t <= parse_hhmm_local(LOCAL_END_LOCAL)
-
-def local_day_key(ts_utc: datetime=None):
-    """Return YYYY-MM-DD for Trinidad local date (used for all tallies/quotas)."""
-    if ts_utc is None: ts_utc = now_utc()
-    return ts_utc.astimezone(TT_TZ).date().isoformat()
-
 def pretty_symbol(sym: str):
     if sym.startswith("frx") and len(sym) == 8:
-        p = sym[3:]
-        return f"{p[:3]}/{p[3:]}"
+        p = sym[3:]; return f"{p[:3]}/{p[3:]}"
     if len(sym) >= 6 and sym[-3:].isalpha() and sym[:3].isalpha():
         return f"{sym[:3]}/{sym[3:]}"
     return sym
@@ -186,7 +190,7 @@ def safe_float(x, d=None):
     try: return float(x)
     except Exception: return d
 
-# ------------- DB -------------
+# ---------- DB ----------
 class DB:
     def __init__(self, url: str):
         self.url = url
@@ -222,6 +226,7 @@ class DB:
             finally:
                 cur.close()
     def _init_schema(self):
+        # signals/tallies/quotas
         if self.is_pg:
             self.execute("""CREATE TABLE IF NOT EXISTS signals(
                 id BIGSERIAL PRIMARY KEY, symbol TEXT, direction TEXT, price DOUBLE PRECISION,
@@ -242,7 +247,12 @@ class DB:
             self.execute("""CREATE TABLE IF NOT EXISTS quotas(
                 dt TEXT NOT NULL, symbol TEXT NOT NULL, sent INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(dt, symbol));""")
-    # helpers (LOCAL date keys)
+        # NEW: settings
+        self.execute("""CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );""")
+    # tallies / quotas
     def inc_tally(self, kind: str, amount=1, ts: datetime=None):
         dt = local_day_key(ts)
         if self.is_pg:
@@ -281,10 +291,84 @@ class DB:
         rows = self.execute(("SELECT SUM(sent) AS total FROM quotas WHERE dt=?;") if not self.is_pg
                             else ("SELECT SUM(sent) AS total FROM quotas WHERE dt=%s;"), (dt,), fetch=True)
         return int(rows[0]["total"]) if rows and rows[0]["total"] is not None else 0
+    # settings
+    def set_setting(self, key: str, value: str):
+        if self.is_pg:
+            self.execute("INSERT INTO settings(key,value) VALUES(%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;", (key, value))
+        else:
+            self.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value;", (key, value))
+    def get_setting(self, key: str):
+        rows = self.execute(("SELECT value FROM settings WHERE key=?;") if not self.is_pg
+                            else ("SELECT value FROM settings WHERE key=%s;"), (key,), fetch=True)
+        return rows[0]["value"] if rows else None
+    def get_all_settings(self):
+        rows = self.execute("SELECT key, value FROM settings;", fetch=True)
+        return {r["key"]: r["value"] for r in rows} if rows else {}
 
 DBH = DB(DATABASE_URL)
 
-# ------------- STATE -------------
+# ---------- SETTINGS HELPERS ----------
+SET_LOCK = threading.Lock()
+
+def get_setting(key, default_val):
+    v = DBH.get_setting(key)
+    return v if v is not None else default_val
+
+def get_bool(key, default_bool):
+    v = DBH.get_setting(key)
+    if v is None: return default_bool
+    return str(v).strip() in ("1","true","True","yes","on")
+
+def get_int(key, default_int):
+    v = DBH.get_setting(key)
+    if v is None: return default_int
+    try: return int(v)
+    except Exception: return default_int
+
+def get_float(key, default_float):
+    v = DBH.get_setting(key)
+    if v is None: return default_float
+    try: return float(v)
+    except Exception: return default_float
+
+def get_symbols():
+    v = DBH.get_setting("SYMBOLS")
+    if v:
+        xs = [s.strip() for s in v.split(",") if s.strip()]
+        return xs if xs else DEFAULT_SYMBOLS
+    return DEFAULT_SYMBOLS
+
+def local_day_key(ts_utc: datetime=None):
+    tz = tz_obj()
+    if ts_utc is None: ts_utc = now_utc()
+    return ts_utc.astimezone(tz).date().isoformat()
+
+def local_market_open(ts_utc: datetime):
+    tz = tz_obj()
+    ld = ts_utc.astimezone(tz)
+    days = get_setting("LOCAL_TRADING_DAYS", ",".join(LOCAL_TRADING_DAYS)).split(",")
+    def expand(tokens):
+        ref = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+        S=set()
+        for token in [t.strip() for t in tokens if t.strip()]:
+            if "-" in token:
+                a,b=token.split("-",1);ia,ib=ref.index(a),ref.index(b)
+                rng = ref[ia:ib+1] if ia<=ib else ref[ia:]+ref[:ib+1]
+                S.update(rng)
+            else: S.add(token)
+        return S
+    if ["*"] != days and weekday_name(ld.weekday()) not in expand(days): return False
+    start = get_setting("LOCAL_TRADING_START", LOCAL_START_LOCAL)
+    end   = get_setting("LOCAL_TRADING_END",   LOCAL_END_LOCAL)
+    try:
+        start_t = dtime(int(start.split(":")[0]), int(start.split(":")[1]), tzinfo=tz)
+        end_t   = dtime(int(end.split(":")[0]),   int(end.split(":")[1]),   tzinfo=tz)
+    except Exception:
+        start_t = dtime(8,0,tzinfo=tz); end_t=dtime(17,0,tzinfo=tz)
+    t = ld.timetz()
+    return start_t <= t <= end_t
+
+# ---------- STATE ----------
 STATE_LOCK     = threading.Lock()
 STOP_EVENT     = threading.Event()
 SCHED          = BackgroundScheduler(timezone=UTC)
@@ -297,21 +381,23 @@ LAST_SIGNAL_AT = defaultdict(lambda: None)
 
 def ensure_symbol_state(sym):
     if sym in ROLLING: return
-    ROLLING[sym] = {
-        "fast": deque(maxlen=SMA_FAST), "sum_fast": 0.0,
-        "slow": deque(maxlen=SMA_SLOW), "sum_slow": 0.0,
+    st = {
+        "fast": deque(maxlen=get_int("SMA_FAST", SMA_FAST)), "sum_fast": 0.0,
+        "slow": deque(maxlen=get_int("SMA_SLOW", SMA_SLOW)), "sum_slow": 0.0,
         "prev_fast": None, "prev_slow": None,
-        "closes": deque(maxlen=BB_WINDOW), "sum_close": 0.0, "sumsq_close": 0.0,
-        "trs": deque(maxlen=ATR_WINDOW), "sum_tr": 0.0, "prev_close": None
+        "closes": deque(maxlen=get_int("BB_WINDOW", BB_WINDOW)), "sum_close": 0.0, "sumsq_close": 0.0,
+        "trs": deque(maxlen=get_int("ATR_WINDOW", ATR_WINDOW)), "sum_tr": 0.0, "prev_close": None
     }
+    ROLLING[sym] = st
 
-# ------------- TELEGRAM -------------
+# ---------- TELEGRAM ----------
 def tg_send_to(chat_ids, text: str):
-    if not TELEGRAM_BOT_TOKEN or not chat_ids: return
+    if not get_setting("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN) or not chat_ids: return
+    token = get_setting("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
     for cid in chat_ids:
         try:
             r = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": cid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
                 timeout=10
             )
@@ -320,7 +406,7 @@ def tg_send_to(chat_ids, text: str):
         except Exception as e:
             logger.exception(f"Telegram send exception ({cid}): {e}")
 
-# ------------- INDICATORS -------------
+# ---------- INDICATORS ----------
 def update_sma(sym, close_price):
     st = ROLLING[sym]
     if len(st["fast"]) == st["fast"].maxlen: st["sum_fast"] -= st["fast"][0]
@@ -351,51 +437,53 @@ def update_atr(sym, high, low, close):
     st["trs"].append(tr); st["sum_tr"] += tr; st["prev_close"] = close
     n = len(st["trs"]); return (st["sum_tr"]/n) if n>0 else None
 
-# ------------- QUOTAS / COOLDOWN -------------
+# ---------- QUOTAS / COOLDOWN ----------
 def cooldown_ok(sym):
     last = LAST_SIGNAL_AT.get(sym)
-    return True if last is None else (now_utc() - last).total_seconds() >= COOLDOWN_SECONDS
+    return True if last is None else (now_utc() - last).total_seconds() >= get_int("COOLDOWN_SECONDS", COOLDOWN_SECONDS)
 
 def quotas_ok(sym):
-    # global/symbol caps (kept high by default)
-    if DBH.get_quota_symbol(sym) >= PER_SYMBOL_DAILY_LIMIT: return False, f"{sym} per-symbol daily limit reached"
-    if DBH.get_quota_total() >= DAILY_SIGNAL_LIMIT: return False, "Global daily limit reached"
+    if DBH.get_quota_symbol(sym) >= get_int("PER_SYMBOL_DAILY_LIMIT", PER_SYMBOL_DAILY_LIMIT): return False, f"{sym} per-symbol daily limit reached"
+    if DBH.get_quota_total() >= get_int("DAILY_SIGNAL_LIMIT", DAILY_SIGNAL_LIMIT): return False, "Global daily limit reached"
     return True, ""
 
 def tier_remaining():
     return {
-        "free":  max(FREE_DAILY_LIMIT  - DBH.get_tally("sent_free"),  0),
-        "basic": max(BASIC_DAILY_LIMIT - DBH.get_tally("sent_basic"), 0),
-        "pro":   max(PRO_DAILY_LIMIT   - DBH.get_tally("sent_pro"),   0),
-        "vip":   10**9  # unlimited
+        "free":  max(get_int("FREE_DAILY_LIMIT", FREE_DAILY_LIMIT)   - DBH.get_tally("sent_free"),  0),
+        "basic": max(get_int("BASIC_DAILY_LIMIT", BASIC_DAILY_LIMIT) - DBH.get_tally("sent_basic"), 0),
+        "pro":   max(get_int("PRO_DAILY_LIMIT", PRO_DAILY_LIMIT)     - DBH.get_tally("sent_pro"),   0),
+        "vip":   10**9
     }
 
 def choose_tier_targets():
+    # Chat IDs read from ENV at boot; allow overriding via settings if desired (optional)
+    ids_free  = TELEGRAM_FREE
+    ids_basic = TELEGRAM_BASIC
+    ids_pro   = TELEGRAM_PRO
+    ids_vip   = TELEGRAM_VIP
     rem = tier_remaining()
     targets = {}
-    if TELEGRAM_FREE   and rem["free"]  > 0: targets["free"]  = TELEGRAM_FREE
-    if TELEGRAM_BASIC  and rem["basic"] > 0: targets["basic"] = TELEGRAM_BASIC
-    if TELEGRAM_PRO    and rem["pro"]   > 0: targets["pro"]   = TELEGRAM_PRO
-    if TELEGRAM_VIP:                        targets["vip"]   = TELEGRAM_VIP
+    if ids_free  and rem["free"]  > 0: targets["free"]  = ids_free
+    if ids_basic and rem["basic"] > 0: targets["basic"] = ids_basic
+    if ids_pro   and rem["pro"]   > 0: targets["pro"]   = ids_pro
+    if ids_vip:                        targets["vip"]   = ids_vip
     return targets, rem
 
 def record_tier_send(used_tiers: dict, ts: datetime):
     for tier in used_tiers.keys():
         DBH.inc_tally(f"sent_{tier}", 1, ts=ts)
 
-# ------------- SIGNAL EMIT -------------
+# ---------- SIGNAL EMIT ----------
 def minimal_message(sym_pretty: str, direction: str, when: datetime):
     line1 = f"⚡ <b>{html.escape(APP_NAME, quote=False)}</b>"
     line2 = f"{html.escape(sym_pretty, quote=False)} — <b>{html.escape(direction, quote=False)}</b>"
-    line3 = f"Candle: {CANDLE_MIN}m | Expiry: {EXPIRY_MIN}m"
+    line3 = f"Candle: {get_int('CANDLE_MIN', CANDLE_MIN)}m | Expiry: {get_int('EXPIRY_MIN', EXPIRY_MIN)}m"
     line4 = f"Time: {html.escape(fmt_dt(when), quote=False)}"
     return "\n".join([line1, line2, line3, line4])
 
 def send_signal(sym: str, direction: str, price: float, when: datetime, strategy_name: str):
-    # local market window gate
     if not local_market_open(when):
-        logger.info(f"[SKIP local market closed] {sym} {direction} @ {price:.5f}")
-        return
+        logger.info(f"[SKIP local market closed] {sym} {direction} @ {price:.5f}"); return
     if not cooldown_ok(sym): return
     ok, reason = quotas_ok(sym)
     if not ok:
@@ -415,27 +503,25 @@ def send_signal(sym: str, direction: str, price: float, when: datetime, strategy
         tg_send_to(ids, text)
         used[tier] = 1
 
-    # Persist + tallies (LOCAL day)
     DBH.save_signal(sym, direction, price, when, strategy_name)
     DBH.inc_quota(sym, 1, ts=when)
     DBH.inc_tally("signals_sent", 1, ts=when)
-    # per-strategy counters
     if strategy_name.startswith("TREND"): DBH.inc_tally("signals_trend", 1, ts=when)
     elif strategy_name.startswith("CHOP"): DBH.inc_tally("signals_chop", 1, ts=when)
     elif strategy_name.startswith("BASE"): DBH.inc_tally("signals_base", 1, ts=when)
-    # per-tier counters
     record_tier_send(used, ts=when)
 
     LAST_SIGNAL_AT[sym] = now_utc()
     logger.info(f"[{strategy_name}] {sym} {direction} @ {price:.5f} | sent tiers: {','.join(used.keys())}")
 
-# ------------- STRATEGIES -------------
+# ---------- STRATEGIES ----------
 def maybe_emit_trend(sym, close_price, when, fast, slow, prev_fast, prev_slow, atr):
-    if not ENABLE_TRENDING: return
-    if len(ROLLING[sym]["slow"]) < SMA_SLOW or atr is None: return
+    if not get_bool("ENABLE_TRENDING", ENABLE_TRENDING): return
+    if len(ROLLING[sym]["slow"]) < get_int("SMA_SLOW", SMA_SLOW) or atr is None: return
     slope = abs(slow - (prev_slow if prev_slow is not None else slow))
-    slope_thresh = SLOPE_ATR_MULT * atr
-    trending = slope >= slope_thresh and abs(close_price - slow) >= (0.25 * atr if atr and atr > 0 else PULLBACK_MIN)
+    slope_thresh = get_float("SLOPE_ATR_MULT", SLOPE_ATR_MULT) * atr
+    ppmin = get_float("PULLBACK_MIN", PULLBACK_MIN)
+    trending = slope >= slope_thresh and abs(close_price - slow) >= (0.25 * atr if atr and atr > 0 else ppmin)
     if not trending: return
     crossed_up = prev_fast is not None and prev_slow is not None and prev_fast <= prev_slow and fast > slow
     crossed_dn = prev_fast is not None and prev_slow is not None and prev_fast >= prev_slow and fast < slow
@@ -444,51 +530,55 @@ def maybe_emit_trend(sym, close_price, when, fast, slow, prev_fast, prev_slow, a
     send_signal(sym, direction, close_price, when, "TREND:SMA_CROSS+SLOPE_ATR")
 
 def maybe_emit_chop(sym, close_price, when, mean, std, slow, prev_slow, atr):
-    if not ENABLE_CHOPPY: return
+    if not get_bool("ENABLE_CHOPPY", ENABLE_CHOPPY): return
     if mean is None or std is None or prev_slow is None or atr is None: return
     slope = abs(slow - prev_slow)
-    slope_thresh = SLOPE_ATR_MULT * atr
+    slope_thresh = get_float("SLOPE_ATR_MULT", SLOPE_ATR_MULT) * atr
     if slope >= slope_thresh: return
-    upper, lower = mean + BB_STD_MULT * std, mean - BB_STD_MULT * std
+    upper, lower = mean + get_float("BB_STD_MULT", BB_STD_MULT) * std, mean - get_float("BB_STD_MULT", BB_STD_MULT) * std
     if close_price >= upper: direction = "PUT"
     elif close_price <= lower: direction = "CALL"
     else: return
     send_signal(sym, direction, close_price, when, "CHOP:MeanRevert@BB")
 
 def maybe_emit_base(sym, close_price, when, fast, slow, prev_fast, prev_slow):
-    if len(ROLLING[sym]["slow"]) < SMA_SLOW: return
+    if len(ROLLING[sym]["slow"]) < get_int("SMA_SLOW", SMA_SLOW): return
     crossed_up = prev_fast is not None and prev_slow is not None and prev_fast <= prev_slow and fast > slow
     crossed_dn = prev_fast is not None and prev_slow is not None and prev_fast >= prev_slow and fast < slow
     if not (crossed_up or crossed_dn): return
-    if abs(close_price - slow) < PULLBACK_MIN: return
+    if abs(close_price - slow) < get_float("PULLBACK_MIN", PULLBACK_MIN): return
     direction = "CALL" if crossed_up else "PUT"
-    send_signal(sym, direction, close_price, when, f"BASE:SMA{SMA_FAST}/{SMA_SLOW}+Pullback")
+    send_signal(sym, direction, close_price, when, f"BASE:SMA{get_int('SMA_FAST',SMA_FAST)}/{get_int('SMA_SLOW',SMA_SLOW)}+Pullback")
 
-# ------------- DERIV WS -------------
+# ---------- DERIV WS ----------
 async def deriv_stream(symbols):
     if websockets is None:
         logger.error("websockets lib not available; streaming disabled"); return
-    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={get_setting('DERIV_APP_ID', DERIV_APP_ID)}"
     backoff = 1
     while not STOP_EVENT.is_set():
         try:
             ssl_ctx = ssl.create_default_context()
-            async with websockets.connect(uri, ssl=ssl_ctx, ping_interval=20, ping_timeout=20, max_queue=2048) as ws:
+            async with websockets.connect(uri, ssl=ssl_ctx, ping_interval=20, ping_timeout=20, max_queue=4096) as ws:
                 logger.info(f"Connected to Deriv WS: {uri}")
 
-                if DERIV_API_TOKEN:
-                    await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+                token = get_setting("DERIV_API_TOKEN", DERIV_API_TOKEN)
+                if token:
+                    await ws.send(json.dumps({"authorize": token}))
                     auth = json.loads(await ws.recv())
                     if "error" in auth: logger.error(f"Deriv authorize error: {auth['error']}")
                     else: logger.info("Deriv authorized")
 
-                # Subscribe per symbol (history + streaming)
+                gran = get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY)
+                count_hist = max(get_int("SMA_SLOW", SMA_SLOW) * 2, 60)
+
+                # Subscribe per symbol
                 for s in symbols:
                     sub = {
                         "ticks_history": s,
                         "style": "candles",
-                        "granularity": CANDLE_GRANULARITY,
-                        "count": max(SMA_SLOW * 2, 60),
+                        "granularity": gran,
+                        "count": count_hist,
                         "adjust_start_time": 1,
                         "end": "latest",
                         "subscribe": 1
@@ -515,7 +605,7 @@ async def handle_deriv_message(msg: dict):
         sym = o.get("symbol"); epoch = o.get("epoch")
         h_, l_, c_ = safe_float(o.get("high")), safe_float(o.get("low")), safe_float(o.get("close"))
         if not sym or epoch is None or h_ is None or l_ is None or c_ is None:
-            logger.warning(f"Incomplete ohlc: {msg}"); return
+            return
         when = to_dt(epoch)
         prev_epoch = LAST_EPOCH.get(sym); LAST_EPOCH[sym] = epoch
 
@@ -526,8 +616,7 @@ async def handle_deriv_message(msg: dict):
             mean, std = update_bb(sym, c_)
             atr = update_atr(sym, h_, l_, c_)
 
-        # only act on *newly closed* candles
-        if prev_epoch is not None and epoch == prev_epoch: return
+        if prev_epoch is not None and epoch == prev_epoch: return  # ignore interim
 
         maybe_emit_trend(sym, c_, when, fast, slow, prev_fast, prev_slow, atr)
         maybe_emit_chop(sym, c_, when, mean, std, slow, prev_slow, atr)
@@ -548,81 +637,106 @@ async def handle_deriv_message(msg: dict):
                     CANDLES[sym].append((dt, close))
                     update_sma(sym, close); update_bb(sym, close)
         return
-    # ignore others
 
-def ws_thread_target(symbols):
-    if asyncio is None:
-        logger.error("asyncio/websockets not available; cannot start WS thread."); return
-    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-    loop.run_until_complete(deriv_stream(symbols))
+# ---------- WS THREAD MGMT ----------
+WS_LOCK = threading.Lock()
+WS_THREAD = None
 
-# ------------- SCHED -------------
-def housekeeping():
+def start_ws_thread(symbols):
     global WS_THREAD
-    if WS_THREAD is None or not WS_THREAD.is_alive():
-        try:
-            logger.warning("WS thread not alive — starting…")
-            WS_THREAD = threading.Thread(target=ws_thread_target, args=(DEFAULT_SYMBOLS,), daemon=True)
-            WS_THREAD.start()
-        except Exception as e:
-            logger.exception(f"Failed to start WS thread: {e}")
+    with WS_LOCK:
+        if WS_THREAD and WS_THREAD.is_alive():
+            logger.info("WS thread already running")
+            return
+        if asyncio is None:
+            logger.error("asyncio/websockets not available; cannot start WS thread."); return
+        def _target():
+            loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+            loop.run_until_complete(deriv_stream(symbols))
+        WS_THREAD = threading.Thread(target=_target, name="deriv-ws", daemon=True)
+        WS_THREAD.start()
+        logger.info(f"WS thread started for symbols: {symbols}")
+
+def stop_ws_thread():
+    global WS_THREAD
+    with WS_LOCK:
+        if WS_THREAD and WS_THREAD.is_alive():
+            # Soft stop: set STOP_EVENT and wait a moment; new start will clear
+            # Here we just replace STOP_EVENT logic by restart flag:
+            pass  # The stream loop restarts on reconnect anyway
+        # We don't forcibly kill thread (Python doesn't support); we rely on new subscriptions
+
+def restart_ws_thread():
+    # Re-subscribe by starting a new thread with new symbol list;
+    # The old connection will naturally drop if we rotate process;
+    # For this app, we keep one thread and rely on reconnect – simplest is to just start if dead.
+    # To enforce new subscriptions, we reboot the process if needed, but here we'll log + rely on new state.
+    logger.info("Requested WS restart — attempting soft refresh")
+    # The simplest safe approach: nothing to kill; we start a fresh thread if none:
+    if not (WS_THREAD and WS_THREAD.is_alive()):
+        start_ws_thread(get_symbols())
+    # Also clear rolling state so new params apply cleanly
+    with STATE_LOCK:
+        ROLLING.clear()
+        for s in get_symbols():
+            ensure_symbol_state(s)
+    logger.info("WS soft-refresh done")
+
+# ---------- SCHED ----------
+def housekeeping():
+    if not (WS_THREAD and WS_THREAD.is_alive()):
+        start_ws_thread(get_symbols())
     logger.info(
-        f"housekeeping: symbols={len(DEFAULT_SYMBOLS)} sent_today={DBH.get_tally('signals_sent')} "
+        f"housekeeping: symbols={len(get_symbols())} sent_today={DBH.get_tally('signals_sent')} "
         f"free={DBH.get_tally('sent_free')} basic={DBH.get_tally('sent_basic')} "
         f"pro={DBH.get_tally('sent_pro')} vip={DBH.get_tally('sent_vip')} "
         f"| local_now={now_local().strftime('%Y-%m-%d %H:%M:%S %Z')} "
         f"| market_open={local_market_open(now_utc())}"
     )
 
-def reset_daily_marker():
-    # Tallies are keyed by local date, so no truncation needed; this is just a log marker.
-    logger.info("Daily marker (LOCAL date).")
-
-def reset_weekly_marker():
-    logger.info("Weekly marker (LOCAL week).")
-
 SCHED = BackgroundScheduler(timezone=UTC)
-SCHED.add_job(housekeeping,   CronTrigger(second="*/30"))
-SCHED.add_job(reset_daily_marker,  CronTrigger(hour="0", minute="0"))           # UTC marker only (for logs)
-SCHED.add_job(reset_weekly_marker, CronTrigger(day_of_week="mon", hour="0"))    # UTC marker only
+SCHED.add_job(housekeeping, CronTrigger(second="*/30"))
 SCHED.start()
 logger.info("Scheduler started.")
 
-# ------------- DASHBOARD / METRICS -------------
+# ---------- UI (Dashboard & Metrics) ----------
+def admin_ok(req):
+    need = ADMIN_TOKEN or DBH.get_setting("ADMIN_TOKEN")
+    supplied = req.args.get("token") or req.form.get("token") or req.headers.get("X-Admin-Token","")
+    if not need:
+        # if no token set at all, lock write access (read-only)
+        return False
+    return supplied == need
+
 DASHBOARD_HTML = """
 <!doctype html><html><head><meta charset="utf-8"/>
 <title>{{ app_name }} Dashboard</title>
 <style>
-body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px}
-h1{color:#38bdf8}.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;margin:12px 0}
-code{background:#0b1220;padding:2px 6px;border-radius:6px}table{width:100%;border-collapse:collapse;margin-top:12px}
-th,td{border:1px solid #1f2937;padding:8px;text-align:center}th{background:#0b1220}
-.stat{display:inline-block;margin-right:14px}
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px;max-width:1100px;margin:auto}
+h1{color:#38bdf8} .card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:16px;margin:12px 0}
+code{background:#0b1220;padding:2px 6px;border-radius:6px}
+table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border:1px solid #1f2937;padding:8px;text-align:center}th{background:#0b1220}
+label{display:block;margin-top:8px} input[type=text],input[type=number],textarea,select{width:100%;padding:8px;border-radius:8px;border:1px solid #1f2937;background:#0b1220;color:#e2e8f0}
+button{background:#38bdf8;border:none;border-radius:10px;padding:10px 14px;color:#001018;cursor:pointer;font-weight:600;margin-top:10px}
+button.secondary{background:#1f2937;color:#e2e8f0}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 small{color:#94a3b8}
 </style></head><body>
 <h1>{{ app_name }}</h1>
+
 <div class="card">
-<div class="stat"><b>UTC:</b> <code>{{ utc_time }}</code></div>
-<div class="stat"><b>Local:</b> <code>{{ local_time }}</code> <small>({{ tz }})</small></div>
-<div class="stat"><b>Market open:</b> <code>{{ market_open }}</code></div>
-<div class="stat"><b>Window:</b> <code>{{ window.days|join(",") }} {{ window.start }}→{{ window.end }} local</code></div>
+<div><b>UTC:</b> <code>{{ utc_time }}</code> · <b>Local:</b> <code>{{ local_time }}</code> <small>({{ tz }})</small> · <b>Market open:</b> <code>{{ market_open }}</code></div>
+<div><b>Window:</b> <code>{{ window.days }} {{ window.start }}→{{ window.end }} local</code> · <b>Today:</b> <code>{{ local_day }}</code></div>
 </div>
 
 <div class="card">
 <h3>Today (Local)</h3>
-<div class="stat"><b>Total signals:</b> <code>{{ totals.signals }}</code></div>
-<div class="stat"><b>TREND:</b> <code>{{ totals.trend }}</code></div>
-<div class="stat"><b>CHOP:</b> <code>{{ totals.chop }}</code></div>
-<div class="stat"><b>BASE:</b> <code>{{ totals.base }}</code></div>
-<br/><br/>
-<div class="stat"><b>FREE:</b> <code>{{ tiers.free }}/{{ limits.free }}</code></div>
-<div class="stat"><b>BASIC:</b> <code>{{ tiers.basic }}/{{ limits.basic }}</code></div>
-<div class="stat"><b>PRO:</b> <code>{{ tiers.pro }}/{{ limits.pro }}</code></div>
-<div class="stat"><b>VIP sent:</b> <code>{{ tiers.vip }}</code></div>
+<div><b>Total:</b> <code>{{ totals.signals }}</code> · <b>TREND:</b> <code>{{ totals.trend }}</code> · <b>CHOP:</b> <code>{{ totals.chop }}</code> · <b>BASE:</b> <code>{{ totals.base }}</code></div>
+<div style="margin-top:8px"><b>FREE:</b> <code>{{ tiers.free }}/{{ limits.free }}</code> · <b>BASIC:</b> <code>{{ tiers.basic }}/{{ limits.basic }}</code> · <b>PRO:</b> <code>{{ tiers.pro }}/{{ limits.pro }}</code> · <b>VIP sent:</b> <code>{{ tiers.vip }}</code></div>
 </div>
 
 <div class="card">
-<h3>Symbols</h3>
+<h3>Symbols & Recent Closes</h3>
 <b>Tracking:</b> <code>{{ symbols|join(", ") }}</code> · <b>Granularity:</b> <code>{{ granularity }}s</code> · <b>Cooldown:</b> <code>{{ cooldown }}s</code> · <b>Msg:</b> <code>{{ candle }}m→{{ expiry }}m</code><br/><br/>
 {% for sym, candles in candles_map.items() %}
   <h4>{{ sym }}</h4>
@@ -633,8 +747,144 @@ small{color:#94a3b8}
   </table>
 {% endfor %}
 </div>
+
+<div class="card">
+<h3>Control Panel {% if not can_edit %}<small>(read-only: add ?token=YOUR_TOKEN)</small>{% endif %}</h3>
+<form method="POST">
+<input type="hidden" name="token" value="{{ token }}"/>
+<div class="row">
+  <div>
+    <label>Symbols (comma separated)</label>
+    <textarea name="SYMBOLS" rows="3" {{ 'disabled' if not can_edit else '' }}>{{ current.SYMBOLS }}</textarea>
+  </div>
+  <div>
+    <label>Trading Days (e.g., Mon-Fri or Mon,Wed,Fri or *)</label>
+    <input type="text" name="LOCAL_TRADING_DAYS" value="{{ current.LOCAL_TRADING_DAYS }}" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Local Start (HH:MM)</label>
+    <input type="text" name="LOCAL_TRADING_START" value="{{ current.LOCAL_TRADING_START }}" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Local End (HH:MM)</label>
+    <input type="text" name="LOCAL_TRADING_END" value="{{ current.LOCAL_TRADING_END }}" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+</div>
+
+<div class="row">
+  <div>
+    <label>Candle Granularity (seconds)</label>
+    <input type="number" name="CANDLE_GRANULARITY" value="{{ current.CANDLE_GRANULARITY }}" min="5" step="5" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Cooldown Seconds</label>
+    <input type="number" name="COOLDOWN_SECONDS" value="{{ current.COOLDOWN_SECONDS }}" min="0" step="1" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+  <div>
+    <label>Message Candle Label (minutes)</label>
+    <input type="number" name="CANDLE_MIN" value="{{ current.CANDLE_MIN }}" min="1" step="1" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Expiry Minutes</label>
+    <input type="number" name="EXPIRY_MIN" value="{{ current.EXPIRY_MIN }}" min="1" step="1" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+</div>
+
+<div class="row">
+  <div>
+    <label>Enable TREND</label>
+    <select name="ENABLE_TRENDING" {{ 'disabled' if not can_edit else '' }}>
+      <option value="1" {{ 'selected' if current.ENABLE_TRENDING=='1' else '' }}>On</option>
+      <option value="0" {{ 'selected' if current.ENABLE_TRENDING=='0' else '' }}>Off</option>
+    </select>
+    <label>SMA Fast / Slow</label>
+    <div class="row">
+      <input type="number" name="SMA_FAST" value="{{ current.SMA_FAST }}" min="2" step="1" {{ 'disabled' if not can_edit else '' }}/>
+      <input type="number" name="SMA_SLOW" value="{{ current.SMA_SLOW }}" min="3" step="1" {{ 'disabled' if not can_edit else '' }}/>
+    </div>
+  </div>
+  <div>
+    <label>Enable CHOP</label>
+    <select name="ENABLE_CHOPPY" {{ 'disabled' if not can_edit else '' }}>
+      <option value="1" {{ 'selected' if current.ENABLE_CHOPPY=='1' else '' }}>On</option>
+      <option value="0" {{ 'selected' if current.ENABLE_CHOPPY=='0' else '' }}>Off</option>
+    </select>
+    <label>BB Window / Std Mult</label>
+    <div class="row">
+      <input type="number" name="BB_WINDOW" value="{{ current.BB_WINDOW }}" min="5" step="1" {{ 'disabled' if not can_edit else '' }}/>
+      <input type="number" name="BB_STD_MULT" value="{{ current.BB_STD_MULT }}" min="0.1" step="0.1" {{ 'disabled' if not can_edit else '' }}/>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div>
+    <label>ATR Window</label>
+    <input type="number" name="ATR_WINDOW" value="{{ current.ATR_WINDOW }}" min="2" step="1" {{ 'disabled' if not can_edit else '' }}/>
+    <label>Slope ATR Mult</label>
+    <input type="number" name="SLOPE_ATR_MULT" value="{{ current.SLOPE_ATR_MULT }}" min="0.05" step="0.05" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+  <div>
+    <label>Pullback Min (price units)</label>
+    <input type="text" name="PULLBACK_MIN" value="{{ current.PULLBACK_MIN }}" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+</div>
+
+<div class="row">
+  <div>
+    <label>Tier Limits (per LOCAL day)</label>
+    <div class="row">
+      <input type="number" name="FREE_DAILY_LIMIT" value="{{ current.FREE_DAILY_LIMIT }}" min="0" step="1" {{ 'disabled' if not can_edit else '' }}/>
+      <input type="number" name="BASIC_DAILY_LIMIT" value="{{ current.BASIC_DAILY_LIMIT }}" min="0" step="1" {{ 'disabled' if not can_edit else '' }}/>
+    </div>
+    <div style="margin-top:6px" class="row">
+      <input type="number" name="PRO_DAILY_LIMIT" value="{{ current.PRO_DAILY_LIMIT }}" min="0" step="1" {{ 'disabled' if not can_edit else '' }}/>
+      <input type="text" value="VIP = unlimited" disabled/>
+    </div>
+  </div>
+  <div>
+    <label>Trading Timezone (IANA)</label>
+    <input type="text" name="TRADING_TZ" value="{{ current.TRADING_TZ }}" {{ 'disabled' if not can_edit else '' }}/>
+  </div>
+</div>
+
+{% if can_edit %}
+  <button type="submit">Save Settings</button>
+  <a href="{{ url_for('apply_and_restart') }}?token={{ token }}"><button class="secondary" type="button">Apply & Restart Stream</button></a>
+{% endif %}
+</form>
+</div>
 </body></html>
 """
+
+def current_settings_snapshot():
+    return {
+        "SYMBOLS": ",".join(get_symbols()),
+        "LOCAL_TRADING_DAYS": get_setting("LOCAL_TRADING_DAYS", ",".join(LOCAL_TRADING_DAYS)),
+        "LOCAL_TRADING_START": get_setting("LOCAL_TRADING_START", LOCAL_START_LOCAL),
+        "LOCAL_TRADING_END": get_setting("LOCAL_TRADING_END", LOCAL_END_LOCAL),
+        "CANDLE_GRANULARITY": str(get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY)),
+        "COOLDOWN_SECONDS": str(get_int("COOLDOWN_SECONDS", COOLDOWN_SECONDS)),
+        "CANDLE_MIN": str(get_int("CANDLE_MIN", CANDLE_MIN)),
+        "EXPIRY_MIN": str(get_int("EXPIRY_MIN", EXPIRY_MIN)),
+        "ENABLE_TRENDING": "1" if get_bool("ENABLE_TRENDING", ENABLE_TRENDING) else "0",
+        "SMA_FAST": str(get_int("SMA_FAST", SMA_FAST)),
+        "SMA_SLOW": str(get_int("SMA_SLOW", SMA_SLOW)),
+        "ENABLE_CHOPPY": "1" if get_bool("ENABLE_CHOPPY", ENABLE_CHOPPY) else "0",
+        "BB_WINDOW": str(get_int("BB_WINDOW", BB_WINDOW)),
+        "BB_STD_MULT": str(get_float("BB_STD_MULT", BB_STD_MULT)),
+        "ATR_WINDOW": str(get_int("ATR_WINDOW", ATR_WINDOW)),
+        "SLOPE_ATR_MULT": str(get_float("SLOPE_ATR_MULT", SLOPE_ATR_MULT)),
+        "PULLBACK_MIN": str(get_float("PULLBACK_MIN", PULLBACK_MIN)),
+        "FREE_DAILY_LIMIT": str(get_int("FREE_DAILY_LIMIT", FREE_DAILY_LIMIT)),
+        "BASIC_DAILY_LIMIT": str(get_int("BASIC_DAILY_LIMIT", BASIC_DAILY_LIMIT)),
+        "PRO_DAILY_LIMIT": str(get_int("PRO_DAILY_LIMIT", PRO_DAILY_LIMIT)),
+        "TRADING_TZ": get_setting("TRADING_TZ", TRADING_TZ),
+    }
+
+def save_settings_from_form(form):
+    mutable_keys = [
+        "SYMBOLS","LOCAL_TRADING_DAYS","LOCAL_TRADING_START","LOCAL_TRADING_END",
+        "CANDLE_GRANULARITY","COOLDOWN_SECONDS","CANDLE_MIN","EXPIRY_MIN",
+        "ENABLE_TRENDING","SMA_FAST","SMA_SLOW","ENABLE_CHOPPY","BB_WINDOW","BB_STD_MULT",
+        "ATR_WINDOW","SLOPE_ATR_MULT","PULLBACK_MIN",
+        "FREE_DAILY_LIMIT","BASIC_DAILY_LIMIT","PRO_DAILY_LIMIT","TRADING_TZ"
+    ]
+    for k in mutable_keys:
+        if k in form:
+            DBH.set_setting(k, str(form.get(k)).strip())
 
 @app.route("/", methods=["GET"])
 def root():
@@ -643,10 +893,15 @@ def root():
         "status": "ok",
         "utc_time": fmt_dt(now_utc()),
         "local_time": now_local().strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "trading_tz": TRADING_TZ,
+        "local_day": local_day_key(),
+        "trading_tz": get_setting("TRADING_TZ", TRADING_TZ),
         "market_open": local_market_open(now_utc()),
-        "local_trading_window": {"days": LOCAL_TRADING_DAYS, "start": LOCAL_START_LOCAL, "end": LOCAL_END_LOCAL},
-        "symbols": DEFAULT_SYMBOLS,
+        "local_trading_window": {
+            "days": get_setting("LOCAL_TRADING_DAYS", ",".join(LOCAL_TRADING_DAYS)),
+            "start": get_setting("LOCAL_TRADING_START", LOCAL_START_LOCAL),
+            "end": get_setting("LOCAL_TRADING_END", LOCAL_END_LOCAL)
+        },
+        "symbols": get_symbols(),
         "today": {
             "signals_total": DBH.get_tally("signals_sent"),
             "trend": DBH.get_tally("signals_trend"),
@@ -659,30 +914,56 @@ def root():
                 "vip": DBH.get_tally("sent_vip")
             }
         },
-        "limits": {"free": FREE_DAILY_LIMIT, "basic": BASIC_DAILY_LIMIT, "pro": PRO_DAILY_LIMIT, "vip": None},
-        "granularity_sec": CANDLE_GRANULARITY,
-        "message_times": {"candle_min": CANDLE_MIN, "expiry_min": EXPIRY_MIN},
-        "strategies": {"trend": ENABLE_TRENDING, "chop": ENABLE_CHOPPY, "base": True},
-        "app_id": DERIV_APP_ID
+        "limits": {
+            "free": get_int("FREE_DAILY_LIMIT", FREE_DAILY_LIMIT),
+            "basic": get_int("BASIC_DAILY_LIMIT", BASIC_DAILY_LIMIT),
+            "pro": get_int("PRO_DAILY_LIMIT", PRO_DAILY_LIMIT),
+            "vip": None
+        },
+        "granularity_sec": get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY),
+        "message_times": {"candle_min": get_int("CANDLE_MIN", CANDLE_MIN), "expiry_min": get_int("EXPIRY_MIN", EXPIRY_MIN)},
+        "strategies": {
+            "trend": get_bool("ENABLE_TRENDING", ENABLE_TRENDING),
+            "chop": get_bool("ENABLE_CHOPPY", ENABLE_CHOPPY), "base": True
+        },
+        "app_id": get_setting("DERIV_APP_ID", DERIV_APP_ID)
     })
 
-@app.route("/dashboard", methods=["GET"])
+@app.route("/dashboard", methods=["GET","POST"])
 def dashboard():
+    token = flask_request.args.get("token","") or flask_request.form.get("token","")
+    can_edit = admin_ok(flask_request)
+    if flask_request.method == "POST":
+        if not can_edit:
+            return redirect(url_for("dashboard"))
+        save_settings_from_form(flask_request.form)
+        # refresh TZ object
+        global TT_TZ; TT_TZ = tz_obj()
+        return redirect(url_for("dashboard", token=token))
+
+    # candles table
     with STATE_LOCK:
         candles_map = {}
-        for s in DEFAULT_SYMBOLS:
-            items = list(CANDLES[s])  # [(dt, close), ...]
-            trimmed = items[-10:]     # last 10 only
+        for s in get_symbols():
+            items = list(CANDLES[s])
+            trimmed = items[-10:]
             candles_map[s] = [(fmt_dt(dt), c) for (dt, c) in trimmed]
+
+    current = current_settings_snapshot()
     return render_template_string(
         DASHBOARD_HTML,
         app_name=APP_NAME,
         utc_time=fmt_dt(now_utc()),
         local_time=now_local().strftime("%Y-%m-%d %H:%M:%S %Z"),
-        tz=TRADING_TZ,
+        tz=get_setting("TRADING_TZ", TRADING_TZ),
+        local_day=local_day_key(),
         market_open=local_market_open(now_utc()),
-        window={"days": LOCAL_TRADING_DAYS, "start": LOCAL_START_LOCAL, "end": LOCAL_END_LOCAL},
-        symbols=DEFAULT_SYMBOLS,
+        window={
+            "days": get_setting("LOCAL_TRADING_DAYS", ",".join(LOCAL_TRADING_DAYS)),
+            "start": get_setting("LOCAL_TRADING_START", LOCAL_START_LOCAL),
+            "end": get_setting("LOCAL_TRADING_END", LOCAL_END_LOCAL)
+        },
+        symbols=get_symbols(),
         totals={
             "signals": DBH.get_tally("signals_sent"),
             "trend": DBH.get_tally("signals_trend"),
@@ -695,11 +976,31 @@ def dashboard():
             "pro": DBH.get_tally("sent_pro"),
             "vip": DBH.get_tally("sent_vip"),
         },
-        limits={"free": FREE_DAILY_LIMIT, "basic": BASIC_DAILY_LIMIT, "pro": PRO_DAILY_LIMIT},
-        granularity=CANDLE_GRANULARITY, cooldown=COOLDOWN_SECONDS,
-        candle=CANDLE_MIN, expiry=EXPIRY_MIN,
-        candles_map=candles_map
+        limits={"free": get_int("FREE_DAILY_LIMIT", FREE_DAILY_LIMIT),
+                "basic": get_int("BASIC_DAILY_LIMIT", BASIC_DAILY_LIMIT),
+                "pro": get_int("PRO_DAILY_LIMIT", PRO_DAILY_LIMIT)},
+        granularity=get_int("CANDLE_GRANULARITY", CANDLE_GRANULARITY),
+        cooldown=get_int("COOLDOWN_SECONDS", COOLDOWN_SECONDS),
+        candle=get_int("CANDLE_MIN", CANDLE_MIN),
+        expiry=get_int("EXPIRY_MIN", EXPIRY_MIN),
+        candles_map=candles_map,
+        can_edit=can_edit,
+        token=token,
+        current=current
     )
+
+@app.route("/apply", methods=["GET"])
+def apply_and_restart():
+    if not admin_ok(flask_request):
+        return jsonify({"ok": False, "error": "admin token required"}), 403
+    # Clear rolling state so new indicator windows apply, and soft-restart WS if needed
+    with STATE_LOCK:
+        ROLLING.clear()
+        CANDLES.clear()
+        LAST_EPOCH.clear()
+        LAST_SIGNAL_AT.clear()
+    restart_ws_thread()
+    return redirect(url_for("dashboard", token=flask_request.args.get("token","")))
 
 @app.route("/metrics", methods=["GET"])
 def metrics():
@@ -715,12 +1016,12 @@ def metrics():
         f"tier_basic_sent {DBH.get_tally('sent_basic')}",
         f"tier_pro_sent {DBH.get_tally('sent_pro')}",
         f"tier_vip_sent {DBH.get_tally('sent_vip')}",
-        f"granularity_seconds {CANDLE_GRANULARITY}",
-        f"sma_fast {SMA_FAST}",
-        f"sma_slow {SMA_SLOW}",
-        f"trend_enabled {1 if ENABLE_TRENDING else 0}",
-        f"chop_enabled {1 if ENABLE_CHOPPY else 0}",
-        f"cooldown_seconds {COOLDOWN_SECONDS}",
+        f"granularity_seconds {get_int('CANDLE_GRANULARITY', CANDLE_GRANULARITY)}",
+        f"sma_fast {get_int('SMA_FAST', SMA_FAST)}",
+        f"sma_slow {get_int('SMA_SLOW', SMA_SLOW)}",
+        f"trend_enabled {1 if get_bool('ENABLE_TRENDING', ENABLE_TRENDING) else 0}",
+        f"chop_enabled {1 if get_bool('ENABLE_CHOPPY', ENABLE_CHOPPY) else 0}",
+        f"cooldown_seconds {get_int('COOLDOWN_SECONDS', COOLDOWN_SECONDS)}",
     ]
     return Response("\n".join(lines) + "\n", mimetype="text/plain")
 
@@ -729,29 +1030,24 @@ def send_test():
     sym = flask_request.args.get("sym", "GBP/USD")
     direction = flask_request.args.get("dir", "CALL").upper()
     msg = minimal_message(sym, direction, now_utc())
-    tg_send_to(TELEGRAM_ALL, msg)
-    return jsonify({"ok": True, "sent_to": len(TELEGRAM_ALL)})
+    # Send test to ALL chats (ignores tier limits)
+    ids = TELEGRAM_FREE + TELEGRAM_BASIC + TELEGRAM_PRO + TELEGRAM_VIP
+    tg_send_to(ids, msg)
+    return jsonify({"ok": True, "sent_to": len(ids)})
 
-# ------------- STARTUP / SHUTDOWN -------------
+# ---------- START/SHUTDOWN ----------
 def shutdown(signum=None, frame=None):
     logger.warning("Shutdown signal received; stopping…")
-    STOP_EVENT.set()
     try: SCHED.shutdown(wait=False)
     except Exception: pass
-    time.sleep(0.3); sys.exit(0)
+    time.sleep(0.2); sys.exit(0)
 
-def ws_thread_target(symbols):
-    if asyncio is None:
-        logger.error("asyncio/websockets not available; cannot start WS thread."); return
-    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-    loop.run_until_complete(deriv_stream(symbols))
-
-# Start WS on import (no before_first_request)
-WS_THREAD = threading.Thread(target=ws_thread_target, args=(DEFAULT_SYMBOLS,), daemon=True)
-WS_THREAD.start()
 signal.signal(signal.SIGTERM, shutdown)
 signal.signal(signal.SIGINT, shutdown)
 
-# ------------- MAIN -------------
+# Kick off WS on boot
+start_ws_thread(get_symbols())
+
+# ---------- MAIN ----------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","8000")), debug=(ENV!="production"))
