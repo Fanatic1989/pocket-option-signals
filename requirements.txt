@@ -1,0 +1,9 @@
+Flask==3.0.3
+gunicorn==22.0.0
+pandas==2.3.2
+pandas_ta==0.4.67b0
+requests==2.32.3
+apscheduler==3.10.4
+pytz==2025.2
+tzdata==2025.2
+websocket-client==1.8.0
