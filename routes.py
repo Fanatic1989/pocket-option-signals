@@ -13,6 +13,23 @@ from live_engine import ENGINE, tg_test
 
 bp = Blueprint('dashboard', __name__)
 
+# ---------- Curated symbol lists (Deriv + PocketOption-style) ----------
+DERIV_FRX = [
+    "frxEURUSD","frxGBPUSD","frxUSDJPY","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD",
+    "frxEURGBP","frxEURJPY","frxEURCHF","frxEURAUD","frxGBPAUD","frxGBPJPY","frxGBPNZD",
+    "frxAUDJPY","frxAUDCAD","frxAUDCHF","frxCADJPY","frxCADCHF","frxCHFJPY","frxNZDJPY",
+    "frxEURNZD","frxEURCAD","frxGBPCAD","frxGBPCHF","frxNZDCHF","frxNZDCAD"
+]
+# You can include your PocketOption naming if you use it elsewhere (kept here for UI):
+PO_MAJOR = [
+    "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"
+]
+
+AVAILABLE_GROUPS = [
+    {"label":"Deriv (frx*)", "items": DERIV_FRX},
+    {"label":"Pocket Option majors", "items": PO_MAJOR},
+]
+
 # ---------------- Auth ----------------
 def require_login(func):
     from functools import wraps
@@ -57,14 +74,11 @@ def dashboard():
     cfg = get_config()
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
-
-    # compose customs list for template (avoid globals())
     customs = [
         dict(cfg.get('custom1', {}), _idx=1),
         dict(cfg.get('custom2', {}), _idx=2),
         dict(cfg.get('custom3', {}), _idx=3),
     ]
-
     bt = session.get("bt", {})
     return render_template('dashboard.html', view='dashboard',
                            window=cfg['window'],
@@ -73,6 +87,7 @@ def dashboard():
                            specs=INDICATOR_SPECS,
                            customs=customs,
                            active_symbols=cfg.get("symbols") or [],
+                           available_groups=AVAILABLE_GROUPS,
                            users=users,
                            bt=bt,
                            live_tf=cfg.get("live_tf","M5"),
@@ -88,7 +103,6 @@ def update_window():
     cfg['window']['start'] = request.form.get('start', cfg['window']['start'])
     cfg['window']['end']   = request.form.get('end',   cfg['window']['end'])
     cfg['window']['timezone'] = request.form.get('timezone', cfg['window']['timezone'])
-    # optional live defaults
     if request.form.get('live_tf'): cfg['live_tf'] = request.form.get('live_tf').upper()
     if request.form.get('live_expiry'): cfg['live_expiry'] = request.form.get('live_expiry')
     set_config(cfg); flash("Trading window & live defaults updated.")
@@ -107,11 +121,20 @@ def update_strategies():
 @require_login
 def update_symbols():
     cfg = get_config()
-    raw = (request.form.get('symbols') or "").strip()
-    symbols = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
-    cfg['symbols'] = symbols
+    # From multi-select
+    selected = request.form.getlist('symbols_multi')  # multiple
+    # From free text
+    raw = (request.form.get('symbols_text') or "").strip()
+    text_syms = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
+    # Merge + de-dup, keep order (multi first, then text)
+    seen = set()
+    merged = []
+    for s in selected + text_syms:
+        if s not in seen:
+            merged.append(s); seen.add(s)
+    cfg['symbols'] = merged
     set_config(cfg)
-    flash(f"Active symbols updated: {', '.join(symbols) if symbols else '(none)'}")
+    flash(f"Active symbols: {', '.join(merged) if merged else '(none)'}")
     return redirect(url_for('dashboard.dashboard'))
 
 # ---------------- Indicators ----------------
@@ -214,8 +237,10 @@ def backtest():
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
 
+    # prefer multi-select; fall back to text
     raw_syms = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
-    symbols = [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
+    from_multi = request.form.getlist('bt_symbols_multi')
+    symbols = from_multi if from_multi else [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
 
     uploaded = request.files.get('bt_csv')
     results = []
