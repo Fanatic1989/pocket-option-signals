@@ -5,11 +5,11 @@ from datetime import datetime
 from typing import List, Tuple, Optional
 
 import pandas as pd
+import requests
 
 from utils import get_config, within_window, TZ, log
 from strategies import run_backtest_core_binary
-from data_fetch import deriv_csv_path  # only path helper; no import of routes!
-import requests
+from data_fetch import deriv_csv_path  # path helper only; avoids circular imports
 
 
 def _send_telegram(text: str) -> Tuple[bool, str]:
@@ -19,37 +19,57 @@ def _send_telegram(text: str) -> Tuple[bool, str]:
       TELEGRAM_BOT_TOKEN   (required)
       TELEGRAM_CHAT_ID     (optional default)
       TELEGRAM_CHAT_ID_TIER1 / TIER2 / TIER3  (optional)
+
+    Returns (ok, summary)
     """
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         return False, "Missing TELEGRAM_BOT_TOKEN"
 
-    # Collect all target chats (unique and non-empty)
+    # Collect chat targets
     chats = []
     for key in ("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID_TIER1", "TELEGRAM_CHAT_ID_TIER2", "TELEGRAM_CHAT_ID_TIER3"):
         cid = os.getenv(key, "").strip()
         if cid:
-            chats.append(cid)
-    chats = list(dict.fromkeys(chats))  # dedupe keep order
-    if not chats:
+            chats.append((key, cid))
+    # de-dupe by cid
+    seen = set()
+    targets = []
+    for k, cid in chats:
+        if cid not in seen:
+            targets.append((k, cid))
+            seen.add(cid)
+    if not targets:
         return False, "No TELEGRAM_CHAT_ID* provided"
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok_count = 0
-    last_error = ""
-    for chat in chats:
+    details = []
+    for key, chat in targets:
         try:
-            resp = requests.post(url, json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=10)
-            if resp.ok and resp.json().get("ok"):
+            resp = requests.post(
+                url,
+                json={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=12,
+            )
+            data = {}
+            try:
+                data = resp.json()
+            except Exception:
+                pass
+            if resp.ok and isinstance(data, dict) and data.get("ok") is True:
                 ok_count += 1
+                details.append(f"{key}:{chat} ok")
             else:
-                last_error = f"chat {chat} -> {resp.text}"
+                # common causes: bot not member/admin, wrong chat id (use negative for groups), privacy mode
+                err = data.get("description") if isinstance(data, dict) else resp.text
+                details.append(f"{key}:{chat} error: {err}")
         except Exception as e:
-            last_error = f"chat {chat} -> {e}"
+            details.append(f"{key}:{chat} exception: {e}")
 
     if ok_count:
-        return True, f"sent to {ok_count} chat(s)"
-    return False, last_error or "unknown telegram error"
+        return True, f"sent to {ok_count}/{len(targets)} chats; " + "; ".join(details)
+    return False, "; ".join(details) if details else "unknown telegram error"
 
 
 def _format_signal_msg(sym: str, tf: str, expiry: str, direction: str, tstamp: str, price: Optional[float]) -> str:
@@ -186,7 +206,6 @@ class LiveEngine:
                 continue
 
             # Use the same engine as backtest to get decisions on latest bars
-            # We take a tail slice to keep this fast
             tail = df.tail(300).reset_index(drop=True)
             try:
                 bt = run_backtest_core_binary(tail, strat["core"], strat["cfg"], tf, expiry)
@@ -199,7 +218,6 @@ class LiveEngine:
                 continue
 
             last = bt.rows[-1]  # dict with keys like time_in, dir, entry, outcome?
-            # we consider it a live signal if time_in == last candle close (or very recent)
             t_in = last.get("time_in") or last.get("timestamp") or ""
             direction = last.get("dir") or last.get("signal") or ""
             entry = last.get("entry")
