@@ -58,19 +58,25 @@ def dashboard():
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
 
-    # recent backtest results (kept in session)
+    # compose customs list for template (avoid globals())
+    customs = [
+        dict(cfg.get('custom1', {}), _idx=1),
+        dict(cfg.get('custom2', {}), _idx=2),
+        dict(cfg.get('custom3', {}), _idx=3),
+    ]
+
     bt = session.get("bt", {})
     return render_template('dashboard.html', view='dashboard',
                            window=cfg['window'],
                            strategies=cfg['strategies'],
                            indicators=cfg.get('indicators', {}),
                            specs=INDICATOR_SPECS,
-                           custom1=cfg.get('custom1',{}),
-                           custom2=cfg.get('custom2',{}),
-                           custom3=cfg.get('custom3',{}),
+                           customs=customs,
                            active_symbols=cfg.get("symbols") or [],
                            users=users,
                            bt=bt,
+                           live_tf=cfg.get("live_tf","M5"),
+                           live_expiry=cfg.get("live_expiry","5m"),
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
                            tz=TIMEZONE)
 
@@ -118,19 +124,16 @@ def update_indicators():
         enabled = bool(request.form.get(f'ind_{key}_enabled'))
         inds.setdefault(key, {})
         inds[key]['enabled'] = enabled
-        # dynamic params
         for p in spec.get("params", {}).keys():
             form_key = f'ind_{key}_{p}'
             if form_key in request.form and request.form.get(form_key) != "":
                 val = request.form.get(form_key)
                 try:
-                    inds[key][p] = int(val) if val.isdigit() else float(val)
+                    inds[key][p] = int(val) if re.fullmatch(r"-?\d+", val) else float(val)
                 except Exception:
                     inds[key][p] = val
-        # for SMA we always keep a 'period' even if disabled (used by BASE rules)
-        if key == "sma":
-            if 'period' not in inds[key]:
-                inds[key]['period'] = spec['params']['period']
+        if key == "sma" and 'period' not in inds[key]:
+            inds[key]['period'] = spec['params']['period']
     cfg['indicators'] = inds
     set_config(cfg)
     flash("Indicators updated.")
@@ -145,18 +148,16 @@ def update_custom():
     cfg = get_config()
     cfg.setdefault(field_prefix, {})
 
-    mode = request.form.get('mode', 'SIMPLE').upper()
+    mode = (request.form.get('mode', 'SIMPLE') or 'SIMPLE').upper()
     cfg[field_prefix]['enabled'] = bool(request.form.get('enabled'))
     cfg[field_prefix]['mode'] = mode
 
     if mode == "SIMPLE":
         cfg[field_prefix]['simple_buy']  = request.form.get('simple_buy', '')
         cfg[field_prefix]['simple_sell'] = request.form.get('simple_sell', '')
-        # Parse into dicts for runtime engine convenience
         cfg[field_prefix]['buy_rule']  = parse_natural_rule(cfg[field_prefix]['simple_buy'])
         cfg[field_prefix]['sell_rule'] = parse_natural_rule(cfg[field_prefix]['simple_sell'])
     else:
-        # ADV: accept explicit JSON rule dicts
         try:
             cfg[field_prefix]['buy_rule']  = json.loads(request.form.get('buy_rule_json','{}'))
         except Exception: cfg[field_prefix]['buy_rule'] = {}
@@ -164,7 +165,6 @@ def update_custom():
             cfg[field_prefix]['sell_rule'] = json.loads(request.form.get('sell_rule_json','{}'))
         except Exception: cfg[field_prefix]['sell_rule'] = {}
 
-    # Safety knobs
     try: cfg[field_prefix]['tol_pct'] = float(request.form.get('tol_pct', cfg[field_prefix].get('tol_pct', 0.1)))
     except Exception: pass
     try: cfg[field_prefix]['lookback'] = int(request.form.get('lookback', cfg[field_prefix].get('lookback', 3)))
@@ -214,11 +214,9 @@ def backtest():
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
 
-    # pick symbols
     raw_syms = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
     symbols = [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
 
-    # CSV upload (optional)
     uploaded = request.files.get('bt_csv')
     results = []
     summary = {"trades":0,"wins":0,"losses":0,"draws":0,"winrate":0.0}
@@ -239,7 +237,6 @@ def backtest():
 
     try:
         if uploaded and uploaded.filename:
-            # Single-symbol CSV path (expects timestamp,open,high,low,close)
             data = uploaded.read().decode("utf-8", errors="ignore")
             df = pd.read_csv(StringIO(data))
             df.columns = [c.strip().lower() for c in df.columns]
@@ -249,7 +246,6 @@ def backtest():
             df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
             run_one(symbols[0] if symbols else "CSV", df)
         else:
-            # Use server-side data (pull from Deriv if requested)
             for sym in symbols:
                 if use_server:
                     _fetch_one_symbol(app_id, sym, gran, count)
