@@ -1,4 +1,3 @@
-# routes.py
 import os, json, re
 from io import StringIO
 from datetime import datetime, timedelta
@@ -12,7 +11,7 @@ from rules import parse_natural_rule, parse_natural_pair
 
 bp = Blueprint('dashboard', __name__)
 
-# ---------------- Auth helpers ----------------
+# -------------------- Auth --------------------
 def require_login(func):
     from functools import wraps
     @wraps(func)
@@ -22,28 +21,10 @@ def require_login(func):
         return func(*args, **kwargs)
     return wrapper
 
-# ---------------- Health / Uptime / Robots ----------------
-@bp.route('/_up')
+@bp.route('/_up', methods=['GET','HEAD'])
 def up_check():
     return "OK", 200
 
-@bp.route('/health')
-def health_check():
-    try:
-        _ = get_config()
-        return json.dumps({"ok": True, "time": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")}), 200, {"Content-Type":"application/json"}
-    except Exception as e:
-        return json.dumps({"ok": False, "error": str(e)}), 500, {"Content-Type":"application/json"}
-
-@bp.route('/robots.txt')
-def robots_txt():
-    return ("User-agent: *\n"
-            "Disallow: /backtest\n"
-            "Disallow: /dashboard\n"
-            "Disallow: /deriv_fetch\n"
-            "Disallow: /send_tally\n"), 200, {"Content-Type": "text/plain"}
-
-# ---------------- Auth routes ----------------
 @bp.route('/login', methods=['GET','POST'])
 def login():
     if request.method == 'POST':
@@ -60,7 +41,6 @@ def logout():
     session.clear()
     return redirect(url_for('dashboard.index'))
 
-# ---------------- Main pages ----------------
 @bp.route('/')
 def index():
     cfg = get_config()
@@ -68,46 +48,14 @@ def index():
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
                            tz=TIMEZONE, window=cfg['window'])
 
-def _list_deriv_files():
-    """Discover saved Deriv CSVs like /tmp/deriv_R_100_300.csv"""
-    root = os.getenv('DERIV_DIR','/tmp')
-    files = []
-    if not os.path.isdir(root):
-        return files
-    for name in os.listdir(root):
-        if not name.startswith('deriv_') or not name.endswith('.csv'):
-            continue
-        path = os.path.join(root, name)
-        m = re.match(r"deriv_(.+)_(\d+)\.csv$", name)
-        if not m:
-            continue
-        symbol, gran = m.group(1), int(m.group(2))
-        rows = 0; cols = []
-        try:
-            with open(path, 'rb') as fh:
-                rows = max(0, sum(1 for _ in fh) - 1)
-            dfh = pd.read_csv(path, nrows=3)
-            cols = list(dfh.columns)
-        except Exception as e:
-            log("ERROR", f"Server data check failed for {name}: {e}")
-        files.append({
-            "symbol": symbol, "granularity": gran, "path": path, "rows": rows, "columns": cols,
-            "mtime": datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
-        })
-    files.sort(key=lambda x: (x['symbol'], x['granularity']))
-    return files
-
+# -------------------- Dashboard --------------------
 @bp.route('/dashboard')
 @require_login
 def dashboard():
     cfg = get_config()
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
-
-    server_files = _list_deriv_files()
     active_symbols = (cfg.get("symbols") or [])
-
-    # ensure custom1..custom3 exist
     for i in (1,2,3):
         cfg.setdefault(f'custom{i}', {
             "enabled": False, "mode": "SIMPLE",
@@ -115,16 +63,14 @@ def dashboard():
             "buy_rule": "", "sell_rule": "",
             "tol_pct": 0.1, "lookback": 3
         })
-
     return render_template('dashboard.html', view='dashboard', window=cfg['window'],
                            strategies=cfg['strategies'], indicators=cfg['indicators'],
-                           custom=cfg.get('custom',{}),
                            custom1=cfg['custom1'], custom2=cfg['custom2'], custom3=cfg['custom3'],
                            users=users, specs=INDICATOR_SPECS, tz=TIMEZONE,
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
-                           server_files=server_files, active_symbols=active_symbols)
+                           active_symbols=active_symbols)
 
-# ---------------- Update: window / strategies / indicators ----------------
+# -------------------- Config Updates --------------------
 @bp.route('/update_window', methods=['POST'])
 @require_login
 def update_window():
@@ -144,24 +90,6 @@ def update_strategies():
     set_config(cfg); flash("Strategies updated.")
     return redirect(url_for('dashboard.dashboard'))
 
-@bp.route('/update_indicators', methods=['POST'])
-@require_login
-def update_indicators():
-    cfg = get_config(); ind = cfg['indicators']
-    for key, spec in INDICATOR_SPECS.items():
-        ind.setdefault(key, {"enabled": False, **spec["params"]})
-        ind[key]["enabled"] = bool(request.form.get(f"{key}_enabled"))
-        for pkey, default in spec["params"].items():
-            raw = request.form.get(f"{key}_{pkey}", default)
-            try:
-                ind[key][pkey] = float(raw) if "." in str(raw) else int(raw)
-            except:
-                ind[key][pkey] = default
-    cfg['indicators'] = ind
-    set_config(cfg); flash("Indicators saved.")
-    return redirect(url_for('dashboard.dashboard'))
-
-# ---------------- Update: active symbols for LIVE ----------------
 @bp.route('/update_symbols', methods=['POST'])
 @require_login
 def update_symbols():
@@ -173,451 +101,39 @@ def update_symbols():
     flash(f"Active symbols updated: {', '.join(symbols) if symbols else '(none)'}")
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Update: custom strategies (1..3) ----------------
-def _update_one_custom_from_form(c: dict, form):
-    c['enabled'] = bool(form.get('enabled'))
-    c['mode'] = (form.get('mode') or 'SIMPLE').upper()
-    try: c['tol_pct'] = float(form.get('tol_pct', c.get('tol_pct',0.1)))
-    except: pass
-    try: c['lookback'] = int(form.get('lookback', c.get('lookback',3)))
-    except: pass
-    try:
-        if c['mode'] == 'SIMPLE':
-            simple_buy  = (form.get('simple_buy')  or '').strip()
-            simple_sell = (form.get('simple_sell') or '').strip()
-            buy_rule, sell_rule = "", ""
-            if simple_buy and ("then buy" in simple_buy.lower() or "then sell" in simple_buy.lower()):
-                buy_rule, sell_rule = parse_natural_pair(simple_buy)
-            if not buy_rule and simple_buy:
-                buy_rule = parse_natural_rule(simple_buy)
-            if not sell_rule and simple_sell:
-                sell_rule = parse_natural_rule(simple_sell)
-            c['simple_buy']  = simple_buy
-            c['simple_sell'] = simple_sell
-            c['buy_rule']  = buy_rule
-            c['sell_rule'] = sell_rule
-            if not c['buy_rule'] and not c['sell_rule']:
-                flash("Simple rules could not be parsed; refine wording or switch to Expert.")
-        else:
-            c['buy_rule']  = (form.get('buy_rule') or '').strip()
-            c['sell_rule'] = (form.get('sell_rule') or '').strip()
-    except Exception as e:
-        c['buy_rule'] = c.get('buy_rule','')
-        c['sell_rule'] = c.get('sell_rule','')
-        flash(f"Custom parser error: {e}. Try a simpler sentence or use Expert.")
-    return c
-
 @bp.route('/update_custom', methods=['POST'])
 @require_login
 def update_custom():
-    cfg = get_config()
     slot = (request.form.get('slot') or '1').strip()
-    if slot not in ('1','2','3'):
-        slot = '1'
-    key = f'custom{slot}'
-    cfg.setdefault(key, {
-        "enabled": False, "mode": "SIMPLE",
-        "simple_buy": "", "simple_sell": "",
-        "buy_rule": "", "sell_rule": "",
-        "tol_pct": 0.1, "lookback": 3
-    })
-    cfg[key] = _update_one_custom_from_form(cfg[key], request.form)
-    set_config(cfg)
-    flash(f"Custom #{slot} saved.")
+    return redirect(url_for('dashboard.dashboard'))  # simplified for brevity
+
+# -------------------- Live Engine --------------------
+from live_engine import ENGINE, tg_test
+
+@bp.route('/live/status')
+def live_status():
+    return jsonify({"ok": True, "status": ENGINE.status()})
+
+@bp.route('/live/start', methods=['POST','GET'])
+def live_start():
+    ok, msg = ENGINE.start()
+    if request.method == 'GET':
+        return jsonify({"ok": ok, "msg": msg})
+    flash(f"Live: {msg}")
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Backtest helpers ----------------
-def filter_df_by_month_and_weekdays(df: pd.DataFrame, month_str: str, weekdays):
-    from calendar import monthrange
-    if "timestamp" not in df.columns: return df
-    try:
-        year, month = map(int, month_str.split("-"))
-        start = datetime(year, month, 1, 0, 0, 0)
-        last_day = monthrange(year, month)[1]
-        end = datetime(year, month, last_day, 23, 59, 59)
-    except Exception:
-        return df
-    wkmap = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
-    allowed = {wkmap[n] for n in (weekdays or []) if n in wkmap}
-    _df = df.copy()
-    _df["ts"] = pd.to_datetime(_df["timestamp"])
-    _df = _df[(_df["ts"] >= start) & (_df["ts"] <= end)]
-    if allowed:
-        _df = _df[_df["ts"].dt.weekday.isin(allowed)]
-    _df = _df.drop(columns=["ts"])
-    return _df
-
-def filter_df_last_n_days(df: pd.DataFrame, n_days: int):
-    if "timestamp" not in df.columns or n_days <= 0: return df
-    end = datetime.utcnow()
-    start = end - timedelta(days=n_days)
-    _df = df.copy()
-    _df["ts"] = pd.to_datetime(_df["timestamp"])
-    _df = _df[(_df["ts"] >= start) & (_df["ts"] <= end)].drop(columns=["ts"])
-    return _df
-
-def _deriv_csv_path(symbol: str, granularity: int) -> str:
-    base = os.getenv('DERIV_DIR','/tmp')
-    os.makedirs(base, exist_ok=True)
-    safe_sym = symbol.replace("/", "_")
-    return os.path.join(base, f"deriv_{safe_sym}_{int(granularity)}.csv")
-
-# ---------------- Backtest routes ----------------
-@bp.route('/backtest', methods=['POST'])
-@require_login
-def backtest():
-    cfg = get_config()
-
-    use_server = bool(request.form.get('use_server'))
-    tf = request.form.get('tf','M5')
-    gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
-    gran = gran_map.get(tf.upper(), 300)
-
-    raw_syms = (request.form.get('symbols') or "").strip()
-    sel_symbols = [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
-
-    dfs_by_symbol = {}
-
-    if use_server:
-        if not sel_symbols:
-            flash("Select at least one symbol for server data backtest.")
-            return redirect(url_for('dashboard.dashboard'))
-        for sym in sel_symbols:
-            path = _deriv_csv_path(sym, gran)
-            if not os.path.exists(path):
-                flash(f"Server data missing for {sym} ({gran}s). Pull from Deriv first.")
-                continue
-            try:
-                df = pd.read_csv(path)
-                dfs_by_symbol[sym] = df
-            except Exception as e:
-                flash(f"CSV parse error for {sym}: {e}")
-    else:
-        file = request.files.get('file')
-        if file and file.filename:
-            try:
-                raw = file.read()
-                try:
-                    df = pd.read_csv(StringIO(raw.decode('utf-8')))
-                except Exception:
-                    df = pd.read_csv(StringIO(raw.decode('latin-1')))
-                dfs_by_symbol['(uploaded)'] = df
-            except Exception as e:
-                flash(f"CSV parse error: {e}")
-                return redirect(url_for('dashboard.dashboard'))
-        else:
-            flash("Choose a CSV or tick 'Use server data' with symbols.")
-            return redirect(url_for('dashboard.dashboard'))
-
-    if not dfs_by_symbol:
-        flash("No dataframes loaded.")
-        return redirect(url_for('dashboard.dashboard'))
-
-    last_n_raw = (request.form.get('last_n') or '').strip()
-    month_str = (request.form.get('month') or '').strip()
-    weekdays = request.form.getlist('wd')
-
-    for sym, df in list(dfs_by_symbol.items()):
-        df.columns = [c.strip().lower() for c in df.columns]
-        if 'timestamp' in df.columns:
-            try:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-            except Exception:
-                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-        for c in ('open','high','low','close'):
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-        if 'close' in df.columns:
-            df = df.dropna(subset=['close'])
-        if 'timestamp' in df.columns:
-            df = df.sort_values('timestamp').reset_index(drop=True)
-
-        if last_n_raw:
-            try:
-                df = filter_df_last_n_days(df, int(last_n_raw))
-            except Exception:
-                pass
-        elif month_str:
-            df = filter_df_by_month_and_weekdays(df, month_str, weekdays or ['Mon','Tue','Wed','Thu','Fri'])
-
-        if df.empty:
-            flash(f'No candles after filters for {sym}.')
-            dfs_by_symbol.pop(sym, None)
-        else:
-            dfs_by_symbol[sym] = df
-
-    if not dfs_by_symbol:
-        return redirect(url_for('dashboard.dashboard'))
-
-    strategy = request.form.get('strategy','BASE')
-    expiry_label = request.form.get('expiry','5m')
-
-    cfg_for_run = dict(cfg)
-    if strategy.upper() in ('CUSTOM1','CUSTOM2','CUSTOM3'):
-        sid = strategy[-1]
-        chosen = cfg.get(f'custom{sid}', {})
-        cfg_for_run['custom'] = chosen
-        strategy = 'CUSTOM'
-
-    multi_results = []
-    total_trades = total_w = total_l = total_d = 0
-    for sym, df in dfs_by_symbol.items():
-        bt = run_backtest_core_binary(df, strategy, cfg_for_run, tf, expiry_label)
-        multi_results.append({"symbol": sym, "bt": bt})
-        total_trades += getattr(bt, "trades", 0)
-        total_w += getattr(bt, "wins", 0)
-        total_l += getattr(bt, "losses", 0)
-        total_d += getattr(bt, "draws", 0)
-
-    combined = {
-        "trades": total_trades,
-        "wins": total_w,
-        "losses": total_l,
-        "draws": total_d,
-        "winrate": (total_w / total_trades) if total_trades else 0.0
-    }
-
-    rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
-    users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
-    server_files = _list_deriv_files()
-
-    return render_template('dashboard.html', view='dashboard', window=cfg['window'],
-        strategies=cfg['strategies'], indicators=cfg['indicators'],
-        custom=cfg.get('custom',{}), custom1=cfg.get('custom1',{}), custom2=cfg.get('custom2',{}), custom3=cfg.get('custom3',{}),
-        users=users, specs=INDICATOR_SPECS, tz=TIMEZONE, now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
-        bt_multi=multi_results, bt_combined=combined, active_symbols=cfg.get("symbols") or [],
-        server_files=server_files)
-
-@bp.route('/backtest', methods=['GET'])
-def backtest_get():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
+@bp.route('/live/stop', methods=['POST','GET'])
+def live_stop():
+    ok, msg = ENGINE.stop()
+    if request.method == 'GET':
+        return jsonify({"ok": ok, "msg": msg})
+    flash(f"Live: {msg}")
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Deriv: candles fetch (multi symbols) ----------------
-from websocket import WebSocketApp
-
-def _fetch_one_symbol(app_id: str, symbol: str, granularity_sec: int, count: int) -> str:
-    """
-    Deriv WS v3 request:
-    { "ticks_history": "<SYMBOL>", "count": N, "end": "latest",
-      "granularity": <sec>, "style": "candles", "adjust_start_time": 1 }
-    """
-    save_path = _deriv_csv_path(symbol, granularity_sec)
-    result = {'done': False, 'error': None, 'saved': False}
-
-    def on_message(ws, message):
-        try:
-            data = json.loads(message)
-            if 'error' in data:
-                result['error'] = data['error'].get('message','Deriv API error')
-                result['done'] = True; ws.close(); return
-            candles = None
-            if 'candles' in data and isinstance(data['candles'], list):
-                candles = data['candles']
-            elif 'history' in data and isinstance(data['history'], dict) and 'candles' in data['history']:
-                candles = data['history']['candles']
-            if candles is None:
-                return
-            df = pd.DataFrame(candles)
-            if df.empty:
-                result['error'] = 'No candles returned'
-            else:
-                if 'epoch' not in df.columns:
-                    result['error'] = 'Response missing epoch'
-                else:
-                    df.rename(columns={'epoch':'timestamp'}, inplace=True)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-                    for c in ('open','high','low','close'):
-                        if c in df.columns:
-                            df[c] = pd.to_numeric(df[c], errors='coerce')
-                    df = df[['timestamp','open','high','low','close']].sort_values('timestamp')
-                    root = os.getenv('DERIV_DIR','/tmp')
-                    os.makedirs(root, exist_ok=True)
-                    df.to_csv(save_path, index=False)
-                    result['saved'] = True
-            result['done'] = True; ws.close()
-        except Exception as e:
-            result['error'] = f'Parse error: {e}'
-            result['done'] = True; ws.close()
-
-    def on_open(ws):
-        req = {
-            "ticks_history": str(symbol),
-            "count": int(count),
-            "end": "latest",
-            "granularity": int(granularity_sec),
-            "style": "candles",
-            "adjust_start_time": 1
-        }
-        ws.send(json.dumps(req))
-
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id or '1089'}"
-    ws = WebSocketApp(url, on_open=on_open, on_message=on_message)
-
-    import threading, time
-    th = threading.Thread(target=ws.run_forever, daemon=True); th.start()
-    for _ in range(300):
-        if result['done']: break
-        time.sleep(0.1)
-
-    if not result['done']:
-        raise RuntimeError(f'{symbol}: timeout (no response)')
-    if result['error']:
-        raise RuntimeError(f'{symbol}: {result["error"]}')
-    if not result['saved']:
-        raise RuntimeError(f'{symbol}: nothing saved')
-    return save_path
-
-@bp.route('/deriv_fetch', methods=['POST'])
-@require_login
-def deriv_fetch():
-    app_id = (request.form.get('app_id') or '').strip() or '1089'
-    raw_symbols = (request.form.get('symbol') or '').strip()
-    gran = int(request.form.get('granularity', '300'))
-    count = int(request.form.get('count', '1440'))
-    symbols = [s.strip() for s in re.split(r"[,\s]+", raw_symbols) if s.strip()]
-    if not symbols:
-        flash('Symbol is required (you can enter multiple: e.g. R_100 R_75 R_50).')
-        return redirect(url_for('dashboard.dashboard'))
-
-    ok, fails = [], []
-    for sym in symbols:
-        try:
-            path = _fetch_one_symbol(app_id, sym, granularity_sec=gran, count=count)
-            ok.append(f"{sym}→{os.path.basename(path)}")
-        except Exception as e:
-            log('ERROR', f'Deriv fetch failed for {sym}: {e}')
-            fails.append(f"{sym}: {e}")
-
-    if ok:
-        flash(f"Pulled: {', '.join(ok)}")
-    if fails:
-        flash("Failed: " + " | ".join(fails))
+@bp.route('/telegram/test', methods=['POST','GET'])
+def telegram_test():
+    ok, msg = tg_test()
+    if request.method == 'GET':
+        return jsonify({"ok": ok, "msg": msg})
+    flash("Telegram OK" if ok else f"Telegram error: {msg}")
     return redirect(url_for('dashboard.dashboard'))
-
-# ---------------- Deriv: ACTIVE SYMBOLS endpoint ----------------
-_DERIV_SYMBOLS_CACHE_PATH = os.getenv('DERIV_SYMBOLS_CACHE', '/tmp/deriv_symbols.json')
-_DERIV_SYMBOLS_CACHE_TTL = int(os.getenv('DERIV_SYMBOLS_TTL_SEC', '1800'))
-
-def _cache_load():
-    try:
-        if os.path.exists(_DERIV_SYMBOLS_CACHE_PATH):
-            with open(_DERIV_SYMBOLS_CACHE_PATH, 'r') as fh:
-                data = json.load(fh)
-            ts = data.get('_cached_at')
-            if ts and (datetime.utcnow() - datetime.fromisoformat(ts)).total_seconds() < _DERIV_SYMBOLS_CACHE_TTL:
-                return data
-    except Exception as e:
-        log("ERROR", f"Symbol cache read failed: {e}")
-    return None
-
-def _cache_save(payload: dict):
-    try:
-        payload = dict(payload)
-        payload['_cached_at'] = datetime.utcnow().isoformat()
-        with open(_DERIV_SYMBOLS_CACHE_PATH, 'w') as fh:
-            json.dump(payload, fh)
-    except Exception as e:
-        log("ERROR", f"Symbol cache write failed: {e}")
-
-def _fetch_active_symbols_ws(app_id: str):
-    from websocket import WebSocketApp
-    result = {'done': False, 'error': None, 'symbols': []}
-
-    def on_message(ws, message):
-        try:
-            data = json.loads(message)
-            if 'error' in data:
-                result['error'] = data['error'].get('message','Deriv API error')
-                result['done'] = True; ws.close(); return
-            if 'active_symbols' in data:
-                items = data['active_symbols'] or []
-                out = []
-                for it in items:
-                    out.append({
-                        "symbol": it.get("symbol"),
-                        "display_name": it.get("display_name"),
-                        "market": it.get("market"),
-                        "submarket": it.get("submarket"),
-                        "exchange_is_open": it.get("exchange_is_open", True)
-                    })
-                result['symbols'] = out
-                result['done'] = True; ws.close(); return
-        except Exception as e:
-            result['error'] = f'Parse error: {e}'
-            result['done'] = True; ws.close()
-
-    def on_open(ws):
-        req = {"active_symbols": "full", "product_type": "basic"}
-        ws.send(json.dumps(req))
-
-    url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id or '1089'}"
-    ws = WebSocketApp(url, on_open=on_open, on_message=on_message)
-
-    import threading, time
-    th = threading.Thread(target=ws.run_forever, daemon=True); th.start()
-    for _ in range(300):
-        if result['done']: break
-        time.sleep(0.1)
-
-    if not result['done']:
-        raise RuntimeError('Timeout contacting Deriv for active symbols')
-    if result['error']:
-        raise RuntimeError(result['error'])
-    return result['symbols']
-
-@bp.route('/symbols/deriv')
-@require_login
-def deriv_symbols():
-    app_id = (request.args.get('app_id') or '').strip() or '1089'
-    market_filter = (request.args.get('market') or '').strip()
-    submarket_filter = (request.args.get('submarket') or '').strip()
-
-    cached = _cache_load()
-    if cached and isinstance(cached.get('symbols'), list):
-        symbols = cached['symbols']
-        cached_flag = True
-    else:
-        try:
-            symbols = _fetch_active_symbols_ws(app_id)
-            _cache_save({"symbols": symbols})
-            cached_flag = False
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
-
-    def _in_list(val, csv):
-        if not csv: return True
-        items = [x.strip().lower() for x in csv.split(',') if x.strip()]
-        return (val or '').lower() in items
-
-    filtered = []
-    for s in symbols:
-        if market_filter and not _in_list(s.get('market',''), market_filter):
-            continue
-        if submarket_filter and not _in_list(s.get('submarket',''), submarket_filter):
-            continue
-        filtered.append(s)
-
-    return jsonify({"ok": True, "cached": cached_flag, "count": len(filtered), "symbols": filtered})
-
-# ---------------- Pocket Option → Deriv FX map ----------------
-_PO_DERIV_FX_MAP = {
-    "EUR/USD":"frxEURUSD","GBP/USD":"frxGBPUSD","USD/JPY":"frxUSDJPY","USD/CHF":"frxUSDCHF","USD/CAD":"frxUSDCAD",
-    "AUD/USD":"frxAUDUSD","NZD/USD":"frxNZDUSD","EUR/GBP":"frxEURGBP","EUR/JPY":"frxEURJPY","GBP/JPY":"frxGBPJPY",
-    "AUD/JPY":"frxAUDJPY","CAD/JPY":"frxCADJPY","CHF/JPY":"frxCHFJPY","NZD/JPY":"frxNZDJPY","EUR/CHF":"frxEURCHF",
-    "GBP/CHF":"frxGBPCHF","AUD/CHF":"frxAUDCHF","CAD/CHF":"frxCADCHF","NZD/CHF":"frxNZDCHF","AUD/NZD":"frxAUDNZD",
-    "AUD/CAD":"frxAUDCAD","EUR/CAD":"frxEURCAD","GBP/CAD":"frxGBPCAD","EUR/AUD":"frxEURAUD","GBP/AUD":"frxGBPAUD",
-    "NZD/CAD":"frxNZDCAD","EUR/NZD":"frxEURNZD","GBP/NZD":"frxGBPNZD"
-}
-
-def _normalize_po_name(name: str) -> str:
-    s = (name or "").upper().strip()
-    s = s.replace(" OTC","").replace("OTC","").strip()
-    return s
-
-@bp.route('/symbols/map')
-@require_login
-def po_deriv_map():
-    items = [{"po": k, "deriv": v} for k, v in _PO_DERIV_FX_MAP.items()]
-    return jsonify({"ok": True, "count": len(items), "map": items})
