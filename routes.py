@@ -23,10 +23,37 @@ DERIV_FRX = [
 PO_MAJOR = [
     "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"
 ]
+
 AVAILABLE_GROUPS = [
     {"label":"Deriv (frx*)", "items": DERIV_FRX},
     {"label":"Pocket Option majors", "items": PO_MAJOR},
 ]
+
+# ---------- Helpers ----------
+def _is_po_symbol(sym: str) -> bool:
+    s = (sym or "").upper()
+    return s in PO_MAJOR or bool(re.fullmatch(r"[A-Z]{6}", s))
+
+def _to_deriv(sym: str) -> str:
+    """Convert PO-style (EURUSD) to Deriv (frxEURUSD); pass through frx* unchanged."""
+    if not sym:
+        return sym
+    s = sym.strip()
+    if s.startswith("frx"):
+        return s
+    sU = s.upper().replace("/", "")
+    if _is_po_symbol(sU):
+        return "frx" + sU
+    return s  # leave indices/other assets as-is
+
+def _merge_unique(seq):
+    seen, out = set(), []
+    for x in seq:
+        if not x: 
+            continue
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
 
 # ---------------- Auth ----------------
 def require_login(func):
@@ -73,21 +100,18 @@ def dashboard():
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
 
-    # customs for template
     customs = [
         dict(cfg.get('custom1', {}), _idx=1),
         dict(cfg.get('custom2', {}), _idx=2),
         dict(cfg.get('custom3', {}), _idx=3),
     ]
 
-    # compose a strategies view that includes CUSTOM1..3
     strategies_core = cfg.get('strategies', {
         "BASE":{"enabled": True},
         "TREND":{"enabled": False},
         "CHOP":{"enabled": False},
     })
-    strategies_all = dict(strategies_core)  # copy
-    # mirror custom enabled states into strategies so live engine can find them
+    strategies_all = dict(strategies_core)
     for i, c in enumerate(customs, start=1):
         strategies_all[f"CUSTOM{i}"] = {"enabled": bool(c.get("enabled"))}
 
@@ -125,12 +149,9 @@ def update_window():
 @require_login
 def update_strategies():
     cfg = get_config()
-    # ensure base dict
     cfg.setdefault('strategies', {"BASE":{"enabled":True},"TREND":{"enabled":False},"CHOP":{"enabled":False}})
-    # base strategies
     for name in list(cfg['strategies'].keys()):
         cfg['strategies'][name]['enabled'] = bool(request.form.get(f's_{name}'))
-    # handle CUSTOM1..3 checkboxes -> set custom#.enabled and mirror into cfg['strategies']
     for i in (1,2,3):
         box = bool(request.form.get(f's_CUSTOM{i}'))
         key = f'custom{i}'
@@ -145,16 +166,31 @@ def update_strategies():
 @require_login
 def update_symbols():
     cfg = get_config()
-    selected = request.form.getlist('symbols_multi')
+
+    # Multi-selects
+    sel_po     = request.form.getlist('symbols_po_multi')     # PO majors
+    sel_deriv  = request.form.getlist('symbols_deriv_multi')  # frx*
+    # Free text (accept both formats)
     raw = (request.form.get('symbols_text') or "").strip()
     text_syms = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
-    seen, merged = set(), []
-    for s in selected + text_syms:
-        if s not in seen:
-            merged.append(s); seen.add(s)
-    cfg['symbols'] = merged
+
+    convert_po = bool(request.form.get('convert_po'))  # checkbox
+
+    # Merge in order: PO multi -> Deriv multi -> typed
+    merged = _merge_unique(sel_po + sel_deriv + text_syms)
+
+    # Normalize to Deriv if asked
+    normalized = [_to_deriv(s) if convert_po else s for s in merged]
+
+    cfg['symbols'] = normalized
+    cfg['symbols_raw'] = merged  # for UI reference
     set_config(cfg)
-    flash(f"Active symbols: {', '.join(merged) if merged else '(none)'}")
+
+    shown = ", ".join(normalized) if normalized else "(none)"
+    if convert_po:
+        flash(f"Active symbols saved (PO→Deriv conversion ON): {shown}")
+    else:
+        flash(f"Active symbols saved: {shown}")
     return redirect(url_for('dashboard.dashboard'))
 
 # ---------------- Indicators ----------------
@@ -170,11 +206,11 @@ def update_indicators():
         for p in spec.get("params", {}).keys():
             form_key = f'ind_{key}_{p}'
             if form_key in request.form and request.form.get(form_key) != "":
-                val = request.form.get(val := form_key)
+                val = request.form.get(form_key)
                 try:
                     inds[key][p] = int(val) if re.fullmatch(r"-?\d+", val) else float(val)
                 except Exception:
-                    inds[key][p] = request.form.get(form_key)
+                    inds[key][p] = val
         if key == "sma" and 'period' not in inds[key]:
             inds[key]['period'] = spec['params']['period']
     cfg['indicators'] = inds
@@ -213,7 +249,6 @@ def update_custom():
     try: cfg[field_prefix]['lookback'] = int(request.form.get('lookback', cfg[field_prefix].get('lookback', 3)))
     except Exception: pass
 
-    # mirror into strategies so live can pick it
     cfg.setdefault('strategies', {})
     cfg['strategies'][f"CUSTOM{slot}"] = {"enabled": bool(cfg[field_prefix]['enabled'])}
 
@@ -225,15 +260,18 @@ def update_custom():
 @bp.route('/deriv_fetch', methods=['POST'])
 @require_login
 def deriv_fetch():
-    app_id = os.getenv("DERIV_APP_ID", "1089")
+    app_id = os.getenv("DERV_APP_ID", None) or os.getenv("DERIV_APP_ID", "1089")
     symbols = (request.form.get('fetch_symbols') or "").strip()
     tf = (request.form.get('fetch_tf') or "M5").upper()
     count = int(request.form.get('fetch_count') or "300")
+    convert_po = bool(request.form.get('convert_po_fetch'))
 
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
 
-    pairs = [s.strip() for s in re.split(r"[,\s]+", symbols) if s.strip()]
+    pairs_in = [s.strip() for s in re.split(r"[,\s]+", symbols) if s.strip()]
+    pairs = [_to_deriv(s) if convert_po else s for s in pairs_in]
+
     ok = 0; fail = []
     for sym in pairs:
         try:
@@ -255,8 +293,9 @@ def backtest():
     expiry = request.form.get('bt_expiry') or '5m'
     strategy = (request.form.get('bt_strategy') or 'BASE').upper()
     use_server = bool(request.form.get('use_server'))
-    app_id = os.getenv("DERIV_APP_ID", "1089")
+    app_id = os.getenv("DERV_APP_ID", None) or os.getenv("DERIV_APP_ID", "1089")
     count = int(request.form.get('bt_count') or "300")
+    convert_po = bool(request.form.get('convert_po_bt'))
 
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
@@ -264,7 +303,8 @@ def backtest():
     # prefer multi-select; fall back to text/active
     raw_syms = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
     from_multi = request.form.getlist('bt_symbols_multi')
-    symbols = from_multi if from_multi else [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
+    symbols_in = from_multi if from_multi else [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
+    symbols = [_to_deriv(s) if convert_po else s for s in symbols_in]
 
     uploaded = request.files.get('bt_csv')
     results = []
