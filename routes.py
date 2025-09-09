@@ -1,9 +1,8 @@
 # routes.py
-import os, json
+import os, json, re
 from io import StringIO
 from datetime import datetime, timedelta
 import pandas as pd
-import pytz
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash
 
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE, log
@@ -23,7 +22,7 @@ def require_login(func):
         return func(*args, **kwargs)
     return wrapper
 
-# ---------------- Health / Uptime ----------------
+# ---------------- Health / Uptime / Robots ----------------
 @bp.route('/_up')
 def up_check():
     return "OK", 200
@@ -69,6 +68,33 @@ def index():
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
                            tz=TIMEZONE, window=cfg['window'])
 
+def _list_deriv_files():
+    """Discover saved Deriv CSVs like /tmp/deriv_R_100_300.csv"""
+    root = os.getenv('DERIV_DIR','/tmp')
+    files = []
+    for name in os.listdir(root):
+        if not name.startswith('deriv_') or not name.endswith('.csv'):
+            continue
+        path = os.path.join(root, name)
+        m = re.match(r"deriv_(.+)_(\d+)\.csv$", name)
+        if not m:
+            continue
+        symbol, gran = m.group(1), int(m.group(2))
+        rows = 0; cols = []
+        try:
+            with open(path, 'rb') as fh:
+                rows = max(0, sum(1 for _ in fh) - 1)
+            dfh = pd.read_csv(path, nrows=3)
+            cols = list(dfh.columns)
+        except Exception as e:
+            log("ERROR", f"Server data check failed for {name}: {e}")
+        files.append({
+            "symbol": symbol, "granularity": gran, "path": path, "rows": rows, "columns": cols,
+            "mtime": datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d %H:%M:%S')
+        })
+    files.sort(key=lambda x: (x['symbol'], x['granularity']))
+    return files
+
 @bp.route('/dashboard')
 @require_login
 def dashboard():
@@ -76,27 +102,30 @@ def dashboard():
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
 
-    # Server data status (for Deriv pulls)
-    deriv_path = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
-    server_data = {"path": deriv_path, "exists": False, "rows": 0, "mtime": None, "columns": []}
-    if os.path.exists(deriv_path):
-        try:
-            head_df = pd.read_csv(deriv_path, nrows=5)
-            server_data["columns"] = list(map(str, head_df.columns))
-            server_data["exists"] = True
-            with open(deriv_path, 'rb') as fh:
-                server_data["rows"] = max(0, sum(1 for _ in fh) - 1)
-            server_data["mtime"] = datetime.fromtimestamp(os.path.getmtime(deriv_path)).strftime('%Y-%m-%d %H:%M:%S')
-        except Exception as e:
-            log("ERROR", f"Server data check failed: {e}")
+    # server data inventory
+    server_files = _list_deriv_files()
+
+    # active symbols for live
+    active_symbols = (cfg.get("symbols") or [])
+
+    # ensure custom1..custom3 exist
+    for i in (1,2,3):
+        cfg.setdefault(f'custom{i}', {
+            "enabled": False, "mode": "SIMPLE",
+            "simple_buy": "", "simple_sell": "",
+            "buy_rule": "", "sell_rule": "",
+            "tol_pct": 0.1, "lookback": 3
+        })
 
     return render_template('dashboard.html', view='dashboard', window=cfg['window'],
-                           strategies=cfg['strategies'], indicators=cfg['indicators'], custom=cfg['custom'],
+                           strategies=cfg['strategies'], indicators=cfg['indicators'],
+                           custom=cfg.get('custom',{}),
+                           custom1=cfg['custom1'], custom2=cfg['custom2'], custom3=cfg['custom3'],
                            users=users, specs=INDICATOR_SPECS, tz=TIMEZONE,
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
-                           server_data=server_data)
+                           server_files=server_files, active_symbols=active_symbols)
 
-# ---------------- Update forms ----------------
+# ---------------- Update: window / strategies / indicators ----------------
 @bp.route('/update_window', methods=['POST'])
 @require_login
 def update_window():
@@ -133,49 +162,70 @@ def update_indicators():
     set_config(cfg); flash("Indicators saved.")
     return redirect(url_for('dashboard.dashboard'))
 
-@bp.route('/update_custom', methods=['POST'])
+# ---------------- Update: active symbols for LIVE ----------------
+@bp.route('/update_symbols', methods=['POST'])
 @require_login
-def update_custom():
+def update_symbols():
     cfg = get_config()
-    c = cfg.get('custom', {})
-    c['enabled'] = bool(request.form.get('custom_enabled'))
-    c['mode'] = (request.form.get('mode') or 'SIMPLE').upper()
-    try: c['tol_pct'] = float(request.form.get('tol_pct', c.get('tol_pct',0.1)))
-    except: pass
-    try: c['lookback'] = int(request.form.get('lookback', c.get('lookback',3)))
-    except: pass
+    raw = (request.form.get('symbols') or "").strip()
+    # Split on comma/space/newline
+    symbols = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
+    cfg['symbols'] = symbols
+    set_config(cfg)
+    flash(f"Active symbols updated: {', '.join(symbols) if symbols else '(none)'}")
+    return redirect(url_for('dashboard.dashboard'))
 
+# ---------------- Update: custom strategies (1..3) ----------------
+def _update_one_custom_from_form(c: dict, form):
+    c['enabled'] = bool(form.get('enabled'))
+    c['mode'] = (form.get('mode') or 'SIMPLE').upper()
+    try: c['tol_pct'] = float(form.get('tol_pct', c.get('tol_pct',0.1)))
+    except: pass
+    try: c['lookback'] = int(form.get('lookback', c.get('lookback',3)))
+    except: pass
     try:
         if c['mode'] == 'SIMPLE':
-            simple_buy  = (request.form.get('simple_buy')  or '').strip()
-            simple_sell = (request.form.get('simple_sell') or '').strip()
+            simple_buy  = (form.get('simple_buy')  or '').strip()
+            simple_sell = (form.get('simple_sell') or '').strip()
             buy_rule, sell_rule = "", ""
-
             if simple_buy and ("then buy" in simple_buy.lower() or "then sell" in simple_buy.lower()):
                 buy_rule, sell_rule = parse_natural_pair(simple_buy)
-
             if not buy_rule and simple_buy:
                 buy_rule = parse_natural_rule(simple_buy)
             if not sell_rule and simple_sell:
                 sell_rule = parse_natural_rule(simple_sell)
-
             c['simple_buy']  = simple_buy
             c['simple_sell'] = simple_sell
             c['buy_rule']  = buy_rule
             c['sell_rule'] = sell_rule
-
             if not c['buy_rule'] and not c['sell_rule']:
                 flash("Simple rules could not be parsed; refine wording or switch to Expert.")
         else:
-            c['buy_rule']  = (request.form.get('buy_rule') or '').strip()
-            c['sell_rule'] = (request.form.get('sell_rule') or '').strip()
+            c['buy_rule']  = (form.get('buy_rule') or '').strip()
+            c['sell_rule'] = (form.get('sell_rule') or '').strip()
     except Exception as e:
-        c['buy_rule'] = c.get('buy_rule', '')
-        c['sell_rule'] = c.get('sell_rule', '')
-        flash(f"Custom parser error: {e}. Try a simpler sentence or switch to Expert.")
+        c['buy_rule'] = c.get('buy_rule','')
+        c['sell_rule'] = c.get('sell_rule','')
+        flash(f"Custom parser error: {e}. Try a simpler sentence or use Expert.")
+    return c
 
-    cfg['custom'] = c
-    set_config(cfg); flash("Custom rules saved.")
+@bp.route('/update_custom', methods=['POST'])
+@require_login
+def update_custom():
+    cfg = get_config()
+    slot = (request.form.get('slot') or '1').strip()
+    if slot not in ('1','2','3'):
+        slot = '1'
+    key = f'custom{slot}'
+    cfg.setdefault(key, {
+        "enabled": False, "mode": "SIMPLE",
+        "simple_buy": "", "simple_sell": "",
+        "buy_rule": "", "sell_rule": "",
+        "tol_pct": 0.1, "lookback": 3
+    })
+    cfg[key] = _update_one_custom_from_form(cfg[key], request.form)
+    set_config(cfg)
+    flash(f"Custom #{slot} saved.")
     return redirect(url_for('dashboard.dashboard'))
 
 # ---------------- Backtest helpers ----------------
@@ -208,27 +258,46 @@ def filter_df_last_n_days(df: pd.DataFrame, n_days: int):
     _df = _df[(_df["ts"] >= start) & (_df["ts"] <= end)].drop(columns=["ts"])
     return _df
 
+def _deriv_csv_path(symbol: str, granularity: int) -> str:
+    base = os.getenv('DERIV_DIR','/tmp')
+    safe_sym = symbol.replace("/", "_")
+    return os.path.join(base, f"deriv_{safe_sym}_{int(granularity)}.csv")
+
 # ---------------- Backtest routes ----------------
 @bp.route('/backtest', methods=['POST'])
 @require_login
 def backtest():
     cfg = get_config()
 
-    # 1) Decide data source
+    # 1) Decide data source(s)
     use_server = bool(request.form.get('use_server'))
-    df = None
-    server_path = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
+    tf = request.form.get('tf','M5')
+    gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
+    gran = gran_map.get(tf.upper(), 300)
+
+    # symbols selection (for multi)
+    raw_syms = (request.form.get('symbols') or "").strip()
+    sel_symbols = [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
+
+    # 2) Load dataframes
+    dfs_by_symbol = {}
 
     if use_server:
-        if not os.path.exists(server_path):
-            flash("No server data found. Click 'Pull from Deriv' first, or upload a CSV.")
+        if not sel_symbols:
+            flash("Select at least one symbol for server data backtest.")
             return redirect(url_for('dashboard.dashboard'))
-        try:
-            df = pd.read_csv(server_path)
-        except Exception as e:
-            flash(f"Server CSV parse error: {e}")
-            return redirect(url_for('dashboard.dashboard'))
+        for sym in sel_symbols:
+            path = _deriv_csv_path(sym, gran)
+            if not os.path.exists(path):
+                flash(f"Server data missing for {sym} ({gran}s). Pull from Deriv first.")
+                continue
+            try:
+                df = pd.read_csv(path)
+                dfs_by_symbol[sym] = df
+            except Exception as e:
+                flash(f"CSV parse error for {sym}: {e}")
     else:
+        # single upload
         file = request.files.get('file')
         if file and file.filename:
             try:
@@ -237,67 +306,99 @@ def backtest():
                     df = pd.read_csv(StringIO(raw.decode('utf-8')))
                 except Exception:
                     df = pd.read_csv(StringIO(raw.decode('latin-1')))
+                dfs_by_symbol['(uploaded)'] = df
             except Exception as e:
                 flash(f"CSV parse error: {e}")
                 return redirect(url_for('dashboard.dashboard'))
         else:
-            if os.path.exists(server_path):
-                try:
-                    df = pd.read_csv(server_path)
-                    flash("No upload chosen — used server data automatically.")
-                except Exception as e:
-                    flash(f"Fallback server CSV parse error: {e}")
-                    return redirect(url_for('dashboard.dashboard'))
-            else:
-                flash("Please choose a CSV file or tick 'Use server data' after pulling from Deriv.")
-                return redirect(url_for('dashboard.dashboard'))
+            flash("Choose a CSV or tick 'Use server data' with symbols.")
+            return redirect(url_for('dashboard.dashboard'))
 
-    # 2) Normalize columns
-    df.columns = [c.strip().lower() for c in df.columns]
-    if 'timestamp' in df.columns:
-        try:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-        except Exception:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-    for c in ('open','high','low','close'):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    if 'close' in df.columns:
-        df = df.dropna(subset=['close'])
-    if 'timestamp' in df.columns:
-        df = df.sort_values('timestamp').reset_index(drop=True)
+    if not dfs_by_symbol:
+        flash("No dataframes loaded.")
+        return redirect(url_for('dashboard.dashboard'))
 
-    # 3) Date filters
+    # 3) Normalize + date filters
     last_n_raw = (request.form.get('last_n') or '').strip()
     month_str = (request.form.get('month') or '').strip()
     weekdays = request.form.getlist('wd')
 
-    if last_n_raw:
-        try:
-            df = filter_df_last_n_days(df, int(last_n_raw))
-        except Exception:
-            pass
-    elif month_str:
-        df = filter_df_by_month_and_weekdays(df, month_str, weekdays or ['Mon','Tue','Wed','Thu','Fri'])
+    for sym, df in list(dfs_by_symbol.items()):
+        df.columns = [c.strip().lower() for c in df.columns]
+        if 'timestamp' in df.columns:
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+            except Exception:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        for c in ('open','high','low','close'):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        if 'close' in df.columns:
+            df = df.dropna(subset=['close'])
+        if 'timestamp' in df.columns:
+            df = df.sort_values('timestamp').reset_index(drop=True)
 
-    if df.empty:
-        flash('No candles after applying date filters.')
+        if last_n_raw:
+            try:
+                df = filter_df_last_n_days(df, int(last_n_raw))
+            except Exception:
+                pass
+        elif month_str:
+            df = filter_df_by_month_and_weekdays(df, month_str, weekdays or ['Mon','Tue','Wed','Thu','Fri'])
+
+        if df.empty:
+            flash(f'No candles after filters for {sym}.')
+            dfs_by_symbol.pop(sym, None)
+        else:
+            dfs_by_symbol[sym] = df
+
+    if not dfs_by_symbol:
         return redirect(url_for('dashboard.dashboard'))
 
-    # 4) Run backtest
+    # 4) Strategy selection (incl. CUSTOM1..3 mapping)
     strategy = request.form.get('strategy','BASE')
-    tf = request.form.get('tf','M5')
     expiry_label = request.form.get('expiry','5m')
 
-    bt = run_backtest_core_binary(df, strategy, cfg, tf, expiry_label)
+    cfg_for_run = dict(cfg)  # shallow copy so we can swap customs
+    if strategy.upper() in ('CUSTOM1','CUSTOM2','CUSTOM3'):
+        sid = strategy[-1]  # '1','2','3'
+        # make 'custom' point to the chosen slot so strategies.py keeps working
+        chosen = cfg.get(f'custom{sid}', {})
+        cfg_for_run['custom'] = chosen
+        strategy = 'CUSTOM'
 
+    # 5) Run per-symbol and collect
+    multi_results = []
+    total_trades = total_w = total_l = total_d = 0
+    for sym, df in dfs_by_symbol.items():
+        bt = run_backtest_core_binary(df, strategy, cfg_for_run, tf, expiry_label)
+        multi_results.append({"symbol": sym, "bt": bt})
+        total_trades += getattr(bt, "trades", 0)
+        total_w += getattr(bt, "wins", 0)
+        total_l += getattr(bt, "losses", 0)
+        total_d += getattr(bt, "draws", 0)
+
+    combined = {
+        "trades": total_trades,
+        "wins": total_w,
+        "losses": total_l,
+        "draws": total_d,
+        "winrate": (total_w / total_trades) if total_trades else 0.0
+    }
+
+    # 6) Render
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
 
+    # server inventory for panel
+    server_files = _list_deriv_files()
+
     return render_template('dashboard.html', view='dashboard', window=cfg['window'],
-        strategies=cfg['strategies'], indicators=cfg['indicators'], custom=cfg['custom'],
+        strategies=cfg['strategies'], indicators=cfg['indicators'],
+        custom=cfg.get('custom',{}), custom1=cfg.get('custom1',{}), custom2=cfg.get('custom2',{}), custom3=cfg.get('custom3',{}),
         users=users, specs=INDICATOR_SPECS, tz=TIMEZONE, now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
-        bt=bt, sel_inds=[])
+        bt_multi=multi_results, bt_combined=combined, active_symbols=cfg.get("symbols") or [],
+        server_files=server_files)
 
 # Graceful redirect for stray GETs
 @bp.route('/backtest', methods=['GET'])
@@ -306,68 +407,52 @@ def backtest_get():
         return redirect(url_for('dashboard.login', next=request.path))
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Deriv fetch (FIXED) ----------------
+# ---------------- Deriv fetch (multi symbols) ----------------
 from websocket import WebSocketApp
-DERIV_SAVE_PATH = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
 
-def fetch_deriv_candles(app_id: str, symbol: str, granularity_sec: int, count: int = 1440) -> str:
+def _fetch_one_symbol(app_id: str, symbol: str, granularity_sec: int, count: int) -> str:
     """
-    Correct Deriv WS v3 request for candles:
-    {
-      "ticks_history": "<SYMBOL>",
-      "count": <N>,
-      "end": "latest",
-      "granularity": <sec>,
-      "style": "candles",
-      "adjust_start_time": 1
-    }
-    Response contains 'candles': [{epoch,open,high,low,close}, ...]
+    Deriv WS v3 request:
+    { "ticks_history": "<SYMBOL>", "count": N, "end": "latest",
+      "granularity": <sec>, "style": "candles", "adjust_start_time": 1 }
     """
-    result = {'done': False, 'error': None}
+    save_path = _deriv_csv_path(symbol, granularity_sec)
+    result = {'done': False, 'error': None, 'saved': False}
+
     def on_message(ws, message):
         try:
             data = json.loads(message)
-
-            # Handle explicit errors
             if 'error' in data:
                 result['error'] = data['error'].get('message','Deriv API error')
-                result['done'] = True
-                ws.close()
-                return
-
-            # Parse candles
+                result['done'] = True; ws.close(); return
             candles = None
             if 'candles' in data and isinstance(data['candles'], list):
                 candles = data['candles']
             elif 'history' in data and isinstance(data['history'], dict) and 'candles' in data['history']:
                 candles = data['history']['candles']
-
             if candles is None:
-                # Might still be a ping/subscription ack; ignore
                 return
-
             df = pd.DataFrame(candles)
             if df.empty:
                 result['error'] = 'No candles returned'
             else:
-                # Ensure proper columns (epoch in seconds)
                 if 'epoch' not in df.columns:
                     result['error'] = 'Response missing epoch'
                 else:
                     df.rename(columns={'epoch':'timestamp'}, inplace=True)
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-                    # Some responses provide string numbers
                     for c in ('open','high','low','close'):
                         if c in df.columns:
                             df[c] = pd.to_numeric(df[c], errors='coerce')
                     df = df[['timestamp','open','high','low','close']].sort_values('timestamp')
-                    df.to_csv(DERIV_SAVE_PATH, index=False)
-            result['done'] = True
-            ws.close()
+                    root = os.getenv('DERIV_DIR','/tmp')
+                    os.makedirs(root, exist_ok=True)
+                    df.to_csv(save_path, index=False)
+                    result['saved'] = True
+            result['done'] = True; ws.close()
         except Exception as e:
             result['error'] = f'Parse error: {e}'
-            result['done'] = True
-            ws.close()
+            result['done'] = True; ws.close()
 
     def on_open(ws):
         req = {
@@ -385,34 +470,44 @@ def fetch_deriv_candles(app_id: str, symbol: str, granularity_sec: int, count: i
 
     import threading, time
     th = threading.Thread(target=ws.run_forever, daemon=True); th.start()
-    for _ in range(300):  # up to ~30s
+    for _ in range(300):  # ~30s
         if result['done']: break
         time.sleep(0.1)
 
     if not result['done']:
-        raise RuntimeError('Timeout contacting Deriv (no response)')
-
+        raise RuntimeError(f'{symbol}: timeout (no response)')
     if result['error']:
-        raise RuntimeError(result['error'])
-
-    return DERIV_SAVE_PATH
+        raise RuntimeError(f'{symbol}: {result["error"]}')
+    if not result['saved']:
+        raise RuntimeError(f'{symbol}: nothing saved')
+    return save_path
 
 @bp.route('/deriv_fetch', methods=['POST'])
 @require_login
 def deriv_fetch():
     app_id = (request.form.get('app_id') or '').strip() or '1089'
-    symbol = (request.form.get('symbol') or '').strip()
+    raw_symbols = (request.form.get('symbol') or '').strip()
     gran = int(request.form.get('granularity', '300'))
     count = int(request.form.get('count', '1440'))
-    if not symbol:
-        flash('Symbol is required.')
+    # allow multiple separated by comma/space/newline
+    symbols = [s.strip() for s in re.split(r"[,\s]+", raw_symbols) if s.strip()]
+    if not symbols:
+        flash('Symbol is required (you can enter multiple: e.g. R_100,R_75,R_50).')
         return redirect(url_for('dashboard.dashboard'))
-    try:
-        path = fetch_deriv_candles(app_id, symbol, granularity_sec=gran, count=count)
-        flash(f'Pulled candles for {symbol}. Saved {path}.')
-    except Exception as e:
-        log('ERROR', f'Deriv fetch failed: {e}')
-        flash(f'Deriv fetch failed: {e}')
+
+    ok, fails = [], []
+    for sym in symbols:
+        try:
+            path = _fetch_one_symbol(app_id, sym, granularity_sec=gran, count=count)
+            ok.append(f"{sym}→{os.path.basename(path)}")
+        except Exception as e:
+            log('ERROR', f'Deriv fetch failed for {sym}: {e}')
+            fails.append(f"{sym}: {e}")
+
+    if ok:
+        flash(f"Pulled: {', '.join(ok)}")
+    if fails:
+        flash("Failed: " + " | ".join(fails))
     return redirect(url_for('dashboard.dashboard'))
 
 # ---------------- Tally compute/broadcast ----------------
