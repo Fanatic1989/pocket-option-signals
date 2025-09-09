@@ -83,7 +83,6 @@ def week_key(dt): return f"{dt.isocalendar().year}-W{dt.isocalendar().week:02d}"
 
 def within_window(cfg=None):
     cfg = cfg or get_config()
-    import pytz
     tz = pytz.timezone(cfg["window"]["timezone"])
     now = datetime.now(tz)
     sh, sm = map(int, cfg["window"]["start"].split(":"))
@@ -111,5 +110,97 @@ def tier_ok_to_send(telegram_id, tier, cfg=None):
     if limit is None: return True
     return upsert_quota(telegram_id, 0) < limit
 
+
+# ---------------- Tally + Telegram + Schedules ----------------
+import requests
+
+def _tz_now():
+    return datetime.now(TZ)
+
+def _period_bounds(kind: str):
+    now = _tz_now()
+    if kind == "day":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+        return start, end
+    if kind == "week":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = (start + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=999999)
+        return start, end
+    raise ValueError("unknown period")
+
+def compute_tally(kind: str = "day"):
+    start, end = _period_bounds(kind)
+    rows = exec_sql(
+        "SELECT strategy, outcome FROM live_trades WHERE created_at BETWEEN ? AND ?",
+        (start.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")),
+        fetch=True
+    ) or []
+    agg = {}
+    for (strategy, outcome) in rows:
+        s = strategy or "UNKNOWN"
+        agg.setdefault(s, {"WIN":0,"LOSS":0,"DRAW":0})
+        if outcome in ("WIN","LOSS","DRAW"):
+            agg[s][outcome] += 1
+    total = {"WIN":0,"LOSS":0,"DRAW":0}
+    for s,v in agg.items():
+        for k in total: total[k] += v.get(k,0)
+    lines = []
+    title = "Daily" if kind == "day" else "Weekly"
+    lines.append(f"📊 {title} Tally ({start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')})")
+    for s in sorted(agg.keys()):
+        v = agg[s]; t = v["WIN"]+v["LOSS"]+v["DRAW"]
+        wr = (v["WIN"]/t*100.0) if t>0 else 0.0
+        lines.append(f"• {s}: W {v['WIN']} / L {v['LOSS']} / D {v['DRAW']} — {wr:.1f}%")
+    T = total; ttot = T["WIN"]+T["LOSS"]+T["DRAW"]
+    wrtot = (T["WIN"]/ttot*100.0) if ttot>0 else 0.0
+    lines.append("—")
+    lines.append(f"Total: W {T['WIN']} / L {T['LOSS']} / D {T['DRAW']} — {wrtot:.1f}%")
+    text = "\n".join(lines)
+    return {"start":start.isoformat(), "end":end.isoformat(), "per_strategy":agg, "total":total, "text":text}
+
+def send_telegram_message(text: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    chat_ids = [c.strip() for c in os.getenv("TELEGRAM_CHAT_IDS","").split(",") if c.strip()]
+    if not token or not chat_ids:
+        log("WARN", "Telegram not configured: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_IDS")
+        return 0
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    sent = 0
+    for chat_id in chat_ids:
+        try:
+            r = requests.post(url, json={"chat_id": chat_id, "text": text})
+            if r.ok: sent += 1
+            else: log("ERROR", f"Telegram send failed {chat_id}: {r.status_code} {r.text[:120]}")
+        except Exception as e:
+            log("ERROR", f"Telegram send exception {chat_id}: {e}")
+    return sent
+
+def _send_period_summary(kind: str):
+    key = today_key() if kind=="day" else week_key(_tz_now())
+    rows = exec_sql("SELECT 1 FROM summaries_sent WHERE date_key=? AND type=?", (key, kind), fetch=True)
+    if rows:
+        log("INFO", f"Skip {kind} summary (already sent)")
+        return
+    tally = compute_tally(kind)
+    exec_sql("INSERT OR IGNORE INTO summaries_sent(date_key, type) VALUES(?,?)", (key, kind))
+    sent = send_telegram_message(tally["text"])
+    log("INFO", f"Sent {kind} tally to {sent} Telegram chats")
+
 def schedule_jobs():
     if not scheduler.running: scheduler.start()
+    # Clear existing jobs to avoid duplicates on reloads
+    try:
+        for j in scheduler.get_jobs(): scheduler.remove_job(j.id)
+    except Exception:
+        pass
+    # Schedule daily/weekly 5 minutes after end of window
+    cfg = get_config()
+    end_h, end_m = map(int, cfg["window"]["end"].split(":"))
+    post_h = (end_h + (1 if end_m + 5 >= 60 else 0)) % 24
+    post_m = (end_m + 5) % 60
+
+    scheduler.add_job(lambda: _send_period_summary("day"),
+                      trigger="cron", hour=post_h, minute=post_m, id="daily_tally", replace_existing=True)
+    scheduler.add_job(lambda: _send_period_summary("week"),
+                      trigger="cron", day_of_week="fri", hour=post_h, minute=post_m, id="weekly_tally", replace_existing=True)
