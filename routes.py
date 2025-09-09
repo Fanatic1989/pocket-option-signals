@@ -14,7 +14,6 @@ from rules import parse_natural_rule, parse_natural_pair
 bp = Blueprint('dashboard', __name__)
 
 # ---------------- Auth helpers ----------------
-
 def require_login(func):
     from functools import wraps
     @wraps(func)
@@ -24,13 +23,35 @@ def require_login(func):
         return func(*args, **kwargs)
     return wrapper
 
-# ---------------- Auth routes ----------------
+# ---------------- Health / Uptime ----------------
+@bp.route('/_up')
+def up_check():
+    return "OK", 200
 
+@bp.route('/health')
+def health_check():
+    # optionally check DB connectivity, config presence
+    try:
+        _ = get_config()
+        return json.dumps({"ok": True, "time": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")}), 200, {"Content-Type":"application/json"}
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)}), 500, {"Content-Type":"application/json"}
+
+@bp.route('/robots.txt')
+def robots_txt():
+    return ("User-agent: *\n"
+            "Disallow: /backtest\n"
+            "Disallow: /dashboard\n"
+            "Disallow: /deriv_fetch\n"
+            "Disallow: /send_tally\n"), 200, {"Content-Type": "text/plain"}
+
+# ---------------- Auth routes ----------------
 @bp.route('/login', methods=['GET','POST'])
 def login():
     if request.method == 'POST':
         if request.form.get('password') == os.getenv('ADMIN_PASSWORD','admin123'):
-            session['admin'] = True; flash("Logged in.")
+            session['admin'] = True
+            flash("Logged in.")
             return redirect(request.args.get('next') or url_for('dashboard.dashboard'))
         flash("Invalid password")
     cfg = get_config()
@@ -42,7 +63,6 @@ def logout():
     return redirect(url_for('dashboard.index'))
 
 # ---------------- Main pages ----------------
-
 @bp.route('/')
 def index():
     cfg = get_config()
@@ -56,13 +76,30 @@ def dashboard():
     cfg = get_config()
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
+
+    # Server data status (for Deriv pulls)
+    deriv_path = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
+    server_data = {"path": deriv_path, "exists": False, "rows": 0, "mtime": None, "columns": []}
+    if os.path.exists(deriv_path):
+        try:
+            # tiny read to verify columns
+            head_df = pd.read_csv(deriv_path, nrows=5)
+            server_data["columns"] = list(map(str, head_df.columns))
+            server_data["exists"] = True
+            # quick line count (minus header)
+            with open(deriv_path, 'rb') as fh:
+                server_data["rows"] = max(0, sum(1 for _ in fh) - 1)
+            server_data["mtime"] = datetime.fromtimestamp(os.path.getmtime(deriv_path)).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception as e:
+            log("ERROR", f"Server data check failed: {e}")
+
     return render_template('dashboard.html', view='dashboard', window=cfg['window'],
                            strategies=cfg['strategies'], indicators=cfg['indicators'], custom=cfg['custom'],
-                           users=users, specs=INDICATOR_SPECS, tz=TIMEZONE, 
-                           now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'))
+                           users=users, specs=INDICATOR_SPECS, tz=TIMEZONE,
+                           now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                           server_data=server_data)
 
 # ---------------- Update forms ----------------
-
 @bp.route('/update_window', methods=['POST'])
 @require_login
 def update_window():
@@ -117,7 +154,8 @@ def update_custom():
             simple_sell = (request.form.get('simple_sell') or '').strip()
             buy_rule, sell_rule = "", ""
 
-            if simple_buy and ("then buy" in simple_buy or "then sell" in simple_buy):
+            # Attempt auto-split if a single long sentence has both sides
+            if simple_buy and ("then buy" in simple_buy.lower() or "then sell" in simple_buy.lower()):
                 buy_rule, sell_rule = parse_natural_pair(simple_buy)
 
             if not buy_rule and simple_buy:
@@ -144,8 +182,7 @@ def update_custom():
     set_config(cfg); flash("Custom rules saved.")
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Backtest filters ----------------
-
+# ---------------- Backtest helpers ----------------
 def filter_df_by_month_and_weekdays(df: pd.DataFrame, month_str: str, weekdays):
     from calendar import monthrange
     if "timestamp" not in df.columns: return df
@@ -176,54 +213,84 @@ def filter_df_last_n_days(df: pd.DataFrame, n_days: int):
     return _df
 
 # ---------------- Backtest routes ----------------
-
 @bp.route('/backtest', methods=['POST'])
 @require_login
 def backtest():
     cfg = get_config()
-    use_server = bool(request.form.get('use_server')); df = None
 
-    if not use_server:
+    # 1) Decide data source
+    use_server = bool(request.form.get('use_server'))
+    df = None
+    server_path = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
+
+    if use_server:
+        # Prefer server data if checkbox ticked
+        if not os.path.exists(server_path):
+            flash("No server data found. Click 'Pull from Deriv' first, or upload a CSV.")
+            return redirect(url_for('dashboard.dashboard'))
+        try:
+            df = pd.read_csv(server_path)
+        except Exception as e:
+            flash(f"Server CSV parse error: {e}")
+            return redirect(url_for('dashboard.dashboard'))
+    else:
         file = request.files.get('file')
         if file and file.filename:
             try:
                 raw = file.read()
-                try: df = pd.read_csv(StringIO(raw.decode('utf-8')))
-                except Exception: df = pd.read_csv(StringIO(raw.decode('latin-1')))
+                try:
+                    df = pd.read_csv(StringIO(raw.decode('utf-8')))
+                except Exception:
+                    df = pd.read_csv(StringIO(raw.decode('latin-1')))
             except Exception as e:
-                flash(f"CSV parse error: {e}"); return redirect(url_for('dashboard.dashboard'))
+                flash(f"CSV parse error: {e}")
+                return redirect(url_for('dashboard.dashboard'))
         else:
-            flash("Please choose a CSV file or tick 'Use server data'."); return redirect(url_for('dashboard.dashboard'))
-    else:
-        path = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
-        if not os.path.exists(path):
-            flash("No server data found. Click 'Pull from Deriv' first."); return redirect(url_for('dashboard.dashboard'))
-        try: df = pd.read_csv(path)
-        except Exception as e:
-            flash(f"Server CSV parse error: {e}"); return redirect(url_for('dashboard.dashboard'))
+            # If no file upload and not using server, but server data exists, be helpful and use it
+            if os.path.exists(server_path):
+                try:
+                    df = pd.read_csv(server_path)
+                    flash("No upload chosen — used server data automatically.")
+                except Exception as e:
+                    flash(f"Fallback server CSV parse error: {e}")
+                    return redirect(url_for('dashboard.dashboard'))
+            else:
+                flash("Please choose a CSV file or tick 'Use server data' after pulling from Deriv.")
+                return redirect(url_for('dashboard.dashboard'))
 
+    # 2) Normalize columns
     df.columns = [c.strip().lower() for c in df.columns]
     if 'timestamp' in df.columns:
-        try: df['timestamp'] = pd.to_datetime(df['timestamp'])
-        except: df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        try:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        except Exception:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     for c in ('open','high','low','close'):
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
-    if 'close' in df.columns: df = df.dropna(subset=['close'])
-    if 'timestamp' in df.columns: df = df.sort_values('timestamp').reset_index(drop=True)
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    if 'close' in df.columns:
+        df = df.dropna(subset=['close'])
+    if 'timestamp' in df.columns:
+        df = df.sort_values('timestamp').reset_index(drop=True)
 
+    # 3) Date filters
     last_n_raw = (request.form.get('last_n') or '').strip()
     month_str = (request.form.get('month') or '').strip()
     weekdays = request.form.getlist('wd')
 
     if last_n_raw:
-        try: df = filter_df_last_n_days(df, int(last_n_raw))
-        except: pass
+        try:
+            df = filter_df_last_n_days(df, int(last_n_raw))
+        except Exception:
+            pass
     elif month_str:
         df = filter_df_by_month_and_weekdays(df, month_str, weekdays or ['Mon','Tue','Wed','Thu','Fri'])
 
     if df.empty:
-        flash('No candles after applying date filters.'); return redirect(url_for('dashboard.dashboard'))
+        flash('No candles after applying date filters.')
+        return redirect(url_for('dashboard.dashboard'))
 
+    # 4) Run backtest
     strategy = request.form.get('strategy','BASE')
     tf = request.form.get('tf','M5')
     expiry_label = request.form.get('expiry','5m')
@@ -246,7 +313,6 @@ def backtest_get():
     return redirect(url_for('dashboard.dashboard'))
 
 # ---------------- Deriv fetch ----------------
-
 from websocket import WebSocketApp
 DERIV_SAVE_PATH = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
 
@@ -257,7 +323,8 @@ def fetch_deriv_candles(app_id: str, symbol: str, granularity_sec: int, count: i
             data = json.loads(message)
             if 'candles' in data:
                 df = pd.DataFrame(data['candles'])
-                if df.empty: result['error'] = 'No candles returned'
+                if df.empty:
+                    result['error'] = 'No candles returned'
                 else:
                     df.rename(columns={'epoch':'timestamp'}, inplace=True)
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
@@ -287,7 +354,7 @@ def fetch_deriv_candles(app_id: str, symbol: str, granularity_sec: int, count: i
 @require_login
 def deriv_fetch():
     app_id = (request.form.get('app_id') or '').strip() or '1089'
-    symbol = request.form.get('symbol', '').strip()
+    symbol = (request.form.get('symbol') or '').strip()
     gran = int(request.form.get('granularity', '300'))
     count = int(request.form.get('count', '1440'))
     if not symbol:
@@ -302,7 +369,6 @@ def deriv_fetch():
     return redirect(url_for('dashboard.dashboard'))
 
 # ---------------- Tally compute/broadcast ----------------
-
 from utils import compute_tally, send_telegram_message
 
 @bp.route('/send_tally', methods=['POST'])
@@ -318,13 +384,3 @@ def send_tally():
         flash(f"{kind.title()} tally computed (not broadcast).")
     session['last_tally'] = t
     return redirect(url_for('dashboard.dashboard'))
-
-# ---------------- Robots.txt ----------------
-
-@bp.route('/robots.txt')
-def robots_txt():
-    return ("User-agent: *\n"
-            "Disallow: /backtest\n"
-            "Disallow: /dashboard\n"
-            "Disallow: /deriv_fetch\n"
-            "Disallow: /send_tally\n"), 200, {"Content-Type": "text/plain"}
