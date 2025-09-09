@@ -130,7 +130,7 @@
           <select name="symbols_multi" id="symbolsMulti" multiple class="multibox">
             {% for g in available_groups %}
               <optgroup label="{{g.label}}">
-                {% for s in g.items %}
+                {% for s in g['items'] %}
                   <option value="{{s}}" {% if s in active_symbols %}selected{% endif %}>{{s}}</option>
                 {% endfor %}
               </optgroup>
@@ -228,7 +228,7 @@
           <select name="bt_symbols_multi" id="btSymbolsMulti" multiple class="multibox">
             {% for g in available_groups %}
               <optgroup label="{{g.label}}">
-                {% for s in g.items %}
+                {% for s in g['items'] %}
                   <option value="{{s}}" {% if s in active_symbols %}selected{% endif %}>{{s}}</option>
                 {% endfor %}
               </optgroup>
