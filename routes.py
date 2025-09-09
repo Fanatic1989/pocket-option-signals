@@ -26,7 +26,7 @@ def require_login(func):
 def login():
     if request.method == 'POST':
         if request.form.get('password') == os.getenv('ADMIN_PASSWORD','admin123'):
-            session['admin'] = True; flash("Logged in."); 
+            session['admin'] = True; flash("Logged in.")
             return redirect(request.args.get('next') or url_for('dashboard.dashboard'))
         flash("Invalid password")
     cfg = get_config()
@@ -259,4 +259,21 @@ def deriv_fetch():
     except Exception as e:
         log('ERROR', f'Deriv fetch failed: {e}')
         flash(f'Deriv fetch failed: {e}')
+    return redirect(url_for('dashboard.dashboard'))
+
+# ---- Tally compute/broadcast (manual trigger from UI) ----
+from utils import compute_tally, send_telegram_message
+
+@bp.route('/send_tally', methods=['POST'])
+@require_login
+def send_tally():
+    kind = (request.form.get('kind') or 'day').lower()
+    if kind not in ('day','week'): kind = 'day'
+    t = compute_tally(kind)
+    if request.form.get('broadcast'):
+        send_telegram_message(t["text"])
+        flash(f"{kind.title()} tally computed and broadcast to Telegram.")
+    else:
+        flash(f"{kind.title()} tally computed (not broadcast).")
+    session['last_tally'] = t
     return redirect(url_for('dashboard.dashboard'))
