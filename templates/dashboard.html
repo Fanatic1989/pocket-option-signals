@@ -18,6 +18,7 @@
     .muted{ color:#a7b6cc }
     .tag{ display:inline-block; background:#172033; padding:2px 6px; border-radius:6px; margin-right:6px }
     .multibox { height:220px }
+    small{ font-size:12px }
   </style>
 </head>
 <body>
@@ -52,7 +53,42 @@
   </div>
 
 {% else %}
-  <!-- Trading window card unchanged ... -->
+  <div class="card">
+    <h2>Trading Window & Live Defaults</h2>
+    <form method="post" action="{{ url_for('dashboard.update_window') }}">
+      <div class="row">
+        <div class="col">
+          <label>Start</label><input name="start" value="{{ window.start }}">
+        </div>
+        <div class="col">
+          <label>End</label><input name="end" value="{{ window.end }}">
+        </div>
+        <div class="col">
+          <label>Timezone</label><input name="timezone" value="{{ window.timezone }}">
+        </div>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label>Live TF</label>
+          <select name="live_tf">
+            {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+              <option value="{{tf}}" {% if tf==live_tf %}selected{% endif %}>{{tf}}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col">
+          <label>Live Expiry</label>
+          <select name="live_expiry">
+            {% for e in ['1m','3m','5m','30m','H1','H4'] %}
+              <option value="{{e}}" {% if e==live_expiry %}selected{% endif %}>{{e}}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <button class="btn" style="margin-top:8px">Save</button>
+      <span class="muted tag">Now: {{ now }} ({{ tz }})</span>
+    </form>
+  </div>
 
   <div class="card">
     <h2>Strategies (enable one or more)</h2>
@@ -62,7 +98,7 @@
           <div class="col" style="max-width:240px">
             <label><input type="checkbox" name="s_{{name}}" {% if opts.enabled %}checked{% endif %}/> {{ name }}</label>
             {% if name.startswith('CUSTOM') %}
-              <div class="muted" style="font-size:12px">Linked to Custom #{{name[-1]}} form below</div>
+              <div class="muted" style="font-size:12px">Linked to Custom #{{name[-1]}} below</div>
             {% endif %}
           </div>
         {% endfor %}
@@ -71,8 +107,255 @@
     </form>
   </div>
 
-  <!-- Indicators, Active Symbols (with multi-select), Custom Strategies, Deriv Pull, Backtest, Live Control ... exactly as in your current file -->
-  {{!-- keep the rest of your existing sections unchanged --}}
+  <div class="card">
+    <h2>Indicators</h2>
+    <form method="post" action="{{ url_for('dashboard.update_indicators') }}">
+      <div class="row">
+        {% for key, spec in specs.items() %}
+          <div class="col">
+            <div class="tag"><b>{{ spec.name }}</b></div>
+            <label><input type="checkbox" name="ind_{{key}}_enabled" {% if indicators.get(key,{}).get('enabled') %}checked{% endif %}/> enabled</label>
+            {% for p, default in spec.params.items() %}
+              <label>{{p}}</label>
+              <input name="ind_{{key}}_{{p}}" value="{{ indicators.get(key,{}).get(p, default) }}">
+            {% endfor %}
+          </div>
+        {% endfor %}
+      </div>
+      <button class="btn" style="margin-top:8px">Save</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Active Symbols</h2>
+    <form method="post" action="{{ url_for('dashboard.update_symbols') }}">
+      <div class="row">
+        <div class="col">
+          <label>Pocket Option majors (multi-select)</label>
+          <label style="display:flex;align-items:center;gap:8px;margin:0 0 6px 0;">
+            <input type="checkbox" id="selectAllPO" style="width:auto"> Select all (PO)
+          </label>
+          <select name="symbols_po_multi" id="symbolsPOMulti" multiple class="multibox">
+            {% for s in available_groups[1]['items'] %}
+              <option value="{{s}}" {% if s in active_symbols or s in (symbols_raw or []) %}selected{% endif %}>{{s}}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col">
+          <label>Deriv Forex (frx*) (multi-select)</label>
+          <label style="display:flex;align-items:center;gap:8px;margin:0 0 6px 0;">
+            <input type="checkbox" id="selectAllDeriv" style="width:auto"> Select all (Deriv)
+          </label>
+          <select name="symbols_deriv_multi" id="symbolsDerivMulti" multiple class="multibox">
+            {% for s in available_groups[0]['items'] %}
+              <option value="{{s}}" {% if s in active_symbols %}selected{% endif %}>{{s}}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col">
+          <label>Or type manually (space/comma separated)</label>
+          <textarea name="symbols_text" rows="6">{{ (symbols_raw or active_symbols)|join(" ") }}</textarea>
+          <label style="margin-top:8px">
+            <input type="checkbox" name="convert_po" checked style="width:auto"> Convert PO majors to Deriv (frx*) on save
+          </label>
+          <small class="muted">Example: EURUSD → frxEURUSD</small>
+        </div>
+      </div>
+      <button class="btn" style="margin-top:8px">Save</button>
+    </form>
+    <script>
+      (function(){
+        const poAll = document.getElementById('selectAllPO');
+        const poBox = document.getElementById('symbolsPOMulti');
+        poAll?.addEventListener('change', ()=>{ for(const o of poBox.options){ o.selected = poAll.checked; }});
+        const dAll = document.getElementById('selectAllDeriv');
+        const dBox = document.getElementById('symbolsDerivMulti');
+        dAll?.addEventListener('change', ()=>{ for(const o of dBox.options){ o.selected = dAll.checked; }});
+      })();
+    </script>
+  </div>
+
+  <div class="card">
+    <h2>Custom Strategies</h2>
+    {% for c in customs %}
+      <form method="post" action="{{ url_for('dashboard.update_custom') }}" style="margin-bottom:14px">
+        <div class="tag"><b>Custom #{{c._idx}}</b></div>
+        <input type="hidden" name="slot" value="{{c._idx}}">
+        <label><input type="checkbox" name="enabled" {% if c.enabled %}checked{% endif %}/> enabled</label>
+        <label>Mode</label>
+        <select name="mode">
+          <option value="SIMPLE" {% if c.mode=='SIMPLE' %}selected{% endif %}>Simple English</option>
+          <option value="ADV" {% if c.mode=='ADV' %}selected{% endif %}>Advanced (JSON)</option>
+        </select>
+        <div class="row">
+          <div class="col">
+            <label>Simple Buy (English)</label>
+            <input name="simple_buy" value="{{ c.simple_buy or '' }}" placeholder="e.g. price respects 50 sma and rsi bounce up and stochastic cross up">
+          </div>
+          <div class="col">
+            <label>Simple Sell (English)</label>
+            <input name="simple_sell" value="{{ c.simple_sell or '' }}" placeholder="e.g. price below 50 sma and rsi bounce down and stochastic cross down">
+          </div>
+        </div>
+        <div class="row">
+          <div class="col">
+            <label>Tolerance %</label><input name="tol_pct" value="{{ c.tol_pct or 0.1 }}">
+          </div>
+          <div class="col">
+            <label>Lookback Bars</label><input name="lookback" value="{{ c.lookback or 3 }}">
+          </div>
+        </div>
+        <details class="muted" style="margin-top:6px"><summary>Advanced JSON (optional)</summary>
+          <label>buy_rule_json</label><textarea name="buy_rule_json" rows="2">{{ c.buy_rule|tojson }}</textarea>
+          <label>sell_rule_json</label><textarea name="sell_rule_json" rows="2">{{ c.sell_rule|tojson }}</textarea>
+        </details>
+        <button class="btn" style="margin-top:8px">Save Custom #{{c._idx}}</button>
+      </form>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h2>Deriv Pull (Multi-Pair)</h2>
+    <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
+      <div class="row">
+        <div class="col">
+          <label>Symbols (PO or Deriv)</label>
+          <input name="fetch_symbols" placeholder="EURUSD frxGBPUSD ..." value="{{ active_symbols|join(' ') }}">
+          <label style="margin-top:6px">
+            <input type="checkbox" name="convert_po_fetch" checked style="width:auto"> Convert PO → Deriv before pulling
+          </label>
+        </div>
+        <div class="col">
+          <label>TF</label>
+          <select name="fetch_tf">
+            {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+              <option value="{{tf}}" {% if tf=='M5' %}selected{% endif %}>{{tf}}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col">
+          <label>Candle Count</label>
+          <input name="fetch_count" value="300">
+        </div>
+      </div>
+      <button class="btn" style="margin-top:8px">Pull from Deriv</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Backtest</h2>
+    <form method="post" action="/backtest" enctype="multipart/form-data">
+      <div class="row">
+        <div class="col">
+          <label>Pick PO majors</label>
+          <select name="bt_symbols_multi" id="btSymbolsPOMulti" multiple class="multibox">
+            {% for s in available_groups[1]['items'] %}
+              <option value="{{s}}" {% if s in active_symbols or s in (symbols_raw or []) %}selected{% endif %}>{{s}}</option>
+            {% endfor %}
+          </select>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+            <input type="checkbox" id="btPOSelectAll" style="width:auto"> Select all PO
+          </label>
+        </div>
+        <div class="col">
+          <label>Pick Deriv frx*</label>
+          <select name="bt_symbols_multi" id="btSymbolsDerivMulti" multiple class="multibox">
+            {% for s in available_groups[0]['items'] %}
+              <option value="{{s}}" {% if s in active_symbols %}selected{% endif %}>{{s}}</option>
+            {% endfor %}
+          </select>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+            <input type="checkbox" id="btDerivSelectAll" style="width:auto"> Select all Deriv
+          </label>
+        </div>
+        <div class="col">
+          <label>Or type symbols (space/comma)</label>
+          <input name="bt_symbols" value="{{ active_symbols|join(' ') }}">
+          <label style="margin-top:6px">
+            <input type="checkbox" name="convert_po_bt" checked style="width:auto"> Convert PO → Deriv before backtest
+          </label>
+          <label style="margin-top:6px">TF</label>
+          <select name="bt_tf">
+            {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+              <option value="{{tf}}" {% if tf=='M5' %}selected{% endif %}>{{tf}}</option>
+            {% endfor %}
+          </select>
+          <label style="margin-top:6px">Expiry</label>
+          <select name="bt_expiry">
+            {% for e in ['1m','3m','5m','30m','H1','H4'] %}
+              <option value="{{e}}" {% if e=='5m' %}selected{% endif %}>{{e}}</option>
+            {% endfor %}
+          </select>
+          <label style="margin-top:6px">Strategy</label>
+          <select name="bt_strategy">
+            {% for s in ['BASE','TREND','CHOP','CUSTOM1','CUSTOM2','CUSTOM3'] %}
+              <option value="{{s}}">{{s}}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label>Upload CSV (optional)</label>
+          <input type="file" name="bt_csv" accept=".csv">
+        </div>
+        <div class="col">
+          <label>Use server data (pull if checked)</label>
+          <input type="checkbox" name="use_server" checked>
+        </div>
+        <div class="col">
+          <label>Pull candle count (if using server)</label>
+          <input name="bt_count" value="300">
+        </div>
+      </div>
+      <button class="btn" style="margin-top:8px">Run Backtest</button>
+    </form>
+
+    {% if bt and bt.summary %}
+      <div style="margin-top:10px">
+        <div class="tag">TF: {{bt.tf}}</div>
+        <div class="tag">Expiry: {{bt.expiry}}</div>
+        <div class="tag">Strategy: {{bt.strategy}}</div>
+      </div>
+      <table>
+        <thead><tr><th>Symbol</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Winrate %</th></tr></thead>
+        <tbody>
+          {% for r in bt.results %}
+            <tr>
+              <td>{{r.symbol}}</td><td>{{r.trades}}</td><td>{{r.wins}}</td><td>{{r.losses}}</td><td>{{r.draws}}</td><td>{{r.winrate}}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if bt.results and bt.results[0].rows %}
+        <details style="margin-top:8px"><summary>Recent Signals (preview)</summary>
+          <table>
+            <thead><tr><th>Time In</th><th>Dir</th><th>Entry</th><th>Time Out</th><th>Exit</th><th>Outcome</th></tr></thead>
+            <tbody>
+              {% for row in bt.results[0].rows %}
+                <tr>
+                  <td>{{row.time_in}}</td><td>{{row.dir}}</td><td>{{row.entry}}</td><td>{{row.time_out}}</td><td>{{row.exit}}</td><td>{{row.outcome}}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </details>
+      {% endif %}
+      <div class="muted" style="margin-top:6px">
+        Total: {{bt.summary.trades}} | Wins: {{bt.summary.wins}} | Losses: {{bt.summary.losses}} | Draws: {{bt.summary.draws}} | Winrate: {{bt.summary.winrate}}%
+      </div>
+    {% elif bt and bt.error %}
+      <div class="muted" style="margin-top:8px;color:#fca5a5">Error: {{bt.error}}</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Live Control</h2>
+    <form method="post" action="/live/start" style="display:inline"><button class="btn">Start Live</button></form>
+    <form method="post" action="/live/stop" style="display:inline;margin-left:8px"><button class="btn">Stop Live</button></form>
+    <form method="post" action="/telegram/test" style="display:inline;margin-left:8px"><button class="btn">Send Telegram Test</button></form>
+    <div style="margin-top:8px"><a class="btn" href="/live/status" target="_blank">Check Status (JSON)</a></div>
+  </div>
 {% endif %}
 
 </main>
