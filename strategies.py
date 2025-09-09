@@ -226,7 +226,7 @@ def _eval_custom(d: pd.DataFrame, custom: Dict[str, Any]) -> (pd.Series, pd.Seri
 def run_backtest_core_binary(
     df: pd.DataFrame,
     core: str,
-    cfg: Dict[str, Any],
+    cfg: Dict[str, Any] | Any,   # be tolerant
     tf: str,
     expiry: str,
 ) -> BTResult:
@@ -236,37 +236,49 @@ def run_backtest_core_binary(
       - Exit exactly N bars later (N from expiry/timeframe).
       - Outcome: compare exit close vs entry close (ties count as LOSS).
     """
+
+    # ---- guard against bad cfg types (fixes: 'str' object has no attribute 'get') ----
+    if not isinstance(cfg, dict):
+        cfg = {}
+    core = (core or "BASE").upper()
+    tf = (tf or "M5").upper()
+    expiry = (expiry or "5m")
+
     d = _ensure_cols(df)
-    # Minimal guard
     if len(d) < 30:
         return BTResult()
 
-    # Indicator params (can be overridden from cfg['indicators'], but we use defaults regardless of toggles)
-    inds_cfg = (cfg or {}).get("indicators", {})
+    # Indicator params (use defaults if missing)
+    raw_inds = cfg.get("indicators", {}) if isinstance(cfg.get("indicators", {}), dict) else {}
+    sma_obj  = raw_inds.get("sma",  {}) if isinstance(raw_inds.get("sma", {}), dict)  else {}
+    rsi_obj  = raw_inds.get("rsi",  {}) if isinstance(raw_inds.get("rsi", {}), dict)  else {}
+    stoch_obj= raw_inds.get("stoch",{}) if isinstance(raw_inds.get("stoch",{}), dict) else {}
+
     ip = {
-        "sma_period": int(inds_cfg.get("sma", {}).get("period", 50)),
-        "rsi_period": int(inds_cfg.get("rsi", {}).get("period", 14)),
-        "stoch_k":    int(inds_cfg.get("stoch", {}).get("k", 14)),
-        "stoch_d":    int(inds_cfg.get("stoch", {}).get("d", 3)),
+        "sma_period": int(sma_obj.get("period", 50)),
+        "rsi_period": int(rsi_obj.get("period", 14)),
+        "stoch_k":    int(stoch_obj.get("k", 14)),
+        "stoch_d":    int(stoch_obj.get("d", 3)),
     }
     d = _prep_indicators(d, ip)
 
     bars = _expiry_to_bars(tf, expiry)
     result = BTResult()
 
-    core = (core or "BASE").upper()
+    # Select signals
     if core == "TREND":
         buy_sig, sell_sig = _trend_conditions(d)
     elif core == "CHOP":
         buy_sig, sell_sig = _chop_conditions(d)
     elif core == "CUSTOM":
-        custom = (cfg or {}).get("custom", {}) or {}
+        custom = cfg.get("custom", {}) if isinstance(cfg.get("custom", {}), dict) else {}
         buy_sig, sell_sig = _eval_custom(d, custom)
     else:
         buy_sig, sell_sig = _base_conditions(d)
 
+    # Walk forward
     for i in range(1, len(d) - bars):
-        # Entry on next candle when signal is true at i
+        # BUY
         if buy_sig.iloc[i]:
             entry_idx = i + 1
             exit_idx  = entry_idx + bars
@@ -286,6 +298,7 @@ def run_backtest_core_binary(
                 "exit":     exitp,
                 "outcome":  outcome
             })
+        # SELL
         if sell_sig.iloc[i]:
             entry_idx = i + 1
             exit_idx  = entry_idx + bars
