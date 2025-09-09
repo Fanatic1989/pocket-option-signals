@@ -11,8 +11,8 @@
     .card { background:#0f172a; margin:1em 0; padding:1em; border-radius:10px; }
     input,textarea,select { width:100%; background:#0b1220; color:#e5f0ff; border:1px solid #24324a; border-radius:8px; padding:8px }
     label { display:block; margin:8px 0 4px; }
-    .row { display:flex; gap:12px; }
-    .col { flex:1 }
+    .row { display:flex; gap:12px; flex-wrap:wrap }
+    .col { flex:1; min-width:220px }
     table { width:100%; border-collapse:collapse; margin-top:8px}
     th,td { border:1px solid #24324a; padding:6px; font-size:14px }
     .muted{ color:#a7b6cc }
@@ -70,7 +70,7 @@
           <label>Live TF</label>
           <select name="live_tf">
             {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-              <option value="{{tf}}" {% if tf==window.tf or tf==strategies.live_tf or tf==config.live_tf or tf=='' %}{% endif %}{% if tf==('' if not strategies else '') %}{% endif %} {% if tf==('' if not tz else '') %}{% endif %} {% if tf==('' if not window else '') %}{% endif %} {% if tf==('' if not window else '') %}{% endif %}>{{tf}}</option>
+              <option value="{{tf}}" {% if tf==live_tf %}selected{% endif %}>{{tf}}</option>
             {% endfor %}
           </select>
         </div>
@@ -78,7 +78,7 @@
           <label>Live Expiry</label>
           <select name="live_expiry">
             {% for e in ['1m','3m','5m','30m','H1','H4'] %}
-              <option value="{{e}}" {% if e==('' if not window else '') %}{% endif %}>{{e}}</option>
+              <option value="{{e}}" {% if e==live_expiry %}selected{% endif %}>{{e}}</option>
             {% endfor %}
           </select>
         </div>
@@ -128,11 +128,10 @@
 
   <div class="card">
     <h2>Custom Strategies</h2>
-    {% for idx in [1,2,3] %}
-      {% set c = globals()['custom'+idx|string] %}
+    {% for c in customs %}
       <form method="post" action="{{ url_for('dashboard.update_custom') }}" style="margin-bottom:14px">
-        <div class="tag"><b>Custom #{{idx}}</b></div>
-        <input type="hidden" name="slot" value="{{idx}}">
+        <div class="tag"><b>Custom #{{c._idx}}</b></div>
+        <input type="hidden" name="slot" value="{{c._idx}}">
         <label><input type="checkbox" name="enabled" {% if c.enabled %}checked{% endif %}/> enabled</label>
         <label>Mode</label>
         <select name="mode">
@@ -161,7 +160,7 @@
           <label>buy_rule_json</label><textarea name="buy_rule_json" rows="2">{{ c.buy_rule|tojson }}</textarea>
           <label>sell_rule_json</label><textarea name="sell_rule_json" rows="2">{{ c.sell_rule|tojson }}</textarea>
         </details>
-        <button class="btn" style="margin-top:8px">Save Custom #{{idx}}</button>
+        <button class="btn" style="margin-top:8px">Save Custom #{{c._idx}}</button>
       </form>
     {% endfor %}
   </div>
@@ -257,9 +256,6 @@
           {% endfor %}
         </tbody>
       </table>
-      <div class="muted" style="margin-top:6px">
-        Total: {{bt.summary.trades}} | Wins: {{bt.summary.wins}} | Losses: {{bt.summary.losses}} | Draws: {{bt.summary.draws}} | Winrate: {{bt.summary.winrate}}%
-      </div>
       {% if bt.results and bt.results[0].rows %}
         <details style="margin-top:8px"><summary>Recent Signals (preview)</summary>
           <table>
@@ -274,6 +270,9 @@
           </table>
         </details>
       {% endif %}
+      <div class="muted" style="margin-top:6px">
+        Total: {{bt.summary.trades}} | Wins: {{bt.summary.wins}} | Losses: {{bt.summary.losses}} | Draws: {{bt.summary.draws}} | Winrate: {{bt.summary.winrate}}%
+      </div>
     {% elif bt and bt.error %}
       <div class="muted" style="margin-top:8px;color:#fca5a5">Error: {{bt.error}}</div>
     {% endif %}
