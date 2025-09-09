@@ -2,6 +2,7 @@ import os, json, re
 from io import StringIO
 from datetime import datetime
 import pandas as pd
+import requests
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify
 
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE, log
@@ -374,18 +375,48 @@ def telegram_test():
     flash("Telegram OK" if ok else f"Telegram error: {msg}")
     return redirect(url_for('dashboard.dashboard'))
 
-# --------- Debug helpers ----------
-@bp.route('/live/debug/on')
-def live_debug_on():
-    ENGINE.set_debug(True)
-    return jsonify({"ok": True, "msg": "debug on", "status": ENGINE.status()})
+# --------- Telegram diagnostics ----------
+@bp.route('/telegram/diag')
+def telegram_diag():
+    """
+    Runs several checks:
+      - GET /getMe to verify the token is valid
+      - Lists the configured chat envs
+      - Attempts a test send to each configured chat, returning per-chat result
+    Masks the token in the response.
+    """
+    from live_engine import _send_telegram
 
-@bp.route('/live/debug/off')
-def live_debug_off():
-    ENGINE.set_debug(False)
-    return jsonify({"ok": True, "msg": "debug off", "status": ENGINE.status()})
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return jsonify({"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}), 200
 
-@bp.route('/live/step', methods=['POST','GET'])
-def live_step():
-    ok, msg = ENGINE.step_once()
-    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
+    # getMe check
+    getme_url = f"https://api.telegram.org/bot{token}/getMe"
+    getme = {}
+    try:
+        r = requests.get(getme_url, timeout=8)
+        getme = r.json()
+    except Exception as e:
+        getme = {"ok": False, "error": str(e)}
+
+    # Collect chats
+    chat_envs = {k: os.getenv(k, "").strip() for k in (
+        "TELEGRAM_CHAT_ID",
+        "TELEGRAM_CHAT_ID_TIER1",
+        "TELEGRAM_CHAT_ID_TIER2",
+        "TELEGRAM_CHAT_ID_TIER3",
+    )}
+    configured = {k: v for k, v in chat_envs.items() if v}
+
+    # Try a send
+    ok, info = _send_telegram("🧪 Telegram DIAG: test message from Pocket Option Signals.")
+    masked = token[:9] + "..." + token[-6:] if len(token) > 18 else "***"
+
+    return jsonify({
+        "ok": ok,
+        "token_masked": masked,
+        "getMe": getme,
+        "configured_chats": configured,
+        "send_result": info
+    })
