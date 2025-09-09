@@ -30,7 +30,6 @@ def up_check():
 
 @bp.route('/health')
 def health_check():
-    # optionally check DB connectivity, config presence
     try:
         _ = get_config()
         return json.dumps({"ok": True, "time": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")}), 200, {"Content-Type":"application/json"}
@@ -82,11 +81,9 @@ def dashboard():
     server_data = {"path": deriv_path, "exists": False, "rows": 0, "mtime": None, "columns": []}
     if os.path.exists(deriv_path):
         try:
-            # tiny read to verify columns
             head_df = pd.read_csv(deriv_path, nrows=5)
             server_data["columns"] = list(map(str, head_df.columns))
             server_data["exists"] = True
-            # quick line count (minus header)
             with open(deriv_path, 'rb') as fh:
                 server_data["rows"] = max(0, sum(1 for _ in fh) - 1)
             server_data["mtime"] = datetime.fromtimestamp(os.path.getmtime(deriv_path)).strftime('%Y-%m-%d %H:%M:%S')
@@ -154,7 +151,6 @@ def update_custom():
             simple_sell = (request.form.get('simple_sell') or '').strip()
             buy_rule, sell_rule = "", ""
 
-            # Attempt auto-split if a single long sentence has both sides
             if simple_buy and ("then buy" in simple_buy.lower() or "then sell" in simple_buy.lower()):
                 buy_rule, sell_rule = parse_natural_pair(simple_buy)
 
@@ -224,7 +220,6 @@ def backtest():
     server_path = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
 
     if use_server:
-        # Prefer server data if checkbox ticked
         if not os.path.exists(server_path):
             flash("No server data found. Click 'Pull from Deriv' first, or upload a CSV.")
             return redirect(url_for('dashboard.dashboard'))
@@ -246,7 +241,6 @@ def backtest():
                 flash(f"CSV parse error: {e}")
                 return redirect(url_for('dashboard.dashboard'))
         else:
-            # If no file upload and not using server, but server data exists, be helpful and use it
             if os.path.exists(server_path):
                 try:
                     df = pd.read_csv(server_path)
@@ -312,42 +306,95 @@ def backtest_get():
         return redirect(url_for('dashboard.login', next=request.path))
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Deriv fetch ----------------
+# ---------------- Deriv fetch (FIXED) ----------------
 from websocket import WebSocketApp
 DERIV_SAVE_PATH = os.getenv('DERIV_SAVE_PATH','/tmp/deriv_last_month.csv')
 
 def fetch_deriv_candles(app_id: str, symbol: str, granularity_sec: int, count: int = 1440) -> str:
+    """
+    Correct Deriv WS v3 request for candles:
+    {
+      "ticks_history": "<SYMBOL>",
+      "count": <N>,
+      "end": "latest",
+      "granularity": <sec>,
+      "style": "candles",
+      "adjust_start_time": 1
+    }
+    Response contains 'candles': [{epoch,open,high,low,close}, ...]
+    """
     result = {'done': False, 'error': None}
     def on_message(ws, message):
         try:
             data = json.loads(message)
-            if 'candles' in data:
-                df = pd.DataFrame(data['candles'])
-                if df.empty:
-                    result['error'] = 'No candles returned'
+
+            # Handle explicit errors
+            if 'error' in data:
+                result['error'] = data['error'].get('message','Deriv API error')
+                result['done'] = True
+                ws.close()
+                return
+
+            # Parse candles
+            candles = None
+            if 'candles' in data and isinstance(data['candles'], list):
+                candles = data['candles']
+            elif 'history' in data and isinstance(data['history'], dict) and 'candles' in data['history']:
+                candles = data['history']['candles']
+
+            if candles is None:
+                # Might still be a ping/subscription ack; ignore
+                return
+
+            df = pd.DataFrame(candles)
+            if df.empty:
+                result['error'] = 'No candles returned'
+            else:
+                # Ensure proper columns (epoch in seconds)
+                if 'epoch' not in df.columns:
+                    result['error'] = 'Response missing epoch'
                 else:
                     df.rename(columns={'epoch':'timestamp'}, inplace=True)
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-                    df = df[['timestamp','open','high','low','close']]
+                    # Some responses provide string numbers
+                    for c in ('open','high','low','close'):
+                        if c in df.columns:
+                            df[c] = pd.to_numeric(df[c], errors='coerce')
+                    df = df[['timestamp','open','high','low','close']].sort_values('timestamp')
                     df.to_csv(DERIV_SAVE_PATH, index=False)
-            elif 'error' in data:
-                result['error'] = data['error'].get('message','Deriv API error')
+            result['done'] = True
+            ws.close()
         except Exception as e:
             result['error'] = f'Parse error: {e}'
-        finally:
-            result['done'] = True; ws.close()
+            result['done'] = True
+            ws.close()
+
     def on_open(ws):
-        req = {'candles': symbol, 'count': int(count), 'granularity': int(granularity_sec), 'end': 'latest'}
+        req = {
+            "ticks_history": str(symbol),
+            "count": int(count),
+            "end": "latest",
+            "granularity": int(granularity_sec),
+            "style": "candles",
+            "adjust_start_time": 1
+        }
         ws.send(json.dumps(req))
+
     url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id or '1089'}"
     ws = WebSocketApp(url, on_open=on_open, on_message=on_message)
+
     import threading, time
     th = threading.Thread(target=ws.run_forever, daemon=True); th.start()
-    for _ in range(120):
+    for _ in range(300):  # up to ~30s
         if result['done']: break
         time.sleep(0.1)
-    if not result['done']: raise RuntimeError('Timeout connecting to Deriv')
-    if result['error']: raise RuntimeError(result['error'])
+
+    if not result['done']:
+        raise RuntimeError('Timeout contacting Deriv (no response)')
+
+    if result['error']:
+        raise RuntimeError(result['error'])
+
     return DERIV_SAVE_PATH
 
 @bp.route('/deriv_fetch', methods=['POST'])
