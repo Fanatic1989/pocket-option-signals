@@ -17,6 +17,7 @@
     th,td { border:1px solid #24324a; padding:6px; font-size:14px }
     .muted{ color:#a7b6cc }
     .tag{ display:inline-block; background:#172033; padding:2px 6px; border-radius:6px; margin-right:6px }
+    .multibox { height:220px }
   </style>
 </head>
 <body>
@@ -120,9 +121,37 @@
   <div class="card">
     <h2>Active Symbols</h2>
     <form method="post" action="{{ url_for('dashboard.update_symbols') }}">
-      <label>Space/comma separated (e.g., <code>frxEURUSD frxGBPUSD frxUSDJPY</code>)</label>
-      <textarea name="symbols" rows="2">{{ active_symbols|join(" ") }}</textarea>
-      <button class="btn">Save</button>
+      <div class="row">
+        <div class="col">
+          <label>Pick from list (multi-select)</label>
+          <label style="display:flex;align-items:center;gap:8px;margin:0 0 6px 0;">
+            <input type="checkbox" id="selectAllSymbols" style="width:auto"> Select all
+          </label>
+          <select name="symbols_multi" id="symbolsMulti" multiple class="multibox">
+            {% for g in available_groups %}
+              <optgroup label="{{g.label}}">
+                {% for s in g.items %}
+                  <option value="{{s}}" {% if s in active_symbols %}selected{% endif %}>{{s}}</option>
+                {% endfor %}
+              </optgroup>
+            {% endfor %}
+          </select>
+          <script>
+            (function(){
+              const all = document.getElementById('selectAllSymbols');
+              const box = document.getElementById('symbolsMulti');
+              all?.addEventListener('change', e=>{
+                for (const opt of box.options){ opt.selected = all.checked; }
+              });
+            })();
+          </script>
+        </div>
+        <div class="col">
+          <label>Or type manually (space/comma separated)</label>
+          <textarea name="symbols_text" rows="6">{{ active_symbols|join(" ") }}</textarea>
+        </div>
+      </div>
+      <button class="btn" style="margin-top:8px">Save</button>
     </form>
   </div>
 
@@ -195,7 +224,31 @@
     <form method="post" action="/backtest" enctype="multipart/form-data">
       <div class="row">
         <div class="col">
-          <label>Symbols (space/comma)</label>
+          <label>Pick symbols (multi-select)</label>
+          <select name="bt_symbols_multi" id="btSymbolsMulti" multiple class="multibox">
+            {% for g in available_groups %}
+              <optgroup label="{{g.label}}">
+                {% for s in g.items %}
+                  <option value="{{s}}" {% if s in active_symbols %}selected{% endif %}>{{s}}</option>
+                {% endfor %}
+              </optgroup>
+            {% endfor %}
+          </select>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:6px">
+            <input type="checkbox" id="btSelectAll" style="width:auto"> Select all
+          </label>
+          <script>
+            (function(){
+              const all = document.getElementById('btSelectAll');
+              const box = document.getElementById('btSymbolsMulti');
+              all?.addEventListener('change', e=>{
+                for (const opt of box.options){ opt.selected = all.checked; }
+              });
+            })();
+          </script>
+        </div>
+        <div class="col">
+          <label>Or type symbols (space/comma)</label>
           <input name="bt_symbols" value="{{ active_symbols|join(' ') }}">
         </div>
         <div class="col">
@@ -205,17 +258,13 @@
               <option value="{{tf}}" {% if tf=='M5' %}selected{% endif %}>{{tf}}</option>
             {% endfor %}
           </select>
-        </div>
-        <div class="col">
-          <label>Expiry</label>
+          <label style="margin-top:6px">Expiry</label>
           <select name="bt_expiry">
             {% for e in ['1m','3m','5m','30m','H1','H4'] %}
               <option value="{{e}}" {% if e=='5m' %}selected{% endif %}>{{e}}</option>
             {% endfor %}
           </select>
-        </div>
-        <div class="col">
-          <label>Strategy</label>
+          <label style="margin-top:6px">Strategy</label>
           <select name="bt_strategy">
             {% for s in ['BASE','TREND','CHOP','CUSTOM1','CUSTOM2','CUSTOM3'] %}
               <option value="{{s}}">{{s}}</option>
