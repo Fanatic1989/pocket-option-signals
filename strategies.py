@@ -1,8 +1,84 @@
+from __future__ import annotations
+import math
+import re
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
+
+
+# -------------------- Indicator helpers (local, robust) --------------------
+
+def _sma(series: pd.Series, period: int) -> pd.Series:
+    period = max(int(period or 1), 1)
+    return series.rolling(period, min_periods=period).mean()
+
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    period = max(int(period or 1), 1)
+    delta = close.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain).rolling(period, min_periods=period).mean()
+    roll_down = pd.Series(loss).rolling(period, min_periods=period).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return pd.Series(rsi, index=close.index).fillna(method="bfill")
+
+def _stoch(high: pd.Series, low: pd.Series, close: pd.Series, k: int = 14, d: int = 3) -> (pd.Series, pd.Series):
+    k = max(int(k or 1), 1); d = max(int(d or 1), 1)
+    ll = low.rolling(k, min_periods=k).min()
+    hh = high.rolling(k, min_periods=k).max()
+    raw_k = (close - ll) / (hh - ll).replace(0, np.nan) * 100.0
+    k_line = raw_k.rolling(d, min_periods=1).mean()
+    d_line = k_line.rolling(d, min_periods=1).mean()
+    return k_line.fillna(50.0), d_line.fillna(50.0)
+
+def _slope(series: pd.Series, lookback: int = 5) -> pd.Series:
+    lookback = max(int(lookback or 1), 1)
+    # simple slope over lookback using linear regression on index
+    idx = np.arange(len(series))
+    out = np.full(len(series), np.nan)
+    for i in range(lookback - 1, len(series)):
+        x = idx[i - lookback + 1 : i + 1]
+        y = series.iloc[i - lookback + 1 : i + 1].values
+        x_mean = x.mean(); y_mean = y.mean()
+        num = ((x - x_mean) * (y - y_mean)).sum()
+        den = ((x - x_mean) ** 2).sum()
+        out[i] = num / den if den != 0 else 0.0
+    return pd.Series(out, index=series.index)
+
+
+# -------------------- Expiry mapping --------------------
+
+def _expiry_to_bars(tf: str, expiry: str) -> int:
+    tf = (tf or "M5").upper()
+    expiry = (expiry or "5m").upper()
+    # timeframe to seconds
+    tf_sec_map = {
+        "M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400
+    }
+    tf_sec = tf_sec_map.get(tf, 300)
+
+    # expiry string to seconds
+    m = re.fullmatch(r"(\d+)\s*([MH]?)", expiry.replace("MIN","M").replace("HR","H").replace("HRS","H"))
+    if not m:
+        # try canonical forms like 1M / 3M / 5M / 30M / H1 / H4
+        if expiry.endswith("M"):
+            secs = int(expiry[:-1]) * 60
+        elif expiry.startswith("H"):
+            secs = int(expiry[1:]) * 3600
+        else:
+            secs = 300
+    else:
+        n = int(m.group(1))
+        unit = m.group(2) or "M"
+        secs = n * (60 if unit == "M" else 3600)
+    bars = max(int(round(secs / tf_sec)), 1)
+    return bars
+
+
+# -------------------- Backtest Container --------------------
 
 @dataclass
 class BTResult:
@@ -10,184 +86,224 @@ class BTResult:
     wins: int = 0
     losses: int = 0
     draws: int = 0
-    winrate: float = 0.0
-    rows: List[dict] = field(default_factory=list)
+    rows: List[Dict[str, Any]] = field(default_factory=list)
 
-def _expiry_to_bars(expiry_label: str, tf: str) -> int:
-    # expiry like "1m","3m","5m","30m","H1","H4"
-    tf_map = {"M1":1,"M2":2,"M3":3,"M5":5,"M10":10,"M15":15,"M30":30,"H1":60,"H4":240,"D1":1440}
-    e_map = {"1m":1,"3m":3,"5m":5,"30m":30,"h1":60,"h4":240}
-    tf_min = tf_map.get(tf.upper(), 5)
-    e = e_map.get(expiry_label.lower(), 5)
-    return max(1, int(round(e / tf_min)))
+    @property
+    def winrate(self) -> float:
+        return (self.wins / self.trades) if self.trades else 0.0
 
-def _ensure_indicators(df: pd.DataFrame, cfg: Dict[str,Any]) -> pd.DataFrame:
-    out = df.copy()
 
-    # --- Moving Averages (period driven) ---
-    period_sma = int(cfg["indicators"].get("sma",{}).get("period",50))
-    out["sma50"] = ta.sma(out["close"], length=period_sma)
+# -------------------- Core signal builders --------------------
 
-    if cfg["indicators"].get("ema",{}).get("enabled"):
-        out["ema"] = ta.ema(out["close"], length=int(cfg["indicators"]["ema"].get("period",21)))
-    if cfg["indicators"].get("wma",{}).get("enabled"):
-        out["wma"] = ta.wma(out["close"], length=int(cfg["indicators"]["wma"].get("period",20)))
-    if cfg["indicators"].get("smma",{}).get("enabled"):
-        # SMMA (RMA) approximation using ta.rma
-        out["smma"] = ta.rma(out["close"], length=int(cfg["indicators"]["smma"].get("period",20)))
-    if cfg["indicators"].get("tma",{}).get("enabled"):
-        # TMA approximation via 2x SMA
-        l = int(cfg["indicators"]["tma"].get("period",20))
-        out["tma"] = ta.sma(ta.sma(out["close"], length=l), length=l)
+def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d.columns = [c.strip().lower() for c in d.columns]
+    if "timestamp" not in d.columns:
+        # synth ts if missing
+        d["timestamp"] = range(len(d))
+    # coerce OHLC
+    for c in ("open","high","low","close"):
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["close"]).reset_index(drop=True)
+    return d
 
-    # --- RSI ---
-    out["rsi"] = ta.rsi(out["close"], length=int(cfg["indicators"].get("rsi",{}).get("period",14)))
+def _prep_indicators(d: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+    sma_period = int(params.get("sma_period", 50))
+    rsi_period = int(params.get("rsi_period", 14))
+    st_k = int(params.get("stoch_k", 14))
+    st_d = int(params.get("stoch_d", 3))
+    d["sma"] = _sma(d["close"], sma_period)
+    d["rsi"] = _rsi(d["close"], rsi_period)
+    d["sk"], d["sd"] = _stoch(d["high"], d["low"], d["close"], st_k, st_d)
+    d["sma_slope"] = _slope(d["sma"], lookback=5)
+    return d
 
-    # --- Bollinger Bands ---
-    bb_len = int(cfg["indicators"].get("bb",{}).get("period",20))
-    bb_std = float(cfg["indicators"].get("bb",{}).get("std",2.0))
-    bb = ta.bbands(out["close"], length=bb_len, std=bb_std)
-    if bb is not None and isinstance(bb, pd.DataFrame):
-        out["bb_low"] = bb.iloc[:,0]
-        out["bb_mid"] = bb.iloc[:,1]
-        out["bb_up"] = bb.iloc[:,2]
-    else:
-        out["bb_low"]=np.nan; out["bb_mid"]=np.nan; out["bb_up"]=np.nan
+def _cross_up(a_prev, a_now, b_prev, b_now) -> bool:
+    try:
+        return a_prev < b_prev and a_now > b_now
+    except Exception:
+        return False
 
-    # --- Stochastic ---
-    st = ta.stoch(high=out["high"], low=out["low"], close=out["close"],
-                  k=int(cfg["indicators"].get("stoch",{}).get("k",14)),
-                  d=int(cfg["indicators"].get("stoch",{}).get("d",3)),
-                  smooth_k=int(cfg["indicators"].get("stoch",{}).get("smooth_k",3)))
-    if st is not None and isinstance(st, pd.DataFrame):
-        out["stoch_k"] = st.iloc[:,0]; out["stoch_d"]=st.iloc[:,1]
-    else:
-        out["stoch_k"]=np.nan; out["stoch_d"]=np.nan
+def _cross_dn(a_prev, a_now, b_prev, b_now) -> bool:
+    try:
+        return a_prev > b_prev and a_now < b_now
+    except Exception:
+        return False
 
-    # (Optional) more indicators could be added here as enabled
-    return out
 
-def _signal_base(row_prev, row):
-    # Example BASE logic: trend-following around SMA(midline) + RSI
-    if row["close"] > row["sma50"] and row["rsi"] > 50: return "BUY"
-    if row["close"] < row["sma50"] and row["rsi"] < 50: return "SELL"
-    return ""
+# -------------------- Strategy conditions --------------------
 
-def _signal_trend(row_prev, row):
-    # Stricter momentum flavor
-    if row["close"] > row["sma50"] and row["rsi"] > 52 and row_prev["rsi"] < row["rsi"]:
-        return "BUY"
-    if row["close"] < row["sma50"] and row["rsi"] < 48 and row_prev["rsi"] > row["rsi"]:
-        return "SELL"
-    return ""
+def _base_conditions(d: pd.DataFrame) -> pd.Series:
+    # Buy: price above SMA, RSI > 55, Stoch K cross above D
+    buy = pd.Series(False, index=d.index)
+    sell = pd.Series(False, index=d.index)
+    for i in range(1, len(d)):
+        buy.iloc[i] = (
+            d["close"].iloc[i] > d["sma"].iloc[i] and
+            d["rsi"].iloc[i] > 55 and
+            _cross_up(d["sk"].iloc[i-1], d["sk"].iloc[i], d["sd"].iloc[i-1], d["sd"].iloc[i])
+        )
+        sell.iloc[i] = (
+            d["close"].iloc[i] < d["sma"].iloc[i] and
+            d["rsi"].iloc[i] < 45 and
+            _cross_dn(d["sk"].iloc[i-1], d["sk"].iloc[i], d["sd"].iloc[i-1], d["sd"].iloc[i])
+        )
+    return buy, sell
 
-def _signal_chop(row_prev, row):
-    # Mean-reversion off the bands back to midline
-    if not np.isnan(row["bb_low"]) and row["close"] < row["bb_low"] and row["close"] > row["bb_mid"]:
-        return "BUY"
-    if not np.isnan(row["bb_up"]) and row["close"] > row["bb_up"] and row["close"] < row["bb_mid"]:
-        return "SELL"
-    return ""
+def _trend_conditions(d: pd.DataFrame) -> pd.Series:
+    # Trend: SMA slope > 0, pullback that respects SMA and RSI bounces from 50 → buy.
+    buy = pd.Series(False, index=d.index)
+    sell = pd.Series(False, index=d.index)
+    for i in range(2, len(d)):
+        # Uptrend buy
+        buy.iloc[i] = (
+            (d["sma_slope"].iloc[i] > 0) and
+            (d["close"].iloc[i-1] <= d["sma"].iloc[i-1]) and
+            (d["close"].iloc[i]   >  d["sma"].iloc[i]) and
+            (d["rsi"].iloc[i-1] <= 50) and (d["rsi"].iloc[i] > 50)
+        )
+        # Downtrend sell
+        sell.iloc[i] = (
+            (d["sma_slope"].iloc[i] < 0) and
+            (d["close"].iloc[i-1] >= d["sma"].iloc[i-1]) and
+            (d["close"].iloc[i]   <  d["sma"].iloc[i]) and
+            (d["rsi"].iloc[i-1] >= 50) and (d["rsi"].iloc[i] < 50)
+        )
+    return buy, sell
 
-def _signal_custom(cfg_custom, row_prev, row):
-    # Interprets dict produced by rules.parse_natural_rule
-    def match(rule: dict, up: bool):
-        if not rule: return False
-        ok = True
-        if "sma_respect" in rule:
-            sma = row.get("sma50")
-            if not np.isnan(sma):
-                if up:   ok &= row["close"] >= sma
-                else:    ok &= row["close"] <= sma
-        if "rsi_bounce" in rule:
-            if rule["rsi_bounce"] == "up":
-                ok &= row_prev["rsi"] <= 50 and row["rsi"] > 50
-            elif rule["rsi_bounce"] == "down":
-                ok &= row_prev["rsi"] >= 50 and row["rsi"] < 50
-        if "stoch_cross" in rule:
-            if rule["stoch_cross"] == "up":
-                ok &= row_prev["stoch_k"] <= row_prev["stoch_d"] and row["stoch_k"] > row["stoch_d"]
-            elif rule["stoch_cross"] == "down":
-                ok &= row_prev["stoch_k"] >= row_prev["stoch_d"] and row["stoch_k"] < row["stoch_d"]
-        return ok
+def _chop_conditions(d: pd.DataFrame) -> pd.Series:
+    # Mean reversion: RSI < 30 → buy, RSI > 70 → sell, with mild stoch confirmation
+    buy = pd.Series(False, index=d.index)
+    sell = pd.Series(False, index=d.index)
+    for i in range(1, len(d)):
+        buy.iloc[i] = (d["rsi"].iloc[i] < 30) and (d["sk"].iloc[i] > d["sd"].iloc[i])
+        sell.iloc[i] = (d["rsi"].iloc[i] > 70) and (d["sk"].iloc[i] < d["sd"].iloc[i])
+    return buy, sell
 
-    buy_rule = cfg_custom.get("buy_rule_dict") or {}
-    sell_rule = cfg_custom.get("sell_rule_dict") or {}
-    if match(buy_rule, True): return "BUY"
-    if match(sell_rule, False): return "SELL"
-    return ""
 
-def _prepare_custom_dicts(cfg: dict):
-    c = cfg.get("custom", {})
-    def ensure_dict(x): return x if isinstance(x, dict) else {}
-    c["buy_rule_dict"] = ensure_dict(c.get("buy_rule"))
-    c["sell_rule_dict"] = ensure_dict(c.get("sell_rule"))
-    return c
+# -------------------- Custom rule evaluation --------------------
 
-def run_backtest_core_binary(df: pd.DataFrame, strategy: str, cfg: Dict[str,Any], tf: str, expiry_label: str) -> BTResult:
-    if df is None or df.empty:
+def _eval_custom(d: pd.DataFrame, custom: Dict[str, Any]) -> (pd.Series, pd.Series):
+    """
+    Very simple engine: expects dict rules from your natural-language parser,
+    with keys under 'buy'/'sell' arrays OR empty → falls back to BASE.
+    Rule keys supported (boolean AND):
+      price_above_sma / price_below_sma
+      rsi_gt / rsi_lt (number)
+      stoch_cross_up / stoch_cross_dn (bool)
+    """
+    if not custom:
+        return _base_conditions(d)
+
+    br = (custom.get("buy_rule") or custom.get("buy") or {})
+    sr = (custom.get("sell_rule") or custom.get("sell") or {})
+    if not br and not sr:
+        return _base_conditions(d)
+
+    def build(rule: Dict[str, Any]) -> pd.Series:
+        cond = pd.Series(True, index=d.index)
+        if not rule:
+            return pd.Series(False, index=d.index)
+        for i in range(1, len(d)):
+            ok = True
+            if rule.get("price_above_sma"): ok = ok and (d["close"].iloc[i] > d["sma"].iloc[i])
+            if rule.get("price_below_sma"): ok = ok and (d["close"].iloc[i] < d["sma"].iloc[i])
+            if "rsi_gt" in rule:           ok = ok and (d["rsi"].iloc[i] > float(rule["rsi_gt"]))
+            if "rsi_lt" in rule:           ok = ok and (d["rsi"].iloc[i] < float(rule["rsi_lt"]))
+            if rule.get("stoch_cross_up"): ok = ok and _cross_up(d["sk"].iloc[i-1], d["sk"].iloc[i], d["sd"].iloc[i-1], d["sd"].iloc[i])
+            if rule.get("stoch_cross_dn"): ok = ok and _cross_dn(d["sk"].iloc[i-1], d["sk"].iloc[i], d["sd"].iloc[i-1], d["sd"].iloc[i])
+            cond.iloc[i] = ok
+        return cond
+
+    buy = build(br)
+    sell = build(sr)
+    return buy, sell
+
+
+# -------------------- Backtest core (binary) --------------------
+
+def run_backtest_core_binary(
+    df: pd.DataFrame,
+    core: str,
+    cfg: Dict[str, Any],
+    tf: str,
+    expiry: str,
+) -> BTResult:
+    """
+    Simple binary options backtest:
+      - Enter on the bar AFTER a condition becomes true.
+      - Exit exactly N bars later (N from expiry/timeframe).
+      - Outcome: compare exit close vs entry close (ties count as LOSS).
+    """
+    d = _ensure_cols(df)
+    # Minimal guard
+    if len(d) < 30:
         return BTResult()
 
-    data = df.copy()
-    for col in ("open","high","low","close"):
-        if col not in data.columns:
-            raise ValueError("CSV must include open, high, low, close, timestamp")
+    # Indicator params (can be overridden from cfg['indicators'], but we use defaults regardless of toggles)
+    inds_cfg = (cfg or {}).get("indicators", {})
+    ip = {
+        "sma_period": int(inds_cfg.get("sma", {}).get("period", 50)),
+        "rsi_period": int(inds_cfg.get("rsi", {}).get("period", 14)),
+        "stoch_k":    int(inds_cfg.get("stoch", {}).get("k", 14)),
+        "stoch_d":    int(inds_cfg.get("stoch", {}).get("d", 3)),
+    }
+    d = _prep_indicators(d, ip)
 
-    data = data.sort_values("timestamp").reset_index(drop=True)
-    data = _ensure_indicators(data, cfg)
-    bars_ahead = _expiry_to_bars(expiry_label, tf)
+    bars = _expiry_to_bars(tf, expiry)
+    result = BTResult()
 
-    rows = []
-    wins=losses=draws=trades=0
+    core = (core or "BASE").upper()
+    if core == "TREND":
+        buy_sig, sell_sig = _trend_conditions(d)
+    elif core == "CHOP":
+        buy_sig, sell_sig = _chop_conditions(d)
+    elif core == "CUSTOM":
+        custom = (cfg or {}).get("custom", {}) or {}
+        buy_sig, sell_sig = _eval_custom(d, custom)
+    else:
+        buy_sig, sell_sig = _base_conditions(d)
 
-    strat = (strategy or "BASE").upper()
-    custom_cfg = _prepare_custom_dicts(cfg)
+    for i in range(1, len(d) - bars):
+        # Entry on next candle when signal is true at i
+        if buy_sig.iloc[i]:
+            entry_idx = i + 1
+            exit_idx  = entry_idx + bars
+            if exit_idx >= len(d): break
+            entry = float(d["close"].iloc[entry_idx])
+            exitp = float(d["close"].iloc[exit_idx])
+            outcome = "WIN" if exitp > entry else "LOSS" if exitp < entry else "LOSS"
+            result.trades += 1
+            if outcome == "WIN": result.wins += 1
+            elif outcome == "LOSS": result.losses += 1
+            else: result.draws += 1
+            result.rows.append({
+                "time_in":  d["timestamp"].iloc[entry_idx],
+                "dir":      "BUY",
+                "entry":    entry,
+                "time_out": d["timestamp"].iloc[exit_idx],
+                "exit":     exitp,
+                "outcome":  outcome
+            })
+        if sell_sig.iloc[i]:
+            entry_idx = i + 1
+            exit_idx  = entry_idx + bars
+            if exit_idx >= len(d): break
+            entry = float(d["close"].iloc[entry_idx])
+            exitp = float(d["close"].iloc[exit_idx])
+            outcome = "WIN" if exitp < entry else "LOSS" if exitp > entry else "LOSS"
+            result.trades += 1
+            if outcome == "WIN": result.wins += 1
+            elif outcome == "LOSS": result.losses += 1
+            else: result.draws += 1
+            result.rows.append({
+                "time_in":  d["timestamp"].iloc[entry_idx],
+                "dir":      "SELL",
+                "entry":    entry,
+                "time_out": d["timestamp"].iloc[exit_idx],
+                "exit":     exitp,
+                "outcome":  outcome
+            })
 
-    for i in range(50, len(data)-bars_ahead):
-        prev = data.iloc[i-1]
-        cur  = data.iloc[i]
-        sig = ""
-        if strat == "BASE":
-            sig = _signal_base(prev, cur)
-        elif strat == "TREND":
-            sig = _signal_trend(prev, cur)
-        elif strat == "CHOP":
-            sig = _signal_chop(prev, cur)
-        elif strat == "CUSTOM":
-            sig = _signal_custom(custom_cfg, prev, cur)
-
-        if not sig:
-            continue
-
-        entry = float(cur["close"])
-        out = data.iloc[i+bars_ahead]
-        exitp = float(out["close"])
-
-        outcome = "DRAW"
-        if sig == "BUY":
-            if exitp > entry: outcome="WIN"
-            elif exitp < entry: outcome="LOSS"
-        else:
-            if exitp < entry: outcome="WIN"
-            elif exitp > entry: outcome="LOSS"
-
-        trades += 1
-        if outcome=="WIN": wins+=1
-        elif outcome=="LOSS": losses+=1
-        else: draws+=1
-
-        rows.append({
-            "idx": int(i),
-            "time_in": str(cur.get("timestamp")),
-            "dir": sig,
-            "entry": entry,
-            "time_out": str(out.get("timestamp")),
-            "exit": exitp,
-            "outcome": outcome
-        })
-
-    winrate = (wins/ trades) if trades else 0.0
-    if len(rows) > 20:
-        rows = rows[-20:]  # small preview
-
-    return BTResult(trades=trades, wins=wins, losses=losses, draws=draws, winrate=winrate, rows=rows)
+    return result
