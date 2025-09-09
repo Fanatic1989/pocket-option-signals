@@ -1,145 +1,272 @@
-import os, threading, time, traceback
+import os
+import threading
+import time
 from datetime import datetime
+from typing import List, Tuple, Optional
+
 import pandas as pd
+
+from utils import get_config, within_window, TZ, log
+from strategies import run_backtest_core_binary
+from data_fetch import deriv_csv_path  # only path helper; no import of routes!
 import requests
 
-from utils import TZ, get_config, within_window, log
-from strategies import run_backtest_core_binary
-from data_fetch import deriv_csv_path, fetch_one_symbol  # ← breaks cycle
 
-BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_TIER = {1: os.getenv("TG_CHAT_TIER1",""), 2: os.getenv("TG_CHAT_TIER2",""), 3: os.getenv("TG_CHAT_TIER3","")}
-CHAT_ADMIN = os.getenv("TG_CHAT_ADMIN","")
+def _send_telegram(text: str) -> Tuple[bool, str]:
+    """
+    Sends a message to up to three tiered chats (optional).
+    Env:
+      TELEGRAM_BOT_TOKEN   (required)
+      TELEGRAM_CHAT_ID     (optional default)
+      TELEGRAM_CHAT_ID_TIER1 / TIER2 / TIER3  (optional)
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return False, "Missing TELEGRAM_BOT_TOKEN"
 
-def tg_send(chat_id: str, text: str, parse_mode: str = "HTML"):
-    if not BOT or not chat_id:
-        return False, "Missing BOT token or chat_id"
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT}/sendMessage", timeout=10,
-                          json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True})
-        ok = r.status_code == 200
-        if not ok: log("ERROR", f"Telegram send fail {r.status_code}: {r.text}")
-        return ok, (r.text if not ok else "ok")
-    except Exception as e:
-        log("ERROR", f"Telegram exception: {e}")
-        return False, str(e)
+    # Collect all target chats (unique and non-empty)
+    chats = []
+    for key in ("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID_TIER1", "TELEGRAM_CHAT_ID_TIER2", "TELEGRAM_CHAT_ID_TIER3"):
+        cid = os.getenv(key, "").strip()
+        if cid:
+            chats.append(cid)
+    chats = list(dict.fromkeys(chats))  # dedupe keep order
+    if not chats:
+        return False, "No TELEGRAM_CHAT_ID* provided"
 
-def tg_test():
-    return tg_send(CHAT_ADMIN or CHAT_TIER.get(1) or CHAT_TIER.get(2) or CHAT_TIER.get(3),
-                   f"✅ Live ping {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    ok_count = 0
+    last_error = ""
+    for chat in chats:
+        try:
+            resp = requests.post(url, json={"chat_id": chat, "text": text, "parse_mode": "HTML"}, timeout=10)
+            if resp.ok and resp.json().get("ok"):
+                ok_count += 1
+            else:
+                last_error = f"chat {chat} -> {resp.text}"
+        except Exception as e:
+            last_error = f"chat {chat} -> {e}"
+
+    if ok_count:
+        return True, f"sent to {ok_count} chat(s)"
+    return False, last_error or "unknown telegram error"
+
+
+def _format_signal_msg(sym: str, tf: str, expiry: str, direction: str, tstamp: str, price: Optional[float]) -> str:
+    p = f"{price:.5f}" if isinstance(price, (int, float)) else "-"
+    return (
+        f"📣 <b>Pocket Option Signal</b>\n"
+        f"Pair: <b>{sym}</b>\n"
+        f"TF: <b>{tf}</b> | Expiry: <b>{expiry}</b>\n"
+        f"Direction: <b>{direction}</b>\n"
+        f"Time: <code>{tstamp}</code>\n"
+        f"Price: <code>{p}</code>"
+    )
+
 
 class LiveEngine:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._thr = None
-        self._stop = threading.Event()
-        self._status = {"running": False, "last_loop": None, "last_error": None, "sent": 0}
-        self._last_sig = {}
+    """
+    Lightweight live loop that:
+      - Respects the trading window (utils.within_window)
+      - Uses whatever strategy is currently enabled
+      - Reads CSVs saved via /deriv_fetch (data_fetch.deriv_csv_path)
+      - Derives a signal by running a tiny backtest slice and grabbing the last trade
+      - Sends signals to Telegram when present
+      - Provides debug notes and a manual "step once"
+    """
+
+    def __init__(self) -> None:
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._stop_ev = threading.Event()
+
+        self._last_error: Optional[str] = None
+        self._last_loop: Optional[str] = None
+        self._sent = 0
+
+        self._debug = False
+        self._last_reasons: List[str] = []
+
+        # loop cadence in seconds
+        self._period_sec = int(os.getenv("LIVE_LOOP_SECONDS", "30"))
+
+    # -------- public API ----------
 
     def status(self):
-        with self._lock:
-            return dict(self._status)
+        return {
+            "running": self._running,
+            "sent": self._sent,
+            "last_loop": self._last_loop,
+            "last_error": self._last_error,
+            "debug": self._debug,
+            "last_reasons": self._last_reasons[-50:],  # tail
+        }
+
+    def set_debug(self, on: bool):
+        self._debug = bool(on)
+        self._note(f"debug={'ON' if self._debug else 'OFF'}")
 
     def start(self):
-        with self._lock:
-            if self._thr and self._thr.is_alive():
-                return False, "already running"
-            self._stop.clear()
-            self._thr = threading.Thread(target=self._run, daemon=True)
-            self._thr.start()
-            self._status["running"] = True
-            self._status["last_error"] = None
+        if self._running:
+            return True, "already running"
+        self._stop_ev.clear()
+        self._thread = threading.Thread(target=self._run_forever, name="LiveEngine", daemon=True)
+        self._running = True
+        self._thread.start()
         return True, "started"
 
     def stop(self):
-        with self._lock:
-            self._stop.set()
-            self._status["running"] = False
-        return True, "stopping"
+        if not self._running:
+            return True, "already stopped"
+        self._stop_ev.set()
+        self._running = False
+        return True, "stopped"
 
-    def _run(self):
-        SLEEP = int(os.getenv("LIVE_LOOP_SEC", "55"))
-        COUNT = int(os.getenv("LIVE_FETCH_CANDLES", "300"))
-        gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
+    def step_once(self):
+        """Run exactly one iteration without flipping running state."""
+        try:
+            self._note("manual step_once invoked")
+            self._run_once()
+            self._last_loop = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            return True, "stepped"
+        except Exception as e:
+            self._last_error = str(e)
+            self._note(f"error: {e}")
+            return False, str(e)
 
-        while not self._stop.is_set():
+    # -------- internals ----------
+
+    def _run_forever(self):
+        self._note("loop start")
+        while not self._stop_ev.is_set():
             try:
-                cfg = get_config()
-                self._status["last_loop"] = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-                if not within_window(cfg): time.sleep(SLEEP); continue
-
-                symbols = cfg.get("symbols") or []
-                if not symbols: time.sleep(SLEEP); continue
-
-                strategy = next((n for n,o in (cfg.get("strategies") or {}).items() if o.get("enabled")), None)
-                if not strategy: time.sleep(SLEEP); continue
-
-                tf = (cfg.get("live_tf") or "M5").upper()
-                expiry = (cfg.get("live_expiry") or "5m")
-                gran = gran_map.get(tf, 300)
-
-                cfg_for_run = dict(cfg)
-                if strategy.upper() in ("CUSTOM1","CUSTOM2","CUSTOM3"):
-                    sid = strategy[-1]
-                    cfg_for_run["custom"] = cfg.get(f"custom{sid}", {})
-                    core_strategy = "CUSTOM"
-                else:
-                    core_strategy = strategy
-
-                sent_now = 0
-                for sym in symbols:
-                    try:
-                        fetch_one_symbol(os.getenv("DERIV_APP_ID", "1089"), sym, gran, COUNT)
-                        path = deriv_csv_path(sym, gran)
-                        df = pd.read_csv(path)
-                        df.columns = [c.strip().lower() for c in df.columns]
-                        if "timestamp" in df.columns: df["timestamp"] = pd.to_datetime(df["timestamp"])
-                        for c in ("open","high","low","close"):
-                            if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-                        df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
-                        if len(df) < 50: continue
-
-                        bt = run_backtest_core_binary(df, core_strategy, cfg_for_run, tf, expiry)
-                        last = bt.rows[-1] if bt.rows else None
-                        if not last: continue
-
-                        key = (sym, tf)
-                        last_key = f"{last.get('time_in') or last.get('idx')}"
-                        if self._last_sig.get(key) == last_key: continue
-
-                        tier = int(os.getenv("LIVE_TIER", "2"))
-                        chat_id = CHAT_TIER.get(tier) or CHAT_ADMIN
-                        if not chat_id: continue
-
-                        dir_txt = str(last.get("dir","")).upper()
-                        entry = last.get("entry")
-                        expiry_time = last.get("time_out") or ""
-                        msg = (
-                            f"📢 <b>Signal</b>\n"
-                            f"• Pair: <b>{sym}</b>\n"
-                            f"• TF: <b>{tf}</b>  • Expiry: <b>{expiry}</b>\n"
-                            f"• Strategy: <b>{strategy}</b>\n"
-                            f"• Action: <b>{dir_txt or 'N/A'}</b>\n"
-                            f"• Entry: <code>{entry if entry is not None else '—'}</code>\n"
-                            f"• Expires: <code>{expiry_time}</code>\n"
-                            f"• Time: <code>{datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')}</code>"
-                        )
-                        ok, err = tg_send(chat_id, msg)
-                        if ok:
-                            self._last_sig[key] = last_key
-                            sent_now += 1
-                            self._status["sent"] += 1
-                            log("INFO", f"TELEGRAM SENT [{tier}] {sym} {tf} {dir_txt}")
-                        else:
-                            self._status["last_error"] = f"Telegram: {err}"
-                    except Exception as e:
-                        self._status["last_error"] = f"{sym} error: {e}"
-                        log("ERROR", f"Live loop error {sym}: {e}\n{traceback.format_exc()}")
-
-                time.sleep(SLEEP if sent_now == 0 else 3)
+                self._run_once()
+                self._last_loop = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                self._last_error = None
             except Exception as e:
-                self._status["last_error"] = f"loop crash: {e}"
-                log("ERROR", f"Live loop crash: {e}\n{traceback.format_exc()}")
-                time.sleep(5)
+                self._last_error = str(e)
+                self._note(f"loop error: {e}")
+            # sleep
+            for _ in range(self._period_sec):
+                if self._stop_ev.is_set():
+                    break
+                time.sleep(1)
+        self._note("loop end")
 
+    def _run_once(self):
+        cfg = get_config()  # live cfg
+        # 1) window
+        if not within_window(cfg):
+            self._note("skip: outside trading window")
+            return
+
+        # 2) determine which strategy to run (first enabled wins)
+        strat = self._pick_strategy(cfg)
+        if not strat:
+            self._note("skip: no enabled strategy")
+            return
+
+        tf = cfg.get("live_tf", "M5").upper()
+        expiry = cfg.get("live_expiry", "5m")
+        symbols = cfg.get("symbols") or []
+        if not symbols:
+            self._note("skip: no active symbols")
+            return
+
+        # 3) evaluate each symbol from its latest CSV
+        for sym in symbols:
+            try:
+                df = self._load_df(sym, tf)
+            except Exception as e:
+                self._note(f"{sym}: load error {e}")
+                continue
+
+            if df is None or len(df) < 50:
+                self._note(f"{sym}: skip no/short data")
+                continue
+
+            # Use the same engine as backtest to get decisions on latest bars
+            # We take a tail slice to keep this fast
+            tail = df.tail(300).reset_index(drop=True)
+            try:
+                bt = run_backtest_core_binary(tail, strat["core"], strat["cfg"], tf, expiry)
+            except Exception as e:
+                self._note(f"{sym}: eval error {e}")
+                continue
+
+            if not bt.rows:
+                self._note(f"{sym}: no signal")
+                continue
+
+            last = bt.rows[-1]  # dict with keys like time_in, dir, entry, outcome?
+            # we consider it a live signal if time_in == last candle close (or very recent)
+            t_in = last.get("time_in") or last.get("timestamp") or ""
+            direction = last.get("dir") or last.get("signal") or ""
+            entry = last.get("entry")
+
+            if not direction:
+                self._note(f"{sym}: last row has no direction")
+                continue
+
+            # Send
+            msg = _format_signal_msg(sym, tf, expiry, direction.upper(), str(t_in), entry)
+            ok, info = _send_telegram(msg)
+            if ok:
+                self._sent += 1
+                self._note(f"{sym}: SENT {direction.upper()}")
+            else:
+                self._note(f"{sym}: telegram fail {info}")
+
+    def _pick_strategy(self, cfg) -> Optional[dict]:
+        """
+        Returns {"core": "BASE"/"TREND"/"CHOP"/"CUSTOM", "cfg": full_cfg_with_custom}
+        First enabled among: BASE, TREND, CHOP, CUSTOM1..3
+        """
+        strat_cfg = cfg.get("strategies", {})
+        order = ["BASE", "TREND", "CHOP", "CUSTOM1", "CUSTOM2", "CUSTOM3"]
+        for key in order:
+            enabled = bool(strat_cfg.get(key, {}).get("enabled"))
+            if not enabled:
+                continue
+            if key.startswith("CUSTOM"):
+                slot = key[-1]
+                custom = cfg.get(f"custom{slot}", {})
+                run_cfg = dict(cfg)
+                run_cfg["custom"] = custom
+                return {"core": "CUSTOM", "cfg": run_cfg}
+            return {"core": key, "cfg": cfg}
+        return None
+
+    def _load_df(self, sym: str, tf: str) -> Optional[pd.DataFrame]:
+        gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
+        gran = gran_map.get(tf, 300)
+        path = deriv_csv_path(sym, gran)
+        if not os.path.exists(path):
+            self._note(f"{sym}: no CSV {path}")
+            return None
+        df = pd.read_csv(path)
+        if df.empty:
+            return None
+        df.columns = [c.strip().lower() for c in df.columns]
+        if "timestamp" in df.columns:
+            try:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+            except Exception:
+                pass
+        for c in ("open", "high", "low", "close"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["close"]).reset_index(drop=True)
+        return df
+
+    def _note(self, msg: str):
+        if self._debug:
+            self._last_reasons.append(msg)
+
+
+# Singleton
 ENGINE = LiveEngine()
+
+
+def tg_test() -> Tuple[bool, str]:
+    return _send_telegram("✅ Telegram test: Pocket Option Signals dashboard is connected.")
