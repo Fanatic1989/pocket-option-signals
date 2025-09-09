@@ -9,9 +9,11 @@ from flask import Blueprint, render_template, request, redirect, url_for, sessio
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE, log
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
-from rules import parse_natural_rule, parse_natural_pair  # <-- NEW import
+from rules import parse_natural_rule, parse_natural_pair
 
 bp = Blueprint('dashboard', __name__)
+
+# ---------------- Auth helpers ----------------
 
 def require_login(func):
     from functools import wraps
@@ -21,6 +23,8 @@ def require_login(func):
             return redirect(url_for('dashboard.login', next=request.path))
         return func(*args, **kwargs)
     return wrapper
+
+# ---------------- Auth routes ----------------
 
 @bp.route('/login', methods=['GET','POST'])
 def login():
@@ -37,6 +41,8 @@ def logout():
     session.clear()
     return redirect(url_for('dashboard.index'))
 
+# ---------------- Main pages ----------------
+
 @bp.route('/')
 def index():
     cfg = get_config()
@@ -45,9 +51,8 @@ def index():
                            tz=TIMEZONE, window=cfg['window'])
 
 @bp.route('/dashboard')
+@require_login
 def dashboard():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     cfg = get_config()
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
@@ -56,10 +61,11 @@ def dashboard():
                            users=users, specs=INDICATOR_SPECS, tz=TIMEZONE, 
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'))
 
+# ---------------- Update forms ----------------
+
 @bp.route('/update_window', methods=['POST'])
+@require_login
 def update_window():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     cfg = get_config()
     cfg['window']['start'] = request.form.get('start', cfg['window']['start'])
     cfg['window']['end'] = request.form.get('end', cfg['window']['end'])
@@ -68,9 +74,8 @@ def update_window():
     return redirect(url_for('dashboard.dashboard'))
 
 @bp.route('/update_strategies', methods=['POST'])
+@require_login
 def update_strategies():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     cfg = get_config()
     for name in list(cfg['strategies'].keys()):
         cfg['strategies'][name]['enabled'] = bool(request.form.get(f's_{name}'))
@@ -78,9 +83,8 @@ def update_strategies():
     return redirect(url_for('dashboard.dashboard'))
 
 @bp.route('/update_indicators', methods=['POST'])
+@require_login
 def update_indicators():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     cfg = get_config(); ind = cfg['indicators']
     for key, spec in INDICATOR_SPECS.items():
         ind.setdefault(key, {"enabled": False, **spec["params"]})
@@ -96,9 +100,8 @@ def update_indicators():
     return redirect(url_for('dashboard.dashboard'))
 
 @bp.route('/update_custom', methods=['POST'])
+@require_login
 def update_custom():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     cfg = get_config()
     c = cfg.get('custom', {})
     c['enabled'] = bool(request.form.get('custom_enabled'))
@@ -110,7 +113,6 @@ def update_custom():
 
     try:
         if c['mode'] == 'SIMPLE':
-            # Users sometimes paste everything in one box. Try pair parser first.
             simple_buy  = (request.form.get('simple_buy')  or '').strip()
             simple_sell = (request.form.get('simple_sell') or '').strip()
             buy_rule, sell_rule = "", ""
@@ -118,7 +120,6 @@ def update_custom():
             if simple_buy and ("then buy" in simple_buy or "then sell" in simple_buy):
                 buy_rule, sell_rule = parse_natural_pair(simple_buy)
 
-            # If pair parser didn’t yield both, parse individually from both boxes
             if not buy_rule and simple_buy:
                 buy_rule = parse_natural_rule(simple_buy)
             if not sell_rule and simple_sell:
@@ -135,7 +136,6 @@ def update_custom():
             c['buy_rule']  = (request.form.get('buy_rule') or '').strip()
             c['sell_rule'] = (request.form.get('sell_rule') or '').strip()
     except Exception as e:
-        # Never 500 on bad text: store nothing and show a friendly message
         c['buy_rule'] = c.get('buy_rule', '')
         c['sell_rule'] = c.get('sell_rule', '')
         flash(f"Custom parser error: {e}. Try a simpler sentence or switch to Expert.")
@@ -144,7 +144,7 @@ def update_custom():
     set_config(cfg); flash("Custom rules saved.")
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- filters for backtester ----------------
+# ---------------- Backtest filters ----------------
 
 def filter_df_by_month_and_weekdays(df: pd.DataFrame, month_str: str, weekdays):
     from calendar import monthrange
@@ -175,12 +175,11 @@ def filter_df_last_n_days(df: pd.DataFrame, n_days: int):
     _df = _df[(_df["ts"] >= start) & (_df["ts"] <= end)].drop(columns=["ts"])
     return _df
 
-# ---------------- backtest route ----------------
+# ---------------- Backtest routes ----------------
 
 @bp.route('/backtest', methods=['POST'])
+@require_login
 def backtest():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     cfg = get_config()
     use_server = bool(request.form.get('use_server')); df = None
 
@@ -239,6 +238,13 @@ def backtest():
         users=users, specs=INDICATOR_SPECS, tz=TIMEZONE, now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
         bt=bt, sel_inds=[])
 
+# Graceful redirect for stray GETs
+@bp.route('/backtest', methods=['GET'])
+def backtest_get():
+    if not session.get("admin"):
+        return redirect(url_for('dashboard.login', next=request.path))
+    return redirect(url_for('dashboard.dashboard'))
+
 # ---------------- Deriv fetch ----------------
 
 from websocket import WebSocketApp
@@ -278,15 +284,14 @@ def fetch_deriv_candles(app_id: str, symbol: str, granularity_sec: int, count: i
     return DERIV_SAVE_PATH
 
 @bp.route('/deriv_fetch', methods=['POST'])
+@require_login
 def deriv_fetch():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     app_id = (request.form.get('app_id') or '').strip() or '1089'
     symbol = request.form.get('symbol', '').strip()
     gran = int(request.form.get('granularity', '300'))
     count = int(request.form.get('count', '1440'))
-    if not symbol: 
-        flash('Symbol is required.'); 
+    if not symbol:
+        flash('Symbol is required.')
         return redirect(url_for('dashboard.dashboard'))
     try:
         path = fetch_deriv_candles(app_id, symbol, granularity_sec=gran, count=count)
@@ -296,14 +301,13 @@ def deriv_fetch():
         flash(f'Deriv fetch failed: {e}')
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Manual tally compute/broadcast ----------------
+# ---------------- Tally compute/broadcast ----------------
 
 from utils import compute_tally, send_telegram_message
 
 @bp.route('/send_tally', methods=['POST'])
+@require_login
 def send_tally():
-    if not session.get("admin"):
-        return redirect(url_for('dashboard.login', next=request.path))
     kind = (request.form.get('kind') or 'day').lower()
     if kind not in ('day','week'): kind = 'day'
     t = compute_tally(kind)
@@ -314,3 +318,13 @@ def send_tally():
         flash(f"{kind.title()} tally computed (not broadcast).")
     session['last_tally'] = t
     return redirect(url_for('dashboard.dashboard'))
+
+# ---------------- Robots.txt ----------------
+
+@bp.route('/robots.txt')
+def robots_txt():
+    return ("User-agent: *\n"
+            "Disallow: /backtest\n"
+            "Disallow: /dashboard\n"
+            "Disallow: /deriv_fetch\n"
+            "Disallow: /send_tally\n"), 200, {"Content-Type": "text/plain"}
