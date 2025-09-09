@@ -12,35 +12,44 @@ from strategies import run_backtest_core_binary
 from data_fetch import deriv_csv_path  # path helper only; avoids circular imports
 
 
+# ---- all env keys we support for targets (kept in one tuple) ----
+TELEGRAM_CHAT_KEYS = (
+    "TELEGRAM_CHAT_ID",          # default
+    "TELEGRAM_CHAT_ID_TIER1",    # legacy tiers
+    "TELEGRAM_CHAT_ID_TIER2",
+    "TELEGRAM_CHAT_ID_TIER3",
+    # your tier names:
+    "TELEGRAM_CHAT_BASIC",
+    "TELEGRAM_CHAT_FREE",
+    "TELEGRAM_CHAT_PRO",
+    "TELEGRAM_CHAT_VIP",
+)
+
+
 def _send_telegram(text: str) -> Tuple[bool, str]:
     """
-    Sends a message to up to three tiered chats (optional).
+    Sends a message to any configured chats.
     Env:
-      TELEGRAM_BOT_TOKEN   (required)
-      TELEGRAM_CHAT_ID     (optional default)
-      TELEGRAM_CHAT_ID_TIER1 / TIER2 / TIER3  (optional)
-
+      TELEGRAM_BOT_TOKEN (required)
+      And any of: TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID_TIER1..3,
+                  TELEGRAM_CHAT_BASIC, TELEGRAM_CHAT_FREE, TELEGRAM_CHAT_PRO, TELEGRAM_CHAT_VIP
     Returns (ok, summary)
     """
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         return False, "Missing TELEGRAM_BOT_TOKEN"
 
-    # Collect chat targets
-    chats = []
-    for key in ("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID_TIER1", "TELEGRAM_CHAT_ID_TIER2", "TELEGRAM_CHAT_ID_TIER3"):
-        cid = os.getenv(key, "").strip()
-        if cid:
-            chats.append((key, cid))
-    # de-dupe by cid
+    # Collect chat targets (de-duped, keep order)
     seen = set()
     targets = []
-    for k, cid in chats:
-        if cid not in seen:
-            targets.append((k, cid))
+    for key in TELEGRAM_CHAT_KEYS:
+        cid = os.getenv(key, "").strip()
+        if cid and cid not in seen:
+            targets.append((key, cid))
             seen.add(cid)
+
     if not targets:
-        return False, "No TELEGRAM_CHAT_ID* provided"
+        return False, "No TELEGRAM_CHAT_* provided"
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok_count = 0
@@ -61,7 +70,7 @@ def _send_telegram(text: str) -> Tuple[bool, str]:
                 ok_count += 1
                 details.append(f"{key}:{chat} ok")
             else:
-                # common causes: bot not member/admin, wrong chat id (use negative for groups), privacy mode
+                # common causes: bot not member/admin, wrong chat id (groups need negative id), privacy mode
                 err = data.get("description") if isinstance(data, dict) else resp.text
                 details.append(f"{key}:{chat} error: {err}")
         except Exception as e:
