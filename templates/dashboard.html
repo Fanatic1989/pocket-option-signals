@@ -7,7 +7,7 @@
 header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;background:linear-gradient(90deg,#0f172a,#0b1220)}
 a.btn,button.btn{background:var(--cyan);color:#00111f;border:none;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:600;cursor:pointer}
 .link{background:transparent;color:var(--cyan);padding:0;border:none}
-main{max-width:1160px;margin:24px auto;padding:0 16px}
+main{max-width:1180px;margin:24px auto;padding:0 16px}
 .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}
 .card{grid-column:span 12;background:var(--panel);border:1px solid rgba(255,255,255,.06);border-radius:14px;padding:16px}
 @media(min-width:950px){.span6{grid-column:span 6}.span4{grid-column:span 4}.span8{grid-column:span 8}}
@@ -18,9 +18,9 @@ table{width:100%;border-collapse:collapse;font-size:14px} th,td{border-bottom:1p
 .pill{display:inline-block;padding:6px 10px;border-radius:999px;font-size:12px}.ok{background:#063}.bad{background:#450a0a}.muted{color:#9eb3d9}
 .flash{padding:10px 14px;border-radius:10px;background:#13253d;margin-bottom:12px}
 .code{font-family:ui-monospace,monospace;background:#0a1120;padding:4px 6px;border-radius:8px}
-select.multiselect{min-height:160px}
 .grid-cols{display:grid;grid-template-columns:repeat(4, minmax(0,1fr));gap:8px}
 @media(max-width:900px){.grid-cols{grid-template-columns:repeat(2, minmax(0,1fr));}}
+hr.sep{border:0;border-top:1px solid #1d2740;margin:14px 0}
 </style></head><body>
 <header><div><strong>{{ app_name }}</strong></div>
 <nav>
@@ -47,8 +47,8 @@ select.multiselect{min-height:160px}
   <div class="grid">
     <div class="card span8">
       <h2>Welcome</h2>
-      <p>Binary options dashboard with indicator toggles, Deriv pull, backtester, and <b>Simple English</b> custom strategy.</p>
-      <p class="muted">Live mode reads: <span class="code">/data/latest.csv</span> (timestamp,open,high,low,close).</p>
+      <p>Binary options dashboard with indicator toggles, multi-pair Deriv pulls, backtester, and <b>Simple English</b> custom strategies.</p>
+      <p class="muted">Live mode reads your configured <b>Active Symbols</b> list.</p>
     </div>
     <div class="card span4">
       <h3>Status</h3>
@@ -100,73 +100,81 @@ select.multiselect{min-height:160px}
   </div>
 
   <div class="card span12">
-    <h2>Custom Rules (Strategy: CUSTOM)</h2>
-    <form method="post" action="{{ url_for('dashboard.update_custom') }}">
-      <label><input type="checkbox" name="custom_enabled" {% if custom.enabled %}checked{% endif %}/> Enable Custom Rules</label>
+    <h2>Custom Strategies (up to 3)</h2>
 
-      <label>Rule Type</label>
-      <select name="mode">
-        <option value="SIMPLE" {% if custom.mode == 'SIMPLE' %}selected{% endif %}>Simple sentence</option>
-        <option value="EXPERT" {% if custom.mode == 'EXPERT' %}selected{% endif %}>Expert (DSL)</option>
-      </select>
-
-      <div id="simple-box">
-        <label>Simple BUY Rule (English)</label>
-        <textarea name="simple_buy" rows="2">{{ custom.simple_buy }}</textarea>
-        <label>Simple SELL Rule (English)</label>
-        <textarea name="simple_sell" rows="2">{{ custom.simple_sell }}</textarea>
+    {% for slot, c in [('1', custom1), ('2', custom2), ('3', custom3)] %}
+    <form method="post" action="{{ url_for('dashboard.update_custom') }}" style="border:1px solid #22304a;border-radius:12px;padding:12px;margin:10px 0">
+      <input type="hidden" name="slot" value="{{ slot }}"/>
+      <h3 style="margin-top:0">Custom #{{ slot }}</h3>
+      <label><input type="checkbox" name="enabled" {% if c.enabled %}checked{% endif %}/> Enable</label>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div style="flex:1">
+          <label>Mode</label>
+          <select name="mode"><option value="SIMPLE" {% if c.mode == 'SIMPLE' %}selected{% endif %}>Simple</option><option value="EXPERT" {% if c.mode == 'EXPERT' %}selected{% endif %}>Expert</option></select>
+        </div>
+        <div><label>Tolerance %</label><input type="number" step="any" name="tol_pct" value="{{ c.tol_pct or 0.1 }}"/></div>
+        <div><label>Lookback</label><input type="number" step="1" name="lookback" value="{{ c.lookback or 3 }}"/></div>
       </div>
-
-      <div id="expert-box">
+      <div class="simple-{{slot}}" style="margin-top:8px;{% if c.mode == 'EXPERT' %}display:none{% endif %}">
+        <label>Simple BUY (English)</label>
+        <textarea name="simple_buy" rows="2">{{ c.simple_buy }}</textarea>
+        <label>Simple SELL (English)</label>
+        <textarea name="simple_sell" rows="2">{{ c.simple_sell }}</textarea>
+      </div>
+      <div class="expert-{{slot}}" style="margin-top:8px;{% if c.mode != 'EXPERT' %}display:none{% endif %}">
         <label>BUY Rule (DSL)</label>
-        <textarea name="buy_rule" rows="3">{{ custom.buy_rule }}</textarea>
+        <textarea name="buy_rule" rows="3">{{ c.buy_rule }}</textarea>
         <label>SELL Rule (DSL)</label>
-        <textarea name="sell_rule" rows="3">{{ custom.sell_rule }}</textarea>
+        <textarea name="sell_rule" rows="3">{{ c.sell_rule }}</textarea>
       </div>
-
-      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">
-        <div><label>Tolerance %</label><input type="number" step="any" name="tol_pct" value="{{ custom.tol_pct or 0.1 }}"/></div>
-        <div><label>Lookback</label><input type="number" step="1" name="lookback" value="{{ custom.lookback or 3 }}"/></div>
-      </div>
-
-      <div style="margin-top:10px"><button class="btn">Save Custom Rules</button></div>
+      <div style="margin-top:8px"><button class="btn">Save Custom #{{slot}}</button></div>
     </form>
+    {% endfor %}
+
     <script>
       (function(){
-        function sync(){
-          var mode = document.querySelector('select[name="mode"]').value;
-          document.getElementById('simple-box').style.display = (mode === 'SIMPLE') ? '' : 'none';
-          document.getElementById('expert-box').style.display = (mode === 'EXPERT') ? '' : 'none';
-        }
-        document.querySelector('select[name="mode"]').addEventListener('change', sync);
-        sync();
+        ['1','2','3'].forEach(function(slot){
+          var form = document.querySelector('form[action$="update_custom"] input[value="'+slot+'"]').closest('form');
+          var modeSel = form.querySelector('select[name="mode"]');
+          function sync(){
+            var isSimple = modeSel.value === 'SIMPLE';
+            form.querySelector('.simple-'+slot).style.display = isSimple ? '' : 'none';
+            form.querySelector('.expert-'+slot).style.display = isSimple ? 'none' : '';
+          }
+          modeSel.addEventListener('change', sync); sync();
+        });
       })();
     </script>
   </div>
 
   <div class="card span12">
-    <h2>Backtest Simulator (Binary)</h2>
+    <h2>Backtest Simulator (Multi-Pair)</h2>
     <form method="post" action="{{ url_for('dashboard.backtest') }}" enctype="multipart/form-data">
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <div style="flex:2"><label>CSV File</label><input type="file" name="file" accept=".csv"/></div>
+        <div style="flex:2"><label>CSV File (single-pair upload)</label><input type="file" name="file" accept=".csv"/></div>
         <div style="flex:1"><label>Strategy</label>
-          <select name="strategy"><option>BASE</option><option>TREND</option><option>CHOP</option><option>CUSTOM</option></select>
+          <select name="strategy">
+            <option>BASE</option><option>TREND</option><option>CHOP</option>
+            <option>CUSTOM1</option><option>CUSTOM2</option><option>CUSTOM3</option>
+          </select>
         </div>
         <div style="flex:1">
           <label>Candle TF</label>
-          <select name="tf"><option>M1</option><option>M2</option><option>M3</option><option>M5</option><option>M10</option><option>M15</option><option>M30</option><option>H1</option><option>H4</option><option>D1</option></select>
+          <select name="tf"><option>M1</option><option>M2</option><option>M3</option><option selected>M5</option><option>M10</option><option>M15</option><option>M30</option><option>H1</option><option>H4</option><option>D1</option></select>
         </div>
         <div style="flex:1">
           <label>Expiry</label>
-          <select name="expiry"><option>1m</option><option>3m</option><option>5m</option><option>30m</option><option>H1</option><option>H4</option></select>
+          <select name="expiry"><option>1m</option><option>3m</option><option selected>5m</option><option>30m</option><option>H1</option><option>H4</option></select>
         </div>
       </div>
 
       <fieldset style="margin-top:10px;border:1px solid #22304a;padding:8px;border-radius:10px">
-        <legend style="color:#9eb3d9">Pull last month from Deriv</legend>
+        <legend style="color:#9eb3d9">Pull from Deriv (multi-pair)</legend>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <div style="flex:1"><label>App ID</label><input type="text" name="app_id" placeholder="1089 (test)" /></div>
-          <div style="flex:1"><label>Symbol</label><input type="text" name="symbol" placeholder="R_100" /></div>
+          <div style="flex:2"><label>Symbols (comma/space/newline)</label>
+            <textarea name="symbol" rows="2" placeholder="R_100 R_75 R_50"></textarea>
+          </div>
           <div style="flex:1"><label>Granularity</label>
             <select name="granularity">
               <option value="60">M1</option><option value="120">M2</option><option value="180">M3</option>
@@ -180,10 +188,12 @@ select.multiselect{min-height:160px}
         <div style="margin-top:8px">
           <button class="btn" formaction="{{ url_for('dashboard.deriv_fetch') }}" formmethod="post" formnovalidate>Pull from Deriv</button>
         </div>
-        <small class="muted">Saves to <span class="code">/tmp/deriv_last_month.csv</span>.</small>
+        <small class="muted">Files saved as <span class="code">/tmp/deriv_{SYMBOL}_{gran}.csv</span></small>
       </fieldset>
 
-      <label style="margin-top:10px"><input type="checkbox" name="use_server" value="1"/> Use server data: <span class="code">/tmp/deriv_last_month.csv</span></label>
+      <label style="margin-top:10px"><input type="checkbox" name="use_server" value="1"/> Use server data</label>
+      <label>Backtest Symbols (from server files)</label>
+      <textarea name="symbols" rows="2" placeholder="R_100 R_75 R_50">{{ active_symbols|join(' ') }}</textarea>
 
       <fieldset style="margin-top:10px;border:1px solid #22304a;padding:8px;border-radius:10px">
         <legend style="color:#9eb3d9">Date Filter</legend>
@@ -211,34 +221,69 @@ select.multiselect{min-height:160px}
       <div style="margin-top:10px"><button class="btn">Run Backtest</button></div>
     </form>
 
-    {% if server_data %}
-      <div class="card" style="margin-top:12px">
-        <h3>Server Data Status</h3>
-        {% if server_data.exists %}
-          <p>Path: <span class="code">{{ server_data.path }}</span></p>
-          <p>Rows: <b>{{ server_data.rows }}</b> • Last modified: <b>{{ server_data.mtime }}</b></p>
-          <p class="muted">Columns: {{ server_data.columns|join(', ') }}</p>
-          <p class="muted">Tick “Use server data” above to run against this file.</p>
-        {% else %}
-          <p>No file found at <span class="code">{{ server_data.path }}</span></p>
-          <p class="muted">Click “Pull from Deriv”, then return here.</p>
-        {% endif %}
-      </div>
-    {% endif %}
+    <div class="card" style="margin-top:12px">
+      <h3>Server Data Inventory</h3>
+      {% if server_files and server_files|length %}
+        <table>
+          <thead><tr><th>Symbol</th><th>Gran</th><th>Rows</th><th>Last Modified</th><th>Path</th></tr></thead>
+          <tbody>
+          {% for f in server_files %}
+            <tr><td>{{ f.symbol }}</td><td>{{ f.granularity }}</td><td>{{ f.rows }}</td><td>{{ f.mtime }}</td><td class="muted">{{ f.path }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="muted">No Deriv CSVs found. Pull above.</p>
+      {% endif %}
+    </div>
 
-    {% if bt %}
-      <h3>Results</h3>
-      <p>Trades: <b>{{ bt.trades }}</b> • Wins: <b style="color:var(--green)">{{ bt.wins }}</b> •
-      Losses: <b style="color:var(--red)">{{ bt.losses }}</b> • Draws: <b>{{ bt.draws }}</b> •
-      Win Rate: <b>{{ "%.2f"|format(bt.winrate*100) }}%</b></p>
-      <details><summary>Sample Signals (last 20)</summary>
+    {% if bt_multi %}
+      <h3>Results (Per Pair)</h3>
+      <table>
+        <thead><tr><th>Symbol</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Win rate</th></tr></thead>
+        <tbody>
+        {% for item in bt_multi %}
+          {% set b = item.bt %}
+          <tr>
+            <td>{{ item.symbol }}</td>
+            <td>{{ b.trades }}</td>
+            <td style="color:var(--green)">{{ b.wins }}</td>
+            <td style="color:var(--red)">{{ b.losses }}</td>
+            <td>{{ b.draws }}</td>
+            <td>{{ "%.2f"|format(b.winrate*100) }}%</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+
+      <h3>Combined</h3>
+      <p>Trades: <b>{{ bt_combined.trades }}</b> • Wins: <b style="color:var(--green)">{{ bt_combined.wins }}</b> •
+      Losses: <b style="color:var(--red)">{{ bt_combined.losses }}</b> • Draws: <b>{{ bt_combined.draws }}</b> •
+      Win Rate: <b>{{ "%.2f"|format(bt_combined.winrate*100) }}%</b></p>
+
+      <details><summary>Sample Signals (last 20 of last pair)</summary>
+        {% set last = bt_multi[-1].bt if bt_multi|length else None %}
+        {% if last and last.rows %}
         <table><thead><tr><th>Idx</th><th>Entry Time</th><th>Signal</th><th>Entry</th><th>Expiry Time</th><th>Exit</th><th>Outcome</th></tr></thead>
-        <tbody>{% for r in bt.rows %}<tr>
+        <tbody>{% for r in last.rows %}<tr>
           <td>{{ r.idx }}</td><td>{{ r.time_in }}</td><td>{{ r.dir }}</td><td>{{ "%.5f"|format(r.entry) }}</td>
           <td>{{ r.time_out }}</td><td>{{ "%.5f"|format(r.exit) }}</td><td>{{ r.outcome }}</td>
         </tr>{% endfor %}</tbody></table>
+        {% else %}
+          <p class="muted">No preview rows.</p>
+        {% endif %}
       </details>
     {% endif %}
+  </div>
+
+  <div class="card span12">
+    <h2>Live Symbols (for signals)</h2>
+    <form method="post" action="{{ url_for('dashboard.update_symbols') }}">
+      <label>Active Symbols (comma/space/newline)</label>
+      <textarea name="symbols" rows="2" placeholder="R_100 R_75 R_50">{{ active_symbols|join(' ') }}</textarea>
+      <div style="margin-top:8px"><button class="btn">Save Active Symbols</button></div>
+      <p class="muted">Your live loop should iterate cfg['symbols'] and stream signals for each.</p>
+    </form>
   </div>
 
   <div class="card span12">
@@ -256,7 +301,6 @@ select.multiselect{min-height:160px}
       <p class="muted">Range: {{ t.start }} → {{ t.end }}</p>
       <pre class="code" style="white-space:pre-wrap">{{ t.text }}</pre>
     {% endif %}
-    <p class="muted">Set env: <span class="code">TELEGRAM_BOT_TOKEN</span> and <span class="code">TELEGRAM_CHAT_IDS</span> (comma separated).</p>
   </div>
 
 </div>
