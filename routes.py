@@ -5,7 +5,7 @@ import pandas as pd
 import requests
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify
 
-from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE, log
+from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
@@ -54,6 +54,18 @@ def _merge_unique(seq):
             out.append(x); seen.add(x)
     return out
 
+def _cfg_dict(x):
+    """Ensure config is a dict even if storage returned JSON string or None."""
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            j = json.loads(x)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
 # ---------------- Auth ----------------
 def require_login(func):
     from functools import wraps
@@ -76,8 +88,8 @@ def login():
             flash("Logged in.")
             return redirect(request.args.get('next') or url_for('dashboard.dashboard'))
         flash("Invalid password")
-    cfg = get_config()
-    return render_template('dashboard.html', view='login', window=cfg['window'], tz=TIMEZONE)
+    cfg = _cfg_dict(get_config())
+    return render_template('dashboard.html', view='login', window=cfg.get('window', {}), tz=TIMEZONE)
 
 @bp.route('/logout')
 def logout():
@@ -86,40 +98,40 @@ def logout():
 
 @bp.route('/')
 def index():
-    cfg = get_config()
+    cfg = _cfg_dict(get_config())
     return render_template('dashboard.html', view='index', within=within_window(cfg),
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
-                           tz=TIMEZONE, window=cfg['window'])
+                           tz=TIMEZONE, window=cfg.get('window', {}))
 
 # ---------------- Dashboard ----------------
 @bp.route('/dashboard')
 @require_login
 def dashboard():
-    cfg = get_config()
+    cfg = _cfg_dict(get_config())
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
 
     customs = [
-        dict(cfg.get('custom1', {}), _idx=1),
-        dict(cfg.get('custom2', {}), _idx=2),
-        dict(cfg.get('custom3', {}), _idx=3),
+        dict(_cfg_dict(cfg.get('custom1')), _idx=1),
+        dict(_cfg_dict(cfg.get('custom2')), _idx=2),
+        dict(_cfg_dict(cfg.get('custom3')), _idx=3),
     ]
 
-    strategies_core = cfg.get('strategies', {
+    strategies_core = _cfg_dict(cfg.get('strategies')) or {
         "BASE":{"enabled": True},
         "TREND":{"enabled": False},
         "CHOP":{"enabled": False},
-    })
+    }
     strategies_all = dict(strategies_core)
     for i, c in enumerate(customs, start=1):
         strategies_all[f"CUSTOM{i}"] = {"enabled": bool(c.get("enabled"))}
 
     bt = session.get("bt", {})
     return render_template('dashboard.html', view='dashboard',
-                           window=cfg['window'],
+                           window=cfg.get('window', {}),
                            strategies_all=strategies_all,
                            strategies=strategies_core,
-                           indicators=cfg.get('indicators', {}),
+                           indicators=_cfg_dict(cfg.get('indicators')),
                            specs=INDICATOR_SPECS,
                            customs=customs,
                            active_symbols=cfg.get("symbols") or [],
@@ -136,7 +148,8 @@ def dashboard():
 @bp.route('/update_window', methods=['POST'])
 @require_login
 def update_window():
-    cfg = get_config()
+    cfg = _cfg_dict(get_config())
+    cfg.setdefault('window', {"start":"08:00","end":"17:00","timezone":TIMEZONE})
     cfg['window']['start'] = request.form.get('start', cfg['window']['start'])
     cfg['window']['end']   = request.form.get('end',   cfg['window']['end'])
     cfg['window']['timezone'] = request.form.get('timezone', cfg['window']['timezone'])
@@ -148,7 +161,7 @@ def update_window():
 @bp.route('/update_strategies', methods=['POST'])
 @require_login
 def update_strategies():
-    cfg = get_config()
+    cfg = _cfg_dict(get_config())
     cfg.setdefault('strategies', {"BASE":{"enabled":True},"TREND":{"enabled":False},"CHOP":{"enabled":False}})
     for name in list(cfg['strategies'].keys()):
         cfg['strategies'][name]['enabled'] = bool(request.form.get(f's_{name}'))
@@ -165,7 +178,7 @@ def update_strategies():
 @bp.route('/update_symbols', methods=['POST'])
 @require_login
 def update_symbols():
-    cfg = get_config()
+    cfg = _cfg_dict(get_config())
     sel_po     = request.form.getlist('symbols_po_multi')
     sel_deriv  = request.form.getlist('symbols_deriv_multi')
     raw = (request.form.get('symbols_text') or "").strip()
@@ -187,8 +200,8 @@ def update_symbols():
 @bp.route('/update_indicators', methods=['POST'])
 @require_login
 def update_indicators():
-    cfg = get_config()
-    inds = cfg.get("indicators", {})
+    cfg = _cfg_dict(get_config())
+    inds = _cfg_dict(cfg.get("indicators"))
     for key, spec in INDICATOR_SPECS.items():
         enabled = bool(request.form.get(f'ind_{key}_enabled'))
         inds.setdefault(key, {})
@@ -214,7 +227,7 @@ def update_indicators():
 def update_custom():
     slot = (request.form.get('slot') or '1').strip()
     field_prefix = f'custom{slot}'
-    cfg = get_config()
+    cfg = _cfg_dict(get_config())
     cfg.setdefault(field_prefix, {})
 
     mode = (request.form.get('mode', 'SIMPLE') or 'SIMPLE').upper()
@@ -278,7 +291,8 @@ def deriv_fetch():
 @bp.route('/backtest', methods=['POST'])
 @require_login
 def backtest():
-    cfg = get_config()
+    cfg = _cfg_dict(get_config())
+
     tf = (request.form.get('bt_tf') or 'M5').upper()
     expiry = request.form.get('bt_expiry') or '5m'
     strategy = (request.form.get('bt_strategy') or 'BASE').upper()
@@ -300,12 +314,15 @@ def backtest():
     summary = {"trades":0,"wins":0,"losses":0,"draws":0,"winrate":0.0}
 
     def run_one(sym, df):
+        # build cfg_run safely
         if strategy in ("CUSTOM1","CUSTOM2","CUSTOM3"):
             sid = strategy[-1]
-            cfg_run = dict(cfg); cfg_run["custom"] = cfg.get(f"custom{sid}", {})
+            cfg_run = dict(cfg)
+            cfg_run["custom"] = _cfg_dict(cfg.get(f"custom{sid}"))
             core = "CUSTOM"
         else:
-            cfg_run = cfg; core = strategy
+            cfg_run = dict(cfg)
+            core = strategy
         bt = run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         results.append({"symbol": sym, "trades": bt.trades, "wins": bt.wins, "losses": bt.losses, "draws": bt.draws, "winrate": round(bt.winrate*100,2), "rows": bt.rows})
         summary["trades"] += bt.trades
@@ -375,48 +392,18 @@ def telegram_test():
     flash("Telegram OK" if ok else f"Telegram error: {msg}")
     return redirect(url_for('dashboard.dashboard'))
 
-# --------- Telegram diagnostics ----------
 @bp.route('/telegram/diag')
 def telegram_diag():
-    """
-    Runs several checks:
-      - GET /getMe to verify the token is valid
-      - Lists the configured chat envs
-      - Attempts a test send to each configured chat, returning per-chat result
-    Masks the token in the response.
-    """
-    from live_engine import _send_telegram
-
+    from live_engine import _send_telegram, TELEGRAM_CHAT_KEYS
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         return jsonify({"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}), 200
-
-    # getMe check
-    getme_url = f"https://api.telegram.org/bot{token}/getMe"
-    getme = {}
     try:
-        r = requests.get(getme_url, timeout=8)
+        r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=8)
         getme = r.json()
     except Exception as e:
         getme = {"ok": False, "error": str(e)}
-
-    # Collect chats
-    chat_envs = {k: os.getenv(k, "").strip() for k in (
-        "TELEGRAM_CHAT_ID",
-        "TELEGRAM_CHAT_ID_TIER1",
-        "TELEGRAM_CHAT_ID_TIER2",
-        "TELEGRAM_CHAT_ID_TIER3",
-    )}
-    configured = {k: v for k, v in chat_envs.items() if v}
-
-    # Try a send
+    configured = {k: os.getenv(k, "").strip() for k in TELEGRAM_CHAT_KEYS if os.getenv(k, "").strip()}
     ok, info = _send_telegram("🧪 Telegram DIAG: test message from Pocket Option Signals.")
     masked = token[:9] + "..." + token[-6:] if len(token) > 18 else "***"
-
-    return jsonify({
-        "ok": ok,
-        "token_masked": masked,
-        "getMe": getme,
-        "configured_chats": configured,
-        "send_result": info
-    })
+    return jsonify({"ok": ok, "token_masked": masked, "getMe": getme, "configured_chats": configured, "send_result": info})
