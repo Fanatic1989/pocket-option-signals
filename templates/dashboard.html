@@ -21,6 +21,8 @@ table{width:100%;border-collapse:collapse;font-size:14px} th,td{border-bottom:1p
 .grid-cols{display:grid;grid-template-columns:repeat(4, minmax(0,1fr));gap:8px}
 @media(max-width:900px){.grid-cols{grid-template-columns:repeat(2, minmax(0,1fr));}}
 hr.sep{border:0;border-top:1px solid #1d2740;margin:14px 0}
+small.muted{color:#9eb3d9;font-size:12px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#0b2136;margin-left:6px;color:#9ed0ff;font-size:12px}
 </style></head><body>
 <header><div><strong>{{ app_name }}</strong></div>
 <nav>
@@ -147,6 +149,179 @@ hr.sep{border:0;border-top:1px solid #1d2740;margin:14px 0}
     </script>
   </div>
 
+  <!-- NEW: FX Mapper (Pocket Option -> Deriv) -->
+  <div class="card span12">
+    <h2>FX Mapper (Pocket Option → Deriv)</h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <div style="flex:2">
+        <label>Search</label>
+        <input type="text" id="fx-search" placeholder="Type e.g. EUR/USD"/>
+      </div>
+      <div><button class="btn" id="fx-select-all" type="button">Select All</button></div>
+      <div><button class="btn" id="fx-clear" type="button">Clear</button></div>
+      <small class="muted">OTC suffix is ignored automatically.</small>
+    </div>
+    <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div>
+        <label>PO Pairs</label>
+        <select id="fx-po" multiple size="12" style="width:100%;min-height:240px;background:#0b1220;border:1px solid #24324a;color:#e5f0ff;border-radius:10px"></select>
+      </div>
+      <div>
+        <label>Mapped Deriv Codes</label>
+        <textarea id="fx-deriv" rows="10" style="width:100%"></textarea>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" id="fx-to-backtest" type="button">Send to Backtest Symbols</button>
+          <button class="btn" id="fx-to-live" type="button">Send to Active Symbols</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      (async function(){
+        const $ = s => document.querySelector(s);
+        const qs = s => Array.from(document.querySelectorAll(s));
+        const poList = $('#fx-po'), out = $('#fx-deriv'), search = $('#fx-search');
+
+        let MAP = [];
+        async function loadMap(){
+          const res = await fetch('/symbols/map');
+          const j = await res.json();
+          if(!j.ok){ alert('Map load failed'); return; }
+          MAP = j.map || j.map === undefined ? (j.map || []) : [];
+          render(MAP);
+        }
+        function render(items){
+          poList.innerHTML = '';
+          items.forEach(it=>{
+            const opt = document.createElement('option');
+            opt.value = it.deriv;
+            opt.textContent = it.po + '  →  ' + it.deriv;
+            opt.dataset.po = it.po;
+            poList.appendChild(opt);
+          });
+        }
+        function filterList(){
+          const q = search.value.trim().toLowerCase();
+          const filtered = MAP.filter(it=> it.po.toLowerCase().includes(q));
+          render(filtered);
+        }
+        $('#fx-select-all').addEventListener('click', ()=>{
+          qs('#fx-po option').forEach(o=>o.selected=true);
+          out.value = qs('#fx-po option').map(o=>o.value).join(' ');
+        });
+        $('#fx-clear').addEventListener('click', ()=>{
+          qs('#fx-po option').forEach(o=>o.selected=false);
+          out.value = '';
+          search.value = '';
+          render(MAP);
+        });
+        poList.addEventListener('change', ()=>{
+          out.value = qs('#fx-po option:checked').map(o=>o.value).join(' ');
+        });
+        search.addEventListener('input', filterList);
+
+        function pasteTo(name){
+          const ta = document.querySelector(name);
+          if(ta){ ta.value = (ta.value ? (ta.value.trim()+' ') : '') + out.value.trim(); }
+          else{ alert('Target field not found: '+name); }
+        }
+        $('#fx-to-backtest').addEventListener('click', ()=> pasteTo('textarea[name="symbols"]'));
+        $('#fx-to-live').addEventListener('click', ()=> pasteTo('form[action$="update_symbols"] textarea[name="symbols"]'));
+
+        await loadMap();
+      })();
+    </script>
+  </div>
+
+  <!-- Deriv Symbols loader -->
+  <div class="card span12">
+    <h2>Deriv Symbols <span id="sym-count" class="badge"></span></h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <div><label>App ID</label><input type="text" id="app_id" placeholder="1089"/></div>
+      <div>
+        <label>Market filter</label>
+        <select id="market">
+          <option value="">(all)</option>
+          <option value="forex">forex</option>
+          <option value="synthetic_index">synthetic_index</option>
+          <option value="commodities">commodities</option>
+          <option value="indices">indices</option>
+          <option value="cryptocurrency">cryptocurrency</option>
+        </select>
+      </div>
+      <div><button class="btn" id="btn-load-syms">Load Symbols</button></div>
+      <div><button class="btn" id="btn-select-all" type="button">Select All</button></div>
+      <div><button class="btn" id="btn-clear" type="button">Clear</button></div>
+      <small class="muted">Uses Deriv “active_symbols” via WebSocket. Cached 30 min.</small>
+    </div>
+    <div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div>
+        <label>Available (symbol — display_name)</label>
+        <select id="sym-list" multiple size="14" style="width:100%;min-height:260px;background:#0b1220;border:1px solid #24324a;color:#e5f0ff;border-radius:10px"></select>
+      </div>
+      <div>
+        <label>Selected → for Backtest / Live</label>
+        <textarea id="sym-selected" rows="12" style="width:100%"></textarea>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" id="to-backtest" type="button">Send to Backtest Symbols</button>
+          <button class="btn" id="to-live" type="button">Send to Active Symbols</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      (function(){
+        const $ = (s)=>document.querySelector(s);
+        const qs = (s)=>Array.from(document.querySelectorAll(s));
+        const appIdEl = $('#app_id'), marketEl = $('#market'), listEl = $('#sym-list');
+        const selectedEl = $('#sym-selected'), badge = $('#sym-count');
+
+        function render(items){
+          listEl.innerHTML = '';
+          items.forEach(it=>{
+            const opt = document.createElement('option');
+            opt.value = it.symbol;
+            opt.textContent = it.symbol + ' — ' + (it.display_name || '');
+            opt.dataset.market = it.market || '';
+            listEl.appendChild(opt);
+          });
+          badge.textContent = items.length ? (items.length + ' symbols') : '';
+        }
+
+        async function loadSyms(){
+          const params = new URLSearchParams();
+          if (appIdEl.value.trim()) params.set('app_id', appIdEl.value.trim());
+          if (marketEl.value.trim()) params.set('market', marketEl.value.trim());
+          const res = await fetch(`/symbols/deriv?${params.toString()}`);
+          const j = await res.json();
+          if (!j.ok){ alert('Load failed: ' + (j.error||'unknown')); return; }
+          render(j.symbols||[]);
+        }
+
+        $('#btn-load-syms').addEventListener('click', (e)=>{ e.preventDefault(); loadSyms(); });
+        $('#btn-select-all').addEventListener('click', ()=>{
+          qs('#sym-list option').forEach(o=>o.selected=true);
+          selectedEl.value = qs('#sym-list option').map(o=>o.value).join(' ');
+        });
+        $('#btn-clear').addEventListener('click', ()=>{
+          qs('#sym-list option').forEach(o=>o.selected=false);
+          selectedEl.value = '';
+        });
+        listEl.addEventListener('change', ()=>{
+          const vals = qs('#sym-list option:checked').map(o=>o.value);
+          selectedEl.value = vals.join(' ');
+        });
+
+        function pasteTo(name){
+          const ta = document.querySelector(name);
+          if (ta){ ta.value = (ta.value ? (ta.value.trim()+' ') : '') + selectedEl.value.trim(); }
+          else{ alert('Target field not found: '+name); }
+        }
+        $('#to-backtest').addEventListener('click', ()=> pasteTo('textarea[name="symbols"]'));
+        $('#to-live').addEventListener('click', ()=> pasteTo('form[action$="update_symbols"] textarea[name="symbols"]'));
+      })();
+    </script>
+  </div>
+
+  <!-- Backtest + Live sections remain unchanged below -->
   <div class="card span12">
     <h2>Backtest Simulator (Multi-Pair)</h2>
     <form method="post" action="{{ url_for('dashboard.backtest') }}" enctype="multipart/form-data">
@@ -284,23 +459,6 @@ hr.sep{border:0;border-top:1px solid #1d2740;margin:14px 0}
       <div style="margin-top:8px"><button class="btn">Save Active Symbols</button></div>
       <p class="muted">Your live loop should iterate cfg['symbols'] and stream signals for each.</p>
     </form>
-  </div>
-
-  <div class="card span12">
-    <h2>Summaries / Tally</h2>
-    <form method="post" action="{{ url_for('dashboard.send_tally') }}" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
-      <div>
-        <label>Type</label>
-        <select name="kind"><option value="day">Daily</option><option value="week">Weekly</option></select>
-      </div>
-      <label><input type="checkbox" name="broadcast" value="1"/> Broadcast to Telegram</label>
-      <button class="btn">Compute Tally</button>
-    </form>
-    {% if session.get('last_tally') %}
-      {% set t = session.get('last_tally') %}
-      <p class="muted">Range: {{ t.start }} → {{ t.end }}</p>
-      <pre class="code" style="white-space:pre-wrap">{{ t.text }}</pre>
-    {% endif %}
   </div>
 
 </div>
