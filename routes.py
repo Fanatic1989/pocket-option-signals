@@ -23,7 +23,6 @@ DERIV_FRX = [
 PO_MAJOR = [
     "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"
 ]
-
 AVAILABLE_GROUPS = [
     {"label":"Deriv (frx*)", "items": DERIV_FRX},
     {"label":"Pocket Option majors", "items": PO_MAJOR},
@@ -35,7 +34,6 @@ def _is_po_symbol(sym: str) -> bool:
     return s in PO_MAJOR or bool(re.fullmatch(r"[A-Z]{6}", s))
 
 def _to_deriv(sym: str) -> str:
-    """Convert PO-style (EURUSD) to Deriv (frxEURUSD); pass through frx* unchanged."""
     if not sym:
         return sym
     s = sym.strip()
@@ -44,12 +42,12 @@ def _to_deriv(sym: str) -> str:
     sU = s.upper().replace("/", "")
     if _is_po_symbol(sU):
         return "frx" + sU
-    return s  # leave indices/other assets as-is
+    return s
 
 def _merge_unique(seq):
     seen, out = set(), []
     for x in seq:
-        if not x: 
+        if not x:
             continue
         if x not in seen:
             out.append(x); seen.add(x)
@@ -124,6 +122,7 @@ def dashboard():
                            specs=INDICATOR_SPECS,
                            customs=customs,
                            active_symbols=cfg.get("symbols") or [],
+                           symbols_raw=cfg.get("symbols_raw") or [],
                            available_groups=AVAILABLE_GROUPS,
                            users=users,
                            bt=bt,
@@ -166,31 +165,21 @@ def update_strategies():
 @require_login
 def update_symbols():
     cfg = get_config()
-
-    # Multi-selects
-    sel_po     = request.form.getlist('symbols_po_multi')     # PO majors
-    sel_deriv  = request.form.getlist('symbols_deriv_multi')  # frx*
-    # Free text (accept both formats)
+    sel_po     = request.form.getlist('symbols_po_multi')
+    sel_deriv  = request.form.getlist('symbols_deriv_multi')
     raw = (request.form.get('symbols_text') or "").strip()
     text_syms = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
+    convert_po = bool(request.form.get('convert_po'))
 
-    convert_po = bool(request.form.get('convert_po'))  # checkbox
-
-    # Merge in order: PO multi -> Deriv multi -> typed
     merged = _merge_unique(sel_po + sel_deriv + text_syms)
-
-    # Normalize to Deriv if asked
     normalized = [_to_deriv(s) if convert_po else s for s in merged]
 
     cfg['symbols'] = normalized
-    cfg['symbols_raw'] = merged  # for UI reference
+    cfg['symbols_raw'] = merged
     set_config(cfg)
 
     shown = ", ".join(normalized) if normalized else "(none)"
-    if convert_po:
-        flash(f"Active symbols saved (PO→Deriv conversion ON): {shown}")
-    else:
-        flash(f"Active symbols saved: {shown}")
+    flash(("Active symbols saved (PO→Deriv conversion ON): " if convert_po else "Active symbols saved: ") + shown)
     return redirect(url_for('dashboard.dashboard'))
 
 # ---------------- Indicators ----------------
@@ -300,7 +289,6 @@ def backtest():
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
 
-    # prefer multi-select; fall back to text/active
     raw_syms = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
     from_multi = request.form.getlist('bt_symbols_multi')
     symbols_in = from_multi if from_multi else [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
@@ -385,3 +373,19 @@ def telegram_test():
         return jsonify({"ok": ok, "msg": msg})
     flash("Telegram OK" if ok else f"Telegram error: {msg}")
     return redirect(url_for('dashboard.dashboard'))
+
+# --------- Debug helpers ----------
+@bp.route('/live/debug/on')
+def live_debug_on():
+    ENGINE.set_debug(True)
+    return jsonify({"ok": True, "msg": "debug on", "status": ENGINE.status()})
+
+@bp.route('/live/debug/off')
+def live_debug_off():
+    ENGINE.set_debug(False)
+    return jsonify({"ok": True, "msg": "debug off", "status": ENGINE.status()})
+
+@bp.route('/live/step', methods=['POST','GET'])
+def live_step():
+    ok, msg = ENGINE.step_once()
+    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
