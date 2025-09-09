@@ -13,18 +13,16 @@ from live_engine import ENGINE, tg_test
 
 bp = Blueprint('dashboard', __name__)
 
-# ---------- Curated symbol lists (Deriv + PocketOption-style) ----------
+# ---------- Curated symbol lists ----------
 DERIV_FRX = [
     "frxEURUSD","frxGBPUSD","frxUSDJPY","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD",
     "frxEURGBP","frxEURJPY","frxEURCHF","frxEURAUD","frxGBPAUD","frxGBPJPY","frxGBPNZD",
     "frxAUDJPY","frxAUDCAD","frxAUDCHF","frxCADJPY","frxCADCHF","frxCHFJPY","frxNZDJPY",
     "frxEURNZD","frxEURCAD","frxGBPCAD","frxGBPCHF","frxNZDCHF","frxNZDCAD"
 ]
-# You can include your PocketOption naming if you use it elsewhere (kept here for UI):
 PO_MAJOR = [
     "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"
 ]
-
 AVAILABLE_GROUPS = [
     {"label":"Deriv (frx*)", "items": DERIV_FRX},
     {"label":"Pocket Option majors", "items": PO_MAJOR},
@@ -74,15 +72,30 @@ def dashboard():
     cfg = get_config()
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
+
+    # customs for template
     customs = [
         dict(cfg.get('custom1', {}), _idx=1),
         dict(cfg.get('custom2', {}), _idx=2),
         dict(cfg.get('custom3', {}), _idx=3),
     ]
+
+    # compose a strategies view that includes CUSTOM1..3
+    strategies_core = cfg.get('strategies', {
+        "BASE":{"enabled": True},
+        "TREND":{"enabled": False},
+        "CHOP":{"enabled": False},
+    })
+    strategies_all = dict(strategies_core)  # copy
+    # mirror custom enabled states into strategies so live engine can find them
+    for i, c in enumerate(customs, start=1):
+        strategies_all[f"CUSTOM{i}"] = {"enabled": bool(c.get("enabled"))}
+
     bt = session.get("bt", {})
     return render_template('dashboard.html', view='dashboard',
                            window=cfg['window'],
-                           strategies=cfg['strategies'],
+                           strategies_all=strategies_all,
+                           strategies=strategies_core,
                            indicators=cfg.get('indicators', {}),
                            specs=INDICATOR_SPECS,
                            customs=customs,
@@ -112,23 +125,30 @@ def update_window():
 @require_login
 def update_strategies():
     cfg = get_config()
+    # ensure base dict
+    cfg.setdefault('strategies', {"BASE":{"enabled":True},"TREND":{"enabled":False},"CHOP":{"enabled":False}})
+    # base strategies
     for name in list(cfg['strategies'].keys()):
         cfg['strategies'][name]['enabled'] = bool(request.form.get(f's_{name}'))
-    set_config(cfg); flash("Strategies updated.")
+    # handle CUSTOM1..3 checkboxes -> set custom#.enabled and mirror into cfg['strategies']
+    for i in (1,2,3):
+        box = bool(request.form.get(f's_CUSTOM{i}'))
+        key = f'custom{i}'
+        cfg.setdefault(key, {})
+        cfg[key]['enabled'] = box
+        cfg['strategies'][f"CUSTOM{i}"] = {"enabled": box}
+    set_config(cfg)
+    flash("Strategies (including CUSTOM) updated.")
     return redirect(url_for('dashboard.dashboard'))
 
 @bp.route('/update_symbols', methods=['POST'])
 @require_login
 def update_symbols():
     cfg = get_config()
-    # From multi-select
-    selected = request.form.getlist('symbols_multi')  # multiple
-    # From free text
+    selected = request.form.getlist('symbols_multi')
     raw = (request.form.get('symbols_text') or "").strip()
     text_syms = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
-    # Merge + de-dup, keep order (multi first, then text)
-    seen = set()
-    merged = []
+    seen, merged = set(), []
     for s in selected + text_syms:
         if s not in seen:
             merged.append(s); seen.add(s)
@@ -150,11 +170,11 @@ def update_indicators():
         for p in spec.get("params", {}).keys():
             form_key = f'ind_{key}_{p}'
             if form_key in request.form and request.form.get(form_key) != "":
-                val = request.form.get(form_key)
+                val = request.form.get(val := form_key)
                 try:
                     inds[key][p] = int(val) if re.fullmatch(r"-?\d+", val) else float(val)
                 except Exception:
-                    inds[key][p] = val
+                    inds[key][p] = request.form.get(form_key)
         if key == "sma" and 'period' not in inds[key]:
             inds[key]['period'] = spec['params']['period']
     cfg['indicators'] = inds
@@ -192,6 +212,10 @@ def update_custom():
     except Exception: pass
     try: cfg[field_prefix]['lookback'] = int(request.form.get('lookback', cfg[field_prefix].get('lookback', 3)))
     except Exception: pass
+
+    # mirror into strategies so live can pick it
+    cfg.setdefault('strategies', {})
+    cfg['strategies'][f"CUSTOM{slot}"] = {"enabled": bool(cfg[field_prefix]['enabled'])}
 
     set_config(cfg)
     flash(f"Custom #{slot} saved.")
@@ -237,7 +261,7 @@ def backtest():
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
 
-    # prefer multi-select; fall back to text
+    # prefer multi-select; fall back to text/active
     raw_syms = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
     from_multi = request.form.getlist('bt_symbols_multi')
     symbols = from_multi if from_multi else [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
