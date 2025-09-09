@@ -19,6 +19,7 @@
     .tag{ display:inline-block; background:#172033; padding:2px 6px; border-radius:6px; margin-right:6px }
     .multibox { height:220px }
     small{ font-size:12px }
+    details summary { cursor: pointer; }
   </style>
 </head>
 <body>
@@ -355,6 +356,27 @@
     <form method="post" action="/live/stop" style="display:inline;margin-left:8px"><button class="btn">Stop Live</button></form>
     <form method="post" action="/telegram/test" style="display:inline;margin-left:8px"><button class="btn">Send Telegram Test</button></form>
     <div style="margin-top:8px"><a class="btn" href="/live/status" target="_blank">Check Status (JSON)</a></div>
+  </div>
+
+  <div class="card">
+    <h2>Live Debug</h2>
+    <div class="row">
+      <div class="col" style="max-width:260px">
+        <a class="btn" href="/live/debug/on"  target="_blank">Debug ON</a>
+      </div>
+      <div class="col" style="max-width:260px">
+        <a class="btn secondary" href="/live/debug/off" target="_blank">Debug OFF</a>
+      </div>
+      <div class="col" style="max-width:260px">
+        <a class="btn" href="/live/step" target="_blank">Step Once</a>
+      </div>
+      <div class="col" style="max-width:260px">
+        <a class="btn" href="/live/status" target="_blank">View Status</a>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:8px">
+      With Debug ON, <code>/live/status</code> shows <em>last_reasons</em> explaining skips/sends. “Step Once” runs one evaluation pass immediately.
+    </p>
   </div>
 {% endif %}
 
