@@ -1,5 +1,5 @@
 from __future__ import annotations
-import math
+import json
 import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
@@ -29,14 +29,14 @@ def _stoch(high: pd.Series, low: pd.Series, close: pd.Series, k: int = 14, d: in
     k = max(int(k or 1), 1); d = max(int(d or 1), 1)
     ll = low.rolling(k, min_periods=k).min()
     hh = high.rolling(k, min_periods=k).max()
-    raw_k = (close - ll) / (hh - ll).replace(0, np.nan) * 100.0
+    rng = (hh - ll).replace(0, np.nan)
+    raw_k = (close - ll) / rng * 100.0
     k_line = raw_k.rolling(d, min_periods=1).mean()
     d_line = k_line.rolling(d, min_periods=1).mean()
     return k_line.fillna(50.0), d_line.fillna(50.0)
 
 def _slope(series: pd.Series, lookback: int = 5) -> pd.Series:
     lookback = max(int(lookback or 1), 1)
-    # simple slope over lookback using linear regression on index
     idx = np.arange(len(series))
     out = np.full(len(series), np.nan)
     for i in range(lookback - 1, len(series)):
@@ -54,25 +54,16 @@ def _slope(series: pd.Series, lookback: int = 5) -> pd.Series:
 def _expiry_to_bars(tf: str, expiry: str) -> int:
     tf = (tf or "M5").upper()
     expiry = (expiry or "5m").upper()
-    # timeframe to seconds
-    tf_sec_map = {
-        "M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400
-    }
+    tf_sec_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     tf_sec = tf_sec_map.get(tf, 300)
-
-    # expiry string to seconds
-    m = re.fullmatch(r"(\d+)\s*([MH]?)", expiry.replace("MIN","M").replace("HR","H").replace("HRS","H"))
+    e = expiry.upper().replace("MIN","M").replace("MINS","M").replace("HR","H").replace("HRS","H")
+    m = re.fullmatch(r"(\d+)\s*([MH]?)", e)
     if not m:
-        # try canonical forms like 1M / 3M / 5M / 30M / H1 / H4
-        if expiry.endswith("M"):
-            secs = int(expiry[:-1]) * 60
-        elif expiry.startswith("H"):
-            secs = int(expiry[1:]) * 3600
-        else:
-            secs = 300
+        if e.endswith("M"): secs = int(e[:-1]) * 60
+        elif e.startswith("H"): secs = int(e[1:]) * 3600
+        else: secs = 300
     else:
-        n = int(m.group(1))
-        unit = m.group(2) or "M"
+        n = int(m.group(1)); unit = m.group(2) or "M"
         secs = n * (60 if unit == "M" else 3600)
     bars = max(int(round(secs / tf_sec)), 1)
     return bars
@@ -99,9 +90,7 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d.columns = [c.strip().lower() for c in d.columns]
     if "timestamp" not in d.columns:
-        # synth ts if missing
         d["timestamp"] = range(len(d))
-    # coerce OHLC
     for c in ("open","high","low","close"):
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
@@ -134,8 +123,7 @@ def _cross_dn(a_prev, a_now, b_prev, b_now) -> bool:
 
 # -------------------- Strategy conditions --------------------
 
-def _base_conditions(d: pd.DataFrame) -> pd.Series:
-    # Buy: price above SMA, RSI > 55, Stoch K cross above D
+def _base_conditions(d: pd.DataFrame):
     buy = pd.Series(False, index=d.index)
     sell = pd.Series(False, index=d.index)
     for i in range(1, len(d)):
@@ -151,19 +139,16 @@ def _base_conditions(d: pd.DataFrame) -> pd.Series:
         )
     return buy, sell
 
-def _trend_conditions(d: pd.DataFrame) -> pd.Series:
-    # Trend: SMA slope > 0, pullback that respects SMA and RSI bounces from 50 → buy.
+def _trend_conditions(d: pd.DataFrame):
     buy = pd.Series(False, index=d.index)
     sell = pd.Series(False, index=d.index)
     for i in range(2, len(d)):
-        # Uptrend buy
         buy.iloc[i] = (
             (d["sma_slope"].iloc[i] > 0) and
             (d["close"].iloc[i-1] <= d["sma"].iloc[i-1]) and
             (d["close"].iloc[i]   >  d["sma"].iloc[i]) and
             (d["rsi"].iloc[i-1] <= 50) and (d["rsi"].iloc[i] > 50)
         )
-        # Downtrend sell
         sell.iloc[i] = (
             (d["sma_slope"].iloc[i] < 0) and
             (d["close"].iloc[i-1] >= d["sma"].iloc[i-1]) and
@@ -172,8 +157,7 @@ def _trend_conditions(d: pd.DataFrame) -> pd.Series:
         )
     return buy, sell
 
-def _chop_conditions(d: pd.DataFrame) -> pd.Series:
-    # Mean reversion: RSI < 30 → buy, RSI > 70 → sell, with mild stoch confirmation
+def _chop_conditions(d: pd.DataFrame):
     buy = pd.Series(False, index=d.index)
     sell = pd.Series(False, index=d.index)
     for i in range(1, len(d)):
@@ -184,15 +168,7 @@ def _chop_conditions(d: pd.DataFrame) -> pd.Series:
 
 # -------------------- Custom rule evaluation --------------------
 
-def _eval_custom(d: pd.DataFrame, custom: Dict[str, Any]) -> (pd.Series, pd.Series):
-    """
-    Very simple engine: expects dict rules from your natural-language parser,
-    with keys under 'buy'/'sell' arrays OR empty → falls back to BASE.
-    Rule keys supported (boolean AND):
-      price_above_sma / price_below_sma
-      rsi_gt / rsi_lt (number)
-      stoch_cross_up / stoch_cross_dn (bool)
-    """
+def _eval_custom(d: pd.DataFrame, custom: Dict[str, Any]):
     if not custom:
         return _base_conditions(d)
 
@@ -226,20 +202,24 @@ def _eval_custom(d: pd.DataFrame, custom: Dict[str, Any]) -> (pd.Series, pd.Seri
 def run_backtest_core_binary(
     df: pd.DataFrame,
     core: str,
-    cfg: Dict[str, Any] | Any,   # be tolerant
+    cfg: Dict[str, Any] | Any,
     tf: str,
     expiry: str,
 ) -> BTResult:
     """
-    Simple binary options backtest:
-      - Enter on the bar AFTER a condition becomes true.
-      - Exit exactly N bars later (N from expiry/timeframe).
-      - Outcome: compare exit close vs entry close (ties count as LOSS).
+    Simple binary options backtest (entry next bar, exit N bars later).
+    Hardened to accept bad cfg/core types (including JSON strings).
     """
-
-    # ---- guard against bad cfg types (fixes: 'str' object has no attribute 'get') ----
+    # ---- normalize cfg ----
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
     if not isinstance(cfg, dict):
         cfg = {}
+
+    core = core if isinstance(core, str) else "BASE"
     core = (core or "BASE").upper()
     tf = (tf or "M5").upper()
     expiry = (expiry or "5m")
@@ -252,13 +232,13 @@ def run_backtest_core_binary(
     raw_inds = cfg.get("indicators", {}) if isinstance(cfg.get("indicators", {}), dict) else {}
     sma_obj  = raw_inds.get("sma",  {}) if isinstance(raw_inds.get("sma", {}), dict)  else {}
     rsi_obj  = raw_inds.get("rsi",  {}) if isinstance(raw_inds.get("rsi", {}), dict)  else {}
-    stoch_obj= raw_inds.get("stoch",{}) if isinstance(raw_inds.get("stoch",{}), dict) else {}
+    st_obj   = raw_inds.get("stoch",{}) if isinstance(raw_inds.get("stoch",{}), dict) else {}
 
     ip = {
-        "sma_period": int(sma_obj.get("period", 50)),
-        "rsi_period": int(rsi_obj.get("period", 14)),
-        "stoch_k":    int(stoch_obj.get("k", 14)),
-        "stoch_d":    int(stoch_obj.get("d", 3)),
+        "sma_period": int(sma_obj.get("period", 50) or 50),
+        "rsi_period": int(rsi_obj.get("period", 14) or 14),
+        "stoch_k":    int(st_obj.get("k", 14) or 14),
+        "stoch_d":    int(st_obj.get("d", 3) or 3),
     }
     d = _prep_indicators(d, ip)
 
@@ -278,7 +258,6 @@ def run_backtest_core_binary(
 
     # Walk forward
     for i in range(1, len(d) - bars):
-        # BUY
         if buy_sig.iloc[i]:
             entry_idx = i + 1
             exit_idx  = entry_idx + bars
@@ -298,7 +277,6 @@ def run_backtest_core_binary(
                 "exit":     exitp,
                 "outcome":  outcome
             })
-        # SELL
         if sell_sig.iloc[i]:
             entry_idx = i + 1
             exit_idx  = entry_idx + bars
