@@ -3,7 +3,7 @@ import os, json, re
 from io import StringIO
 from datetime import datetime, timedelta
 import pandas as pd
-from flask import Blueprint, render_template, request, redirect, url_for, session, flash
+from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify
 
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE, log
 from indicators import INDICATOR_SPECS
@@ -72,6 +72,8 @@ def _list_deriv_files():
     """Discover saved Deriv CSVs like /tmp/deriv_R_100_300.csv"""
     root = os.getenv('DERIV_DIR','/tmp')
     files = []
+    if not os.path.isdir(root):
+        return files
     for name in os.listdir(root):
         if not name.startswith('deriv_') or not name.endswith('.csv'):
             continue
@@ -102,10 +104,7 @@ def dashboard():
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
 
-    # server data inventory
     server_files = _list_deriv_files()
-
-    # active symbols for live
     active_symbols = (cfg.get("symbols") or [])
 
     # ensure custom1..custom3 exist
@@ -168,7 +167,6 @@ def update_indicators():
 def update_symbols():
     cfg = get_config()
     raw = (request.form.get('symbols') or "").strip()
-    # Split on comma/space/newline
     symbols = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
     cfg['symbols'] = symbols
     set_config(cfg)
@@ -260,6 +258,7 @@ def filter_df_last_n_days(df: pd.DataFrame, n_days: int):
 
 def _deriv_csv_path(symbol: str, granularity: int) -> str:
     base = os.getenv('DERIV_DIR','/tmp')
+    os.makedirs(base, exist_ok=True)
     safe_sym = symbol.replace("/", "_")
     return os.path.join(base, f"deriv_{safe_sym}_{int(granularity)}.csv")
 
@@ -269,17 +268,14 @@ def _deriv_csv_path(symbol: str, granularity: int) -> str:
 def backtest():
     cfg = get_config()
 
-    # 1) Decide data source(s)
     use_server = bool(request.form.get('use_server'))
     tf = request.form.get('tf','M5')
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf.upper(), 300)
 
-    # symbols selection (for multi)
     raw_syms = (request.form.get('symbols') or "").strip()
     sel_symbols = [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
 
-    # 2) Load dataframes
     dfs_by_symbol = {}
 
     if use_server:
@@ -297,7 +293,6 @@ def backtest():
             except Exception as e:
                 flash(f"CSV parse error for {sym}: {e}")
     else:
-        # single upload
         file = request.files.get('file')
         if file and file.filename:
             try:
@@ -318,7 +313,6 @@ def backtest():
         flash("No dataframes loaded.")
         return redirect(url_for('dashboard.dashboard'))
 
-    # 3) Normalize + date filters
     last_n_raw = (request.form.get('last_n') or '').strip()
     month_str = (request.form.get('month') or '').strip()
     weekdays = request.form.getlist('wd')
@@ -355,19 +349,16 @@ def backtest():
     if not dfs_by_symbol:
         return redirect(url_for('dashboard.dashboard'))
 
-    # 4) Strategy selection (incl. CUSTOM1..3 mapping)
     strategy = request.form.get('strategy','BASE')
     expiry_label = request.form.get('expiry','5m')
 
-    cfg_for_run = dict(cfg)  # shallow copy so we can swap customs
+    cfg_for_run = dict(cfg)
     if strategy.upper() in ('CUSTOM1','CUSTOM2','CUSTOM3'):
-        sid = strategy[-1]  # '1','2','3'
-        # make 'custom' point to the chosen slot so strategies.py keeps working
+        sid = strategy[-1]
         chosen = cfg.get(f'custom{sid}', {})
         cfg_for_run['custom'] = chosen
         strategy = 'CUSTOM'
 
-    # 5) Run per-symbol and collect
     multi_results = []
     total_trades = total_w = total_l = total_d = 0
     for sym, df in dfs_by_symbol.items():
@@ -386,11 +377,8 @@ def backtest():
         "winrate": (total_w / total_trades) if total_trades else 0.0
     }
 
-    # 6) Render
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
-
-    # server inventory for panel
     server_files = _list_deriv_files()
 
     return render_template('dashboard.html', view='dashboard', window=cfg['window'],
@@ -400,14 +388,13 @@ def backtest():
         bt_multi=multi_results, bt_combined=combined, active_symbols=cfg.get("symbols") or [],
         server_files=server_files)
 
-# Graceful redirect for stray GETs
 @bp.route('/backtest', methods=['GET'])
 def backtest_get():
     if not session.get("admin"):
         return redirect(url_for('dashboard.login', next=request.path))
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Deriv fetch (multi symbols) ----------------
+# ---------------- Deriv: candles fetch (multi symbols) ----------------
 from websocket import WebSocketApp
 
 def _fetch_one_symbol(app_id: str, symbol: str, granularity_sec: int, count: int) -> str:
@@ -470,7 +457,7 @@ def _fetch_one_symbol(app_id: str, symbol: str, granularity_sec: int, count: int
 
     import threading, time
     th = threading.Thread(target=ws.run_forever, daemon=True); th.start()
-    for _ in range(300):  # ~30s
+    for _ in range(300):
         if result['done']: break
         time.sleep(0.1)
 
@@ -489,10 +476,9 @@ def deriv_fetch():
     raw_symbols = (request.form.get('symbol') or '').strip()
     gran = int(request.form.get('granularity', '300'))
     count = int(request.form.get('count', '1440'))
-    # allow multiple separated by comma/space/newline
     symbols = [s.strip() for s in re.split(r"[,\s]+", raw_symbols) if s.strip()]
     if not symbols:
-        flash('Symbol is required (you can enter multiple: e.g. R_100,R_75,R_50).')
+        flash('Symbol is required (you can enter multiple: e.g. R_100 R_75 R_50).')
         return redirect(url_for('dashboard.dashboard'))
 
     ok, fails = [], []
@@ -510,19 +496,128 @@ def deriv_fetch():
         flash("Failed: " + " | ".join(fails))
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Tally compute/broadcast ----------------
-from utils import compute_tally, send_telegram_message
+# ---------------- Deriv: ACTIVE SYMBOLS endpoint ----------------
+_DERIV_SYMBOLS_CACHE_PATH = os.getenv('DERIV_SYMBOLS_CACHE', '/tmp/deriv_symbols.json')
+_DERIV_SYMBOLS_CACHE_TTL = int(os.getenv('DERIV_SYMBOLS_TTL_SEC', '1800'))
 
-@bp.route('/send_tally', methods=['POST'])
+def _cache_load():
+    try:
+        if os.path.exists(_DERIV_SYMBOLS_CACHE_PATH):
+            with open(_DERIV_SYMBOLS_CACHE_PATH, 'r') as fh:
+                data = json.load(fh)
+            ts = data.get('_cached_at')
+            if ts and (datetime.utcnow() - datetime.fromisoformat(ts)).total_seconds() < _DERIV_SYMBOLS_CACHE_TTL:
+                return data
+    except Exception as e:
+        log("ERROR", f"Symbol cache read failed: {e}")
+    return None
+
+def _cache_save(payload: dict):
+    try:
+        payload = dict(payload)
+        payload['_cached_at'] = datetime.utcnow().isoformat()
+        with open(_DERIV_SYMBOLS_CACHE_PATH, 'w') as fh:
+            json.dump(payload, fh)
+    except Exception as e:
+        log("ERROR", f"Symbol cache write failed: {e}")
+
+def _fetch_active_symbols_ws(app_id: str):
+    from websocket import WebSocketApp
+    result = {'done': False, 'error': None, 'symbols': []}
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+            if 'error' in data:
+                result['error'] = data['error'].get('message','Deriv API error')
+                result['done'] = True; ws.close(); return
+            if 'active_symbols' in data:
+                items = data['active_symbols'] or []
+                out = []
+                for it in items:
+                    out.append({
+                        "symbol": it.get("symbol"),
+                        "display_name": it.get("display_name"),
+                        "market": it.get("market"),
+                        "submarket": it.get("submarket"),
+                        "exchange_is_open": it.get("exchange_is_open", True)
+                    })
+                result['symbols'] = out
+                result['done'] = True; ws.close(); return
+        except Exception as e:
+            result['error'] = f'Parse error: {e}'
+            result['done'] = True; ws.close()
+
+    def on_open(ws):
+        req = {"active_symbols": "full", "product_type": "basic"}
+        ws.send(json.dumps(req))
+
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={app_id or '1089'}"
+    ws = WebSocketApp(url, on_open=on_open, on_message=on_message)
+
+    import threading, time
+    th = threading.Thread(target=ws.run_forever, daemon=True); th.start()
+    for _ in range(300):
+        if result['done']: break
+        time.sleep(0.1)
+
+    if not result['done']:
+        raise RuntimeError('Timeout contacting Deriv for active symbols')
+    if result['error']:
+        raise RuntimeError(result['error'])
+    return result['symbols']
+
+@bp.route('/symbols/deriv')
 @require_login
-def send_tally():
-    kind = (request.form.get('kind') or 'day').lower()
-    if kind not in ('day','week'): kind = 'day'
-    t = compute_tally(kind)
-    if request.form.get('broadcast'):
-        send_telegram_message(t["text"])
-        flash(f"{kind.title()} tally computed and broadcast to Telegram.")
+def deriv_symbols():
+    app_id = (request.args.get('app_id') or '').strip() or '1089'
+    market_filter = (request.args.get('market') or '').strip()
+    submarket_filter = (request.args.get('submarket') or '').strip()
+
+    cached = _cache_load()
+    if cached and isinstance(cached.get('symbols'), list):
+        symbols = cached['symbols']
+        cached_flag = True
     else:
-        flash(f"{kind.title()} tally computed (not broadcast).")
-    session['last_tally'] = t
-    return redirect(url_for('dashboard.dashboard'))
+        try:
+            symbols = _fetch_active_symbols_ws(app_id)
+            _cache_save({"symbols": symbols})
+            cached_flag = False
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    def _in_list(val, csv):
+        if not csv: return True
+        items = [x.strip().lower() for x in csv.split(',') if x.strip()]
+        return (val or '').lower() in items
+
+    filtered = []
+    for s in symbols:
+        if market_filter and not _in_list(s.get('market',''), market_filter):
+            continue
+        if submarket_filter and not _in_list(s.get('submarket',''), submarket_filter):
+            continue
+        filtered.append(s)
+
+    return jsonify({"ok": True, "cached": cached_flag, "count": len(filtered), "symbols": filtered})
+
+# ---------------- Pocket Option → Deriv FX map ----------------
+_PO_DERIV_FX_MAP = {
+    "EUR/USD":"frxEURUSD","GBP/USD":"frxGBPUSD","USD/JPY":"frxUSDJPY","USD/CHF":"frxUSDCHF","USD/CAD":"frxUSDCAD",
+    "AUD/USD":"frxAUDUSD","NZD/USD":"frxNZDUSD","EUR/GBP":"frxEURGBP","EUR/JPY":"frxEURJPY","GBP/JPY":"frxGBPJPY",
+    "AUD/JPY":"frxAUDJPY","CAD/JPY":"frxCADJPY","CHF/JPY":"frxCHFJPY","NZD/JPY":"frxNZDJPY","EUR/CHF":"frxEURCHF",
+    "GBP/CHF":"frxGBPCHF","AUD/CHF":"frxAUDCHF","CAD/CHF":"frxCADCHF","NZD/CHF":"frxNZDCHF","AUD/NZD":"frxAUDNZD",
+    "AUD/CAD":"frxAUDCAD","EUR/CAD":"frxEURCAD","GBP/CAD":"frxGBPCAD","EUR/AUD":"frxEURAUD","GBP/AUD":"frxGBPAUD",
+    "NZD/CAD":"frxNZDCAD","EUR/NZD":"frxEURNZD","GBP/NZD":"frxGBPNZD"
+}
+
+def _normalize_po_name(name: str) -> str:
+    s = (name or "").upper().strip()
+    s = s.replace(" OTC","").replace("OTC","").strip()
+    return s
+
+@bp.route('/symbols/map')
+@require_login
+def po_deriv_map():
+    items = [{"po": k, "deriv": v} for k, v in _PO_DERIV_FX_MAP.items()]
+    return jsonify({"ok": True, "count": len(items), "map": items})
