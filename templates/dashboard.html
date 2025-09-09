@@ -211,6 +211,21 @@ select.multiselect{min-height:160px}
       <div style="margin-top:10px"><button class="btn">Run Backtest</button></div>
     </form>
 
+    {% if server_data %}
+      <div class="card" style="margin-top:12px">
+        <h3>Server Data Status</h3>
+        {% if server_data.exists %}
+          <p>Path: <span class="code">{{ server_data.path }}</span></p>
+          <p>Rows: <b>{{ server_data.rows }}</b> • Last modified: <b>{{ server_data.mtime }}</b></p>
+          <p class="muted">Columns: {{ server_data.columns|join(', ') }}</p>
+          <p class="muted">Tick “Use server data” above to run against this file.</p>
+        {% else %}
+          <p>No file found at <span class="code">{{ server_data.path }}</span></p>
+          <p class="muted">Click “Pull from Deriv”, then return here.</p>
+        {% endif %}
+      </div>
+    {% endif %}
+
     {% if bt %}
       <h3>Results</h3>
       <p>Trades: <b>{{ bt.trades }}</b> • Wins: <b style="color:var(--green)">{{ bt.wins }}</b> •
