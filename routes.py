@@ -4,9 +4,12 @@ from datetime import datetime
 import pandas as pd
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify
 
-from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
+from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE, log
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
+from rules import parse_natural_rule
+from data_fetch import deriv_csv_path as _deriv_csv_path, fetch_one_symbol as _fetch_one_symbol
+from live_engine import ENGINE, tg_test
 
 bp = Blueprint('dashboard', __name__)
 
@@ -54,27 +57,35 @@ def dashboard():
     cfg = get_config()
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
+
+    # recent backtest results (kept in session)
+    bt = session.get("bt", {})
     return render_template('dashboard.html', view='dashboard',
                            window=cfg['window'],
                            strategies=cfg['strategies'],
-                           indicators=cfg['indicators'],
-                           custom1=cfg['custom1'],
-                           custom2=cfg['custom2'],
-                           custom3=cfg['custom3'],
+                           indicators=cfg.get('indicators', {}),
+                           specs=INDICATOR_SPECS,
+                           custom1=cfg.get('custom1',{}),
+                           custom2=cfg.get('custom2',{}),
+                           custom3=cfg.get('custom3',{}),
                            active_symbols=cfg.get("symbols") or [],
-                           users=users, specs=INDICATOR_SPECS,
+                           users=users,
+                           bt=bt,
                            now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
                            tz=TIMEZONE)
 
-# ---------------- Config Updates ----------------
+# ---------------- Config: Window / Strategies / Symbols ----------------
 @bp.route('/update_window', methods=['POST'])
 @require_login
 def update_window():
     cfg = get_config()
     cfg['window']['start'] = request.form.get('start', cfg['window']['start'])
-    cfg['window']['end'] = request.form.get('end', cfg['window']['end'])
+    cfg['window']['end']   = request.form.get('end',   cfg['window']['end'])
     cfg['window']['timezone'] = request.form.get('timezone', cfg['window']['timezone'])
-    set_config(cfg); flash("Window updated.")
+    # optional live defaults
+    if request.form.get('live_tf'): cfg['live_tf'] = request.form.get('live_tf').upper()
+    if request.form.get('live_expiry'): cfg['live_expiry'] = request.form.get('live_expiry')
+    set_config(cfg); flash("Trading window & live defaults updated.")
     return redirect(url_for('dashboard.dashboard'))
 
 @bp.route('/update_strategies', methods=['POST'])
@@ -97,9 +108,171 @@ def update_symbols():
     flash(f"Active symbols updated: {', '.join(symbols) if symbols else '(none)'}")
     return redirect(url_for('dashboard.dashboard'))
 
-# ---------------- Live Engine ----------------
-from live_engine import ENGINE, tg_test
+# ---------------- Indicators ----------------
+@bp.route('/update_indicators', methods=['POST'])
+@require_login
+def update_indicators():
+    cfg = get_config()
+    inds = cfg.get("indicators", {})
+    for key, spec in INDICATOR_SPECS.items():
+        enabled = bool(request.form.get(f'ind_{key}_enabled'))
+        inds.setdefault(key, {})
+        inds[key]['enabled'] = enabled
+        # dynamic params
+        for p in spec.get("params", {}).keys():
+            form_key = f'ind_{key}_{p}'
+            if form_key in request.form and request.form.get(form_key) != "":
+                val = request.form.get(form_key)
+                try:
+                    inds[key][p] = int(val) if val.isdigit() else float(val)
+                except Exception:
+                    inds[key][p] = val
+        # for SMA we always keep a 'period' even if disabled (used by BASE rules)
+        if key == "sma":
+            if 'period' not in inds[key]:
+                inds[key]['period'] = spec['params']['period']
+    cfg['indicators'] = inds
+    set_config(cfg)
+    flash("Indicators updated.")
+    return redirect(url_for('dashboard.dashboard'))
 
+# ---------------- Custom strategies ----------------
+@bp.route('/update_custom', methods=['POST'])
+@require_login
+def update_custom():
+    slot = (request.form.get('slot') or '1').strip()
+    field_prefix = f'custom{slot}'
+    cfg = get_config()
+    cfg.setdefault(field_prefix, {})
+
+    mode = request.form.get('mode', 'SIMPLE').upper()
+    cfg[field_prefix]['enabled'] = bool(request.form.get('enabled'))
+    cfg[field_prefix]['mode'] = mode
+
+    if mode == "SIMPLE":
+        cfg[field_prefix]['simple_buy']  = request.form.get('simple_buy', '')
+        cfg[field_prefix]['simple_sell'] = request.form.get('simple_sell', '')
+        # Parse into dicts for runtime engine convenience
+        cfg[field_prefix]['buy_rule']  = parse_natural_rule(cfg[field_prefix]['simple_buy'])
+        cfg[field_prefix]['sell_rule'] = parse_natural_rule(cfg[field_prefix]['simple_sell'])
+    else:
+        # ADV: accept explicit JSON rule dicts
+        try:
+            cfg[field_prefix]['buy_rule']  = json.loads(request.form.get('buy_rule_json','{}'))
+        except Exception: cfg[field_prefix]['buy_rule'] = {}
+        try:
+            cfg[field_prefix]['sell_rule'] = json.loads(request.form.get('sell_rule_json','{}'))
+        except Exception: cfg[field_prefix]['sell_rule'] = {}
+
+    # Safety knobs
+    try: cfg[field_prefix]['tol_pct'] = float(request.form.get('tol_pct', cfg[field_prefix].get('tol_pct', 0.1)))
+    except Exception: pass
+    try: cfg[field_prefix]['lookback'] = int(request.form.get('lookback', cfg[field_prefix].get('lookback', 3)))
+    except Exception: pass
+
+    set_config(cfg)
+    flash(f"Custom #{slot} saved.")
+    return redirect(url_for('dashboard.dashboard'))
+
+# ---------------- Deriv pull (multi-pair) ----------------
+@bp.route('/deriv_fetch', methods=['POST'])
+@require_login
+def deriv_fetch():
+    app_id = os.getenv("DERIV_APP_ID", "1089")
+    symbols = (request.form.get('fetch_symbols') or "").strip()
+    tf = (request.form.get('fetch_tf') or "M5").upper()
+    count = int(request.form.get('fetch_count') or "300")
+
+    gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
+    gran = gran_map.get(tf, 300)
+
+    pairs = [s.strip() for s in re.split(r"[,\s]+", symbols) if s.strip()]
+    ok = 0; fail = []
+    for sym in pairs:
+        try:
+            _fetch_one_symbol(app_id, sym, gran, count)
+            ok += 1
+        except Exception as e:
+            fail.append(f"{sym}: {e}")
+
+    if ok: flash(f"Deriv: saved {ok} symbol(s) @ {tf}")
+    if fail: flash("Errors: " + "; ".join(fail))
+    return redirect(url_for('dashboard.dashboard'))
+
+# ---------------- Backtest (POST only) ----------------
+@bp.route('/backtest', methods=['POST'])
+@require_login
+def backtest():
+    cfg = get_config()
+    tf = (request.form.get('bt_tf') or 'M5').upper()
+    expiry = request.form.get('bt_expiry') or '5m'
+    strategy = (request.form.get('bt_strategy') or 'BASE').upper()
+    use_server = bool(request.form.get('use_server'))
+    app_id = os.getenv("DERIV_APP_ID", "1089")
+    count = int(request.form.get('bt_count') or "300")
+
+    gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
+    gran = gran_map.get(tf, 300)
+
+    # pick symbols
+    raw_syms = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
+    symbols = [s.strip() for s in re.split(r"[,\s]+", raw_syms) if s.strip()]
+
+    # CSV upload (optional)
+    uploaded = request.files.get('bt_csv')
+    results = []
+    summary = {"trades":0,"wins":0,"losses":0,"draws":0,"winrate":0.0}
+
+    def run_one(sym, df):
+        if strategy in ("CUSTOM1","CUSTOM2","CUSTOM3"):
+            sid = strategy[-1]
+            cfg_run = dict(cfg); cfg_run["custom"] = cfg.get(f"custom{sid}", {})
+            core = "CUSTOM"
+        else:
+            cfg_run = cfg; core = strategy
+        bt = run_backtest_core_binary(df, core, cfg_run, tf, expiry)
+        results.append({"symbol": sym, "trades": bt.trades, "wins": bt.wins, "losses": bt.losses, "draws": bt.draws, "winrate": round(bt.winrate*100,2), "rows": bt.rows})
+        summary["trades"] += bt.trades
+        summary["wins"]   += bt.wins
+        summary["losses"] += bt.losses
+        summary["draws"]  += bt.draws
+
+    try:
+        if uploaded and uploaded.filename:
+            # Single-symbol CSV path (expects timestamp,open,high,low,close)
+            data = uploaded.read().decode("utf-8", errors="ignore")
+            df = pd.read_csv(StringIO(data))
+            df.columns = [c.strip().lower() for c in df.columns]
+            if "timestamp" in df.columns: df["timestamp"] = pd.to_datetime(df["timestamp"])
+            for c in ("open","high","low","close"):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+            run_one(symbols[0] if symbols else "CSV", df)
+        else:
+            # Use server-side data (pull from Deriv if requested)
+            for sym in symbols:
+                if use_server:
+                    _fetch_one_symbol(app_id, sym, gran, count)
+                path = _deriv_csv_path(sym, gran)
+                if not os.path.exists(path):
+                    raise RuntimeError(f"No server data for {sym} @ {tf}. Pull from Deriv first or upload CSV.")
+                df = pd.read_csv(path)
+                df.columns = [c.strip().lower() for c in df.columns]
+                if "timestamp" in df.columns: df["timestamp"] = pd.to_datetime(df["timestamp"])
+                for c in ("open","high","low","close"):
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+                run_one(sym, df)
+
+        summary["winrate"] = round((summary["wins"]/summary["trades"])*100,2) if summary["trades"] else 0.0
+        session["bt"] = {"summary": summary, "results": results, "tf": tf, "expiry": expiry, "strategy": strategy}
+        flash("Backtest complete.")
+    except Exception as e:
+        session["bt"] = {"error": str(e)}
+        flash(f"Backtest error: {e}")
+    return redirect(url_for('dashboard.dashboard'))
+
+# ---------------- Live Engine endpoints ----------------
 @bp.route('/live/status')
 def live_status():
     return jsonify({"ok": True, "status": ENGINE.status()})
