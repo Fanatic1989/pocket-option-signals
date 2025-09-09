@@ -226,6 +226,24 @@ select.multiselect{min-height:160px}
     {% endif %}
   </div>
 
+  <div class="card span12">
+    <h2>Summaries / Tally</h2>
+    <form method="post" action="{{ url_for('dashboard.send_tally') }}" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+      <div>
+        <label>Type</label>
+        <select name="kind"><option value="day">Daily</option><option value="week">Weekly</option></select>
+      </div>
+      <label><input type="checkbox" name="broadcast" value="1"/> Broadcast to Telegram</label>
+      <button class="btn">Compute Tally</button>
+    </form>
+    {% if session.get('last_tally') %}
+      {% set t = session.get('last_tally') %}
+      <p class="muted">Range: {{ t.start }} → {{ t.end }}</p>
+      <pre class="code" style="white-space:pre-wrap">{{ t.text }}</pre>
+    {% endif %}
+    <p class="muted">Set env: <span class="code">TELEGRAM_BOT_TOKEN</span> and <span class="code">TELEGRAM_CHAT_IDS</span> (comma separated).</p>
+  </div>
+
 </div>
 {% endif %}
 </main></body></html>
