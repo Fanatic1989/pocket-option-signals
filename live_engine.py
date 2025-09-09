@@ -1,31 +1,24 @@
-import os, threading, time, json, traceback
+import os, threading, time, traceback
 from datetime import datetime
 import pandas as pd
 import requests
 
 from utils import TZ, get_config, within_window, log
 from strategies import run_backtest_core_binary
-from routes import _deriv_csv_path, _fetch_one_symbol  # reuse existing fetchers
+from data_fetch import deriv_csv_path, fetch_one_symbol  # ← breaks cycle
 
 BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_TIER = {
-    1: os.getenv("TG_CHAT_TIER1", ""),
-    2: os.getenv("TG_CHAT_TIER2", ""),
-    3: os.getenv("TG_CHAT_TIER3", "")
-}
-CHAT_ADMIN = os.getenv("TG_CHAT_ADMIN", "")
+CHAT_TIER = {1: os.getenv("TG_CHAT_TIER1",""), 2: os.getenv("TG_CHAT_TIER2",""), 3: os.getenv("TG_CHAT_TIER3","")}
+CHAT_ADMIN = os.getenv("TG_CHAT_ADMIN","")
 
 def tg_send(chat_id: str, text: str, parse_mode: str = "HTML"):
     if not BOT or not chat_id:
         return False, "Missing BOT token or chat_id"
     try:
-        url = f"https://api.telegram.org/bot{BOT}/sendMessage"
-        r = requests.post(url, timeout=10, json={
-            "chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True
-        })
+        r = requests.post(f"https://api.telegram.org/bot{BOT}/sendMessage", timeout=10,
+                          json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True})
         ok = r.status_code == 200
-        if not ok:
-            log("ERROR", f"Telegram send fail {r.status_code}: {r.text}")
+        if not ok: log("ERROR", f"Telegram send fail {r.status_code}: {r.text}")
         return ok, (r.text if not ok else "ok")
     except Exception as e:
         log("ERROR", f"Telegram exception: {e}")
@@ -67,28 +60,22 @@ class LiveEngine:
     def _run(self):
         SLEEP = int(os.getenv("LIVE_LOOP_SEC", "55"))
         COUNT = int(os.getenv("LIVE_FETCH_CANDLES", "300"))
+        gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
 
         while not self._stop.is_set():
             try:
                 cfg = get_config()
                 self._status["last_loop"] = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-                if not within_window(cfg):
-                    time.sleep(SLEEP); continue
+                if not within_window(cfg): time.sleep(SLEEP); continue
 
                 symbols = cfg.get("symbols") or []
-                if not symbols:
-                    time.sleep(SLEEP); continue
+                if not symbols: time.sleep(SLEEP); continue
 
-                strategy = None
-                for name, opts in (cfg.get("strategies") or {}).items():
-                    if opts.get("enabled"): strategy = name; break
-                if not strategy:
-                    time.sleep(SLEEP); continue
+                strategy = next((n for n,o in (cfg.get("strategies") or {}).items() if o.get("enabled")), None)
+                if not strategy: time.sleep(SLEEP); continue
 
                 tf = (cfg.get("live_tf") or "M5").upper()
                 expiry = (cfg.get("live_expiry") or "5m")
-                gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
                 gran = gran_map.get(tf, 300)
 
                 cfg_for_run = dict(cfg)
@@ -102,15 +89,13 @@ class LiveEngine:
                 sent_now = 0
                 for sym in symbols:
                     try:
-                        _fetch_one_symbol(os.getenv("DERIV_APP_ID", "1089"), sym, gran, COUNT)
-                        path = _deriv_csv_path(sym, gran)
+                        fetch_one_symbol(os.getenv("DERIV_APP_ID", "1089"), sym, gran, COUNT)
+                        path = deriv_csv_path(sym, gran)
                         df = pd.read_csv(path)
                         df.columns = [c.strip().lower() for c in df.columns]
-                        if "timestamp" in df.columns:
-                            df["timestamp"] = pd.to_datetime(df["timestamp"])
+                        if "timestamp" in df.columns: df["timestamp"] = pd.to_datetime(df["timestamp"])
                         for c in ("open","high","low","close"):
-                            if c in df.columns:
-                                df[c] = pd.to_numeric(df[c], errors="coerce")
+                            if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
                         df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
                         if len(df) < 50: continue
 
@@ -120,8 +105,7 @@ class LiveEngine:
 
                         key = (sym, tf)
                         last_key = f"{last.get('time_in') or last.get('idx')}"
-                        prev_key = self._last_sig.get(key)
-                        if prev_key == last_key: continue
+                        if self._last_sig.get(key) == last_key: continue
 
                         tier = int(os.getenv("LIVE_TIER", "2"))
                         chat_id = CHAT_TIER.get(tier) or CHAT_ADMIN
