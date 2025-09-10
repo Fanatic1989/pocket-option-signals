@@ -1,4 +1,4 @@
-# routes.py — full file with entry/expiry render
+# routes.py — full file with indicator-defaults + candlesticks + entry/expiry markers
 import os, re, json, math
 from io import StringIO
 from datetime import datetime, timedelta
@@ -132,8 +132,24 @@ def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period=14, 
     d = k.rolling(d_period).mean()
     return k, d
 
+# ---- FIX: defaults if all indicators disabled ----
 def _compute_plot_lines(df: pd.DataFrame, inds_cfg: dict):
     inds_cfg = _cfg_dict(inds_cfg)
+
+    def _any_enabled(d):
+        d = _cfg_dict(d)
+        for k in ("sma","ema","wma","smma","tma","rsi","stoch"):
+            if _cfg_dict(d.get(k)).get("enabled"): return True
+        return False
+
+    # Use defaults if all OFF
+    if not _any_enabled(inds_cfg):
+        inds_cfg = {
+            "sma":   {"enabled": True, "period": 50},
+            "rsi":   {"enabled": True, "period": 14},
+            "stoch": {"enabled": True, "k": 14, "d": 3, "smooth_k": 3},
+        }
+
     close = df["close"]; high = df["high"]; low = df["low"]
     out = {}
 
@@ -208,21 +224,18 @@ def _expiry_seconds(expiry: str) -> int:
         return int(re.sub(r"[^0-9]", "", s)) * 60
     if s.endswith("h"):
         return int(re.sub(r"[^0-9]", "", s)) * 3600
-    # fallback: digits = minutes
-    if s.isdigit(): return int(s) * 60
+    if s.endswith("d"):
+        return int(re.sub(r"[^0-9]", "", s)) * 86400
+    if s.isdigit():
+        return int(s) * 60
     return 300
 
 def _extract_trades(bt, df: pd.DataFrame, expiry: str):
-    """
-    Extract a list of dicts:
-      { 't': pd.Timestamp, 'side': 'BUY'|'SELL', 'expiry': pd.Timestamp|None, 'price': float|None }
-    Works with several shapes: bt.trades_df, bt.entries, bt.signals, or iterable bt.trades.
-    """
     out = []
     exp_s = _expiry_seconds(expiry)
 
     def to_ts(x):
-        if isinstance(x, (int, float)):  # index
+        if isinstance(x, (int, float)):
             i = int(x)
             if 0 <= i < len(df): return pd.to_datetime(df["timestamp"].iloc[i])
             return None
@@ -231,7 +244,6 @@ def _extract_trades(bt, df: pd.DataFrame, expiry: str):
         except Exception:
             return None
 
-    # trades_df path
     if hasattr(bt, "trades_df") and isinstance(bt.trades_df, pd.DataFrame):
         tdf = bt.trades_df
         for _, r in tdf.iterrows():
@@ -243,8 +255,6 @@ def _extract_trades(bt, df: pd.DataFrame, expiry: str):
             if t is not None and side in ("BUY","SELL"):
                 if exp is None: exp = t + timedelta(seconds=exp_s)
                 out.append({"t": t, "side": side, "expiry": exp, "price": px})
-
-    # entries list path
     elif hasattr(bt, "entries") and isinstance(bt.entries, list):
         for e in bt.entries:
             t = to_ts(e.get("time") or e.get("t") or e.get("entry_time"))
@@ -255,8 +265,6 @@ def _extract_trades(bt, df: pd.DataFrame, expiry: str):
             if t is not None and side in ("BUY","SELL"):
                 if exp is None: exp = t + timedelta(seconds=exp_s)
                 out.append({"t": t, "side": side, "expiry": exp, "price": px})
-
-    # signals path
     elif hasattr(bt, "signals") and isinstance(bt.signals, list):
         for e in bt.signals:
             t = to_ts(e.get("time") or e.get("t"))
@@ -264,8 +272,6 @@ def _extract_trades(bt, df: pd.DataFrame, expiry: str):
             px = e.get("price") or None
             if t is not None and side in ("BUY","SELL"):
                 out.append({"t": t, "side": side, "expiry": t + timedelta(seconds=exp_s), "price": px})
-
-    # trades iterable path
     elif hasattr(bt, "trades"):
         try:
             for e in bt.trades:
@@ -315,7 +321,9 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
         if name.startswith(prefixes):
             axp.plot(ts, s, label=name, linewidth=1.1)
     axp.set_title(f"{sym}  •  TF={tf}  •  Expiry={expiry}")
-    axp.legend(loc="upper left", fontsize=8, ncols=3)
+    # legend only if there are handles
+    if axp.get_legend_handles_labels()[0]:
+        axp.legend(loc="upper left", fontsize=8, ncols=3)
 
     # -- entries / expiry shading
     if trades:
@@ -323,19 +331,16 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
             t  = pd.to_datetime(tr["t"])
             te = pd.to_datetime(tr["expiry"]) if tr.get("expiry") is not None else None
             side = tr.get("side", "BUY").upper()
-            # price row near close at that time
             try:
                 row = ds.iloc[ds["timestamp"].searchsorted(t, side="left")]
                 y = float(row["close"])
             except Exception:
                 y = float(ds["close"].iloc[-1])
 
-            # entry marker
             marker = "▲" if side == "BUY" else "▼"
             color  = "#17c964" if side == "BUY" else "#f31260"
             axp.annotate(marker, (t, y), color=color, fontsize=11, ha="center", va="bottom" if side=="BUY" else "top")
 
-            # expiry shading band
             if te is not None and te > t:
                 axp.axvspan(t, te, color=color, alpha=0.10)
 
@@ -350,7 +355,9 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
         axr.axhline(70, color="#aa4444", linewidth=.7)
         axr.axhline(30, color="#44aa44", linewidth=.7)
         axr.set_ylim(0, 100); axr.set_ylabel("RSI")
-        axr.grid(True, alpha=.15); axr.legend(loc="upper left", fontsize=8)
+        axr.grid(True, alpha=.15)
+        if axr.get_legend_handles_labels()[0]:
+            axr.legend(loc="upper left", fontsize=8)
 
     # stoch
     if has_sto:
@@ -364,7 +371,9 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
         axs.axhline(80, color="#aa4444", linewidth=.7)
         axs.axhline(20, color="#44aa44", linewidth=.7)
         axs.set_ylim(0, 100); axs.set_ylabel("Stoch")
-        axs.grid(True, alpha=.15); axs.legend(loc="upper left", fontsize=8)
+        axs.grid(True, alpha=.15)
+        if axs.get_legend_handles_labels()[0]:
+            axs.legend(loc="upper left", fontsize=8)
 
     fig.autofmt_xdate(); fig.tight_layout()
     fname = f"{sym.replace('/','_')}_{tf}_{expiry}.png"
@@ -701,7 +710,6 @@ def backtest():
             else:
                 raise
 
-        # results tally
         results.append({
             "symbol": sym,
             "trades": getattr(bt, "trades", 0) if isinstance(getattr(bt, "trades", 0), (int, float)) else (getattr(bt, "trades_count", 0) or 0),
@@ -715,12 +723,16 @@ def backtest():
         summary["losses"] += results[-1]["losses"]
         summary["draws"]  += results[-1]["draws"]
 
-        # plot with entries
-        inds_cfg = _cfg_dict(cfg.get("indicators"))
+        # ---- FIX: defaults if indicators all off ----
+        inds_cfg = _cfg_dict(cfg.get("indicators") or {})
+        if not any(_cfg_dict(inds_cfg).get(k, {}).get("enabled") for k in ("sma","ema","wma","smma","tma","rsi","stoch")):
+            inds_cfg = {"sma":{"enabled":True,"period":50},
+                        "rsi":{"enabled":True,"period":14},
+                        "stoch":{"enabled":True,"k":14,"d":3,"smooth_k":3}}
+
         trades = _extract_trades(bt, df, expiry)
         try:
             plot_url_local = _save_backtest_plot(sym, tf, expiry, df, inds_cfg, trades, outdir="static/plots", bars=200)
-            # record first plot
             if plot_url is None:
                 plot_url = plot_url_local
         except Exception as pe:
