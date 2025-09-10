@@ -1,4 +1,4 @@
-# routes.py — full file
+# routes.py — full file (fixed)
 import os, re, json, math
 from io import StringIO
 from datetime import datetime
@@ -214,7 +214,7 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
         ds[col] = pd.to_numeric(ds[col], errors="coerce")
     ds = ds.dropna(subset=["open","high","low","close"]).sort_values("timestamp").tail(bars)
 
-    ts = ds["timestamp"]; close = ds["close"]; high = ds["high"]; low = ds["low"]
+    ts = ds["timestamp"]
     lines = _compute_plot_lines(ds, inds_cfg)
     has_rsi = any(k.startswith("RSI(") for k in lines)
     has_sto = any(k.startswith("Stoch") for k in lines)
@@ -227,8 +227,9 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
     # price
     axp = axes[0]
     _draw_candles(axp, ds)
+    prefixes = ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")
     for name, s in lines.items():
-        if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA("))):
+        if name.startswith(prefixes):
             axp.plot(ts, s, label=name, linewidth=1.1)
     axp.set_title(f"{sym}  •  TF={tf}  •  Expiry={expiry}")
     axp.legend(loc="upper left", fontsize=8, ncols=3)
