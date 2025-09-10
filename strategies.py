@@ -2,7 +2,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import pandas as pd
 import numpy as np
@@ -23,7 +23,7 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     roll_down = pd.Series(loss).rolling(period, min_periods=period).mean()
     rs = roll_up / (roll_down.replace(0, np.nan))
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    return pd.Series(rsi, index=close.index).fillna(method="bfill")
+    return pd.Series(rsi, index=close.index).bfill()
 
 def _stoch(high: pd.Series, low: pd.Series, close: pd.Series, k: int = 14, d: int = 3) -> (pd.Series, pd.Series):
     k = max(int(k or 1), 1); d = max(int(d or 1), 1)
@@ -166,21 +166,43 @@ def _chop_conditions(d: pd.DataFrame):
     return buy, sell
 
 
-# -------------------- Custom rule evaluation --------------------
+# -------------------- Custom rule evaluation (HARDENED) --------------------
+
+def _to_rule(x: Any) -> Dict[str, Any]:
+    """Normalize a rule to dict. Accept dict, JSON string, or anything -> {}."""
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            j = json.loads(x)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
 def _eval_custom(d: pd.DataFrame, custom: Dict[str, Any]):
-    if not custom:
-        return _base_conditions(d)
+    """
+    Accepts custom dict possibly containing stringified buy_rule/sell_rule.
+    Supported keys inside rule:
+      price_above_sma / price_below_sma (bool)
+      rsi_gt / rsi_lt (number)
+      stoch_cross_up / stoch_cross_dn (bool)
+    """
+    if not isinstance(custom, dict):
+        custom = _to_rule(custom)
 
-    br = (custom.get("buy_rule") or custom.get("buy") or {})
-    sr = (custom.get("sell_rule") or custom.get("sell") or {})
+    br_raw = custom.get("buy_rule") or custom.get("buy") or {}
+    sr_raw = custom.get("sell_rule") or custom.get("sell") or {}
+    br = _to_rule(br_raw)
+    sr = _to_rule(sr_raw)
+
     if not br and not sr:
         return _base_conditions(d)
 
     def build(rule: Dict[str, Any]) -> pd.Series:
-        cond = pd.Series(True, index=d.index)
         if not rule:
             return pd.Series(False, index=d.index)
+        cond = pd.Series(False, index=d.index)
         for i in range(1, len(d)):
             ok = True
             if rule.get("price_above_sma"): ok = ok and (d["close"].iloc[i] > d["sma"].iloc[i])
@@ -206,10 +228,7 @@ def run_backtest_core_binary(
     tf: str,
     expiry: str,
 ) -> BTResult:
-    """
-    Simple binary options backtest (entry next bar, exit N bars later).
-    Hardened to accept bad cfg/core types (including JSON strings).
-    """
+    """Binary options backtest (entry next bar, exit N bars later)."""
     # ---- normalize cfg ----
     if isinstance(cfg, str):
         try:
@@ -251,13 +270,14 @@ def run_backtest_core_binary(
     elif core == "CHOP":
         buy_sig, sell_sig = _chop_conditions(d)
     elif core == "CUSTOM":
-        custom = cfg.get("custom", {}) if isinstance(cfg.get("custom", {}), dict) else {}
+        custom = cfg.get("custom", {}) if isinstance(cfg.get("custom", {}), dict) else _to_rule(cfg.get("custom"))
         buy_sig, sell_sig = _eval_custom(d, custom)
     else:
         buy_sig, sell_sig = _base_conditions(d)
 
     # Walk forward
     for i in range(1, len(d) - bars):
+        # BUY
         if buy_sig.iloc[i]:
             entry_idx = i + 1
             exit_idx  = entry_idx + bars
@@ -277,6 +297,7 @@ def run_backtest_core_binary(
                 "exit":     exitp,
                 "outcome":  outcome
             })
+        # SELL
         if sell_sig.iloc[i]:
             entry_idx = i + 1
             exit_idx  = entry_idx + bars
