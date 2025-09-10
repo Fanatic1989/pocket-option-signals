@@ -1,5 +1,5 @@
-# routes.py — full file with indicator-defaults + candlesticks + entry/expiry markers
-import os, re, json, math
+# routes.py — full file (cache-busting images + defaults + entries/expiry markers)
+import os, re, json, math, uuid
 from io import StringIO
 from datetime import datetime, timedelta
 
@@ -132,18 +132,16 @@ def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period=14, 
     d = k.rolling(d_period).mean()
     return k, d
 
-# ---- FIX: defaults if all indicators disabled ----
+def _any_ind_enabled(d):
+    d = _cfg_dict(d)
+    for k in ("sma","ema","wma","smma","tma","rsi","stoch"):
+        if _cfg_dict(d.get(k)).get("enabled"): return True
+    return False
+
+# ---- defaults if all indicators disabled ----
 def _compute_plot_lines(df: pd.DataFrame, inds_cfg: dict):
     inds_cfg = _cfg_dict(inds_cfg)
-
-    def _any_enabled(d):
-        d = _cfg_dict(d)
-        for k in ("sma","ema","wma","smma","tma","rsi","stoch"):
-            if _cfg_dict(d.get(k)).get("enabled"): return True
-        return False
-
-    # Use defaults if all OFF
-    if not _any_enabled(inds_cfg):
+    if not _any_ind_enabled(inds_cfg):
         inds_cfg = {
             "sma":   {"enabled": True, "period": 50},
             "rsi":   {"enabled": True, "period": 14},
@@ -376,8 +374,13 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
             axs.legend(loc="upper left", fontsize=8)
 
     fig.autofmt_xdate(); fig.tight_layout()
-    fname = f"{sym.replace('/','_')}_{tf}_{expiry}.png"
+
+    # ---- CACHE BUSTING (unique filename each run) ----
+    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    uid = uuid.uuid4().hex[:6]
+    fname = f"{sym.replace('/','_')}_{tf}_{expiry}_{stamp}_{uid}.png"
     fpath = os.path.join(outdir, fname)
+
     plt.savefig(fpath, dpi=140); plt.close(fig)
     return "/" + fpath
 
@@ -723,9 +726,9 @@ def backtest():
         summary["losses"] += results[-1]["losses"]
         summary["draws"]  += results[-1]["draws"]
 
-        # ---- FIX: defaults if indicators all off ----
+        # defaults if indicators all off
         inds_cfg = _cfg_dict(cfg.get("indicators") or {})
-        if not any(_cfg_dict(inds_cfg).get(k, {}).get("enabled") for k in ("sma","ema","wma","smma","tma","rsi","stoch")):
+        if not _any_ind_enabled(inds_cfg):
             inds_cfg = {"sma":{"enabled":True,"period":50},
                         "rsi":{"enabled":True,"period":14},
                         "stoch":{"enabled":True,"k":14,"d":3,"smooth_k":3}}
