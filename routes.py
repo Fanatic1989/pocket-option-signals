@@ -1,7 +1,7 @@
-# routes.py — full file (fixed)
+# routes.py — full file with entry/expiry render
 import os, re, json, math
 from io import StringIO
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
@@ -19,17 +19,17 @@ import matplotlib.dates as mdates
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
 # ---------------------------------------------------------------------
-# Local modules (keep imports one-way to avoid circulars)
+# Local modules (one-way imports to avoid cycles)
 # ---------------------------------------------------------------------
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
 
-# Simple fetch helpers (standalone module; not importing routes)
+# Standalone fetchers
 from data_fetch import deriv_csv_path as _deriv_csv_path, fetch_one_symbol as _fetch_one_symbol
 
-# Live engine (must NOT import routes)
+# Live engine (must not import routes)
 from live_engine import ENGINE, tg_test
 
 # ---------------------------------------------------------------------
@@ -96,7 +96,7 @@ def _expand_all_symbols(tokens):
     return unique
 
 # ---------------------------------------------------------------------
-# Minimal indicator functions (for plotting overlays)
+# Minimal indicator fns (for plotting overlays)
 # ---------------------------------------------------------------------
 def _sma(series: pd.Series, period: int):
     return series.rolling(period, min_periods=1).mean()
@@ -168,7 +168,7 @@ def _compute_plot_lines(df: pd.DataFrame, inds_cfg: dict):
     return out
 
 # ---------------------------------------------------------------------
-# Candlestick plotting (no extra deps)
+# Candlestick plotting + entries
 # ---------------------------------------------------------------------
 def _draw_candles(ax, df, ts_col="timestamp", o="open", h="high", l="low", c="close"):
     ts = pd.to_datetime(df[ts_col])
@@ -202,7 +202,90 @@ def _draw_candles(ax, df, ts_col="timestamp", o="open", h="high", l="low", c="cl
         ))
     ax.grid(True, alpha=.15)
 
+def _expiry_seconds(expiry: str) -> int:
+    s = (expiry or "").lower().strip()
+    if s.endswith("m"):
+        return int(re.sub(r"[^0-9]", "", s)) * 60
+    if s.endswith("h"):
+        return int(re.sub(r"[^0-9]", "", s)) * 3600
+    # fallback: digits = minutes
+    if s.isdigit(): return int(s) * 60
+    return 300
+
+def _extract_trades(bt, df: pd.DataFrame, expiry: str):
+    """
+    Extract a list of dicts:
+      { 't': pd.Timestamp, 'side': 'BUY'|'SELL', 'expiry': pd.Timestamp|None, 'price': float|None }
+    Works with several shapes: bt.trades_df, bt.entries, bt.signals, or iterable bt.trades.
+    """
+    out = []
+    exp_s = _expiry_seconds(expiry)
+
+    def to_ts(x):
+        if isinstance(x, (int, float)):  # index
+            i = int(x)
+            if 0 <= i < len(df): return pd.to_datetime(df["timestamp"].iloc[i])
+            return None
+        try:
+            return pd.to_datetime(x)
+        except Exception:
+            return None
+
+    # trades_df path
+    if hasattr(bt, "trades_df") and isinstance(bt.trades_df, pd.DataFrame):
+        tdf = bt.trades_df
+        for _, r in tdf.iterrows():
+            t = to_ts(r.get("entry_time") or r.get("time") or r.get("t"))
+            side = str(r.get("side") or r.get("direction") or "").upper()
+            px = r.get("entry_price") or r.get("price") or None
+            exp = r.get("expiry_time") or r.get("exit_time")
+            exp = to_ts(exp) if exp is not None else None
+            if t is not None and side in ("BUY","SELL"):
+                if exp is None: exp = t + timedelta(seconds=exp_s)
+                out.append({"t": t, "side": side, "expiry": exp, "price": px})
+
+    # entries list path
+    elif hasattr(bt, "entries") and isinstance(bt.entries, list):
+        for e in bt.entries:
+            t = to_ts(e.get("time") or e.get("t") or e.get("entry_time"))
+            side = str(e.get("side") or e.get("direction") or "").upper()
+            px = e.get("price") or e.get("entry_price") or None
+            exp = e.get("expiry_time")
+            exp = to_ts(exp) if exp is not None else None
+            if t is not None and side in ("BUY","SELL"):
+                if exp is None: exp = t + timedelta(seconds=exp_s)
+                out.append({"t": t, "side": side, "expiry": exp, "price": px})
+
+    # signals path
+    elif hasattr(bt, "signals") and isinstance(bt.signals, list):
+        for e in bt.signals:
+            t = to_ts(e.get("time") or e.get("t"))
+            side = str(e.get("side") or e.get("signal") or "").upper()
+            px = e.get("price") or None
+            if t is not None and side in ("BUY","SELL"):
+                out.append({"t": t, "side": side, "expiry": t + timedelta(seconds=exp_s), "price": px})
+
+    # trades iterable path
+    elif hasattr(bt, "trades"):
+        try:
+            for e in bt.trades:
+                t = to_ts(getattr(e, "entry_time", None) or getattr(e, "time", None) or (e.get("entry_time") if isinstance(e, dict) else None))
+                side = (
+                    getattr(e, "side", None) or getattr(e, "direction", None) or
+                    (e.get("side") if isinstance(e, dict) else None) or
+                    (e.get("direction") if isinstance(e, dict) else None)
+                )
+                px = getattr(e, "entry_price", None) or (e.get("entry_price") if isinstance(e, dict) else None)
+                side = str(side or "").upper()
+                if t is not None and side in ("BUY","SELL"):
+                    out.append({"t": t, "side": side, "expiry": t + timedelta(seconds=exp_s), "price": px})
+        except Exception:
+            pass
+
+    return out
+
 def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_cfg: dict,
+                        trades: list | None,
                         outdir="static/plots", bars=200):
     os.makedirs(outdir, exist_ok=True)
 
@@ -220,8 +303,8 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
     has_sto = any(k.startswith("Stoch") for k in lines)
     rows    = 1 + (1 if has_rsi else 0) + (1 if has_sto else 0)
 
-    fig_height = 3.0 * rows + 0.4
-    fig, axes = plt.subplots(rows, 1, figsize=(12.5, fig_height), sharex=True)
+    fig_height = 3.2 * rows + 0.6
+    fig, axes = plt.subplots(rows, 1, figsize=(13.5, fig_height), sharex=True)
     if rows == 1: axes = [axes]
 
     # price
@@ -233,6 +316,28 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
             axp.plot(ts, s, label=name, linewidth=1.1)
     axp.set_title(f"{sym}  •  TF={tf}  •  Expiry={expiry}")
     axp.legend(loc="upper left", fontsize=8, ncols=3)
+
+    # -- entries / expiry shading
+    if trades:
+        for tr in trades:
+            t  = pd.to_datetime(tr["t"])
+            te = pd.to_datetime(tr["expiry"]) if tr.get("expiry") is not None else None
+            side = tr.get("side", "BUY").upper()
+            # price row near close at that time
+            try:
+                row = ds.iloc[ds["timestamp"].searchsorted(t, side="left")]
+                y = float(row["close"])
+            except Exception:
+                y = float(ds["close"].iloc[-1])
+
+            # entry marker
+            marker = "▲" if side == "BUY" else "▼"
+            color  = "#17c964" if side == "BUY" else "#f31260"
+            axp.annotate(marker, (t, y), color=color, fontsize=11, ha="center", va="bottom" if side=="BUY" else "top")
+
+            # expiry shading band
+            if te is not None and te > t:
+                axp.axvspan(t, te, color=color, alpha=0.10)
 
     # rsi
     idx = 1
@@ -264,7 +369,7 @@ def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_c
     fig.autofmt_xdate(); fig.tight_layout()
     fname = f"{sym.replace('/','_')}_{tf}_{expiry}.png"
     fpath = os.path.join(outdir, fname)
-    plt.savefig(fpath, dpi=130); plt.close(fig)
+    plt.savefig(fpath, dpi=140); plt.close(fig)
     return "/" + fpath
 
 # ---------------------------------------------------------------------
@@ -542,7 +647,7 @@ def deriv_fetch():
     return redirect(url_for("dashboard.dashboard"))
 
 # ---------------------------------------------------------------------
-# Backtest (with candlestick plot)
+# Backtest (with candlestick + entries plot)
 # ---------------------------------------------------------------------
 @bp.route("/backtest", methods=["POST"])
 @require_login
@@ -591,31 +696,35 @@ def backtest():
         try:
             bt = run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         except Exception as e:
-            # defensive fallback if any sub-config is unexpectedly a string
             if "object has no attribute 'get'" in str(e):
                 bt = run_backtest_core_binary(df, core, {}, tf, expiry)
             else:
                 raise
 
+        # results tally
         results.append({
             "symbol": sym,
-            "trades": bt.trades,
-            "wins": bt.wins,
-            "losses": bt.losses,
-            "draws": bt.draws,
-            "winrate": round(bt.winrate*100,2),
+            "trades": getattr(bt, "trades", 0) if isinstance(getattr(bt, "trades", 0), (int, float)) else (getattr(bt, "trades_count", 0) or 0),
+            "wins": getattr(bt, "wins", 0),
+            "losses": getattr(bt, "losses", 0),
+            "draws": getattr(bt, "draws", 0),
+            "winrate": round((getattr(bt, "winrate", 0.0) or 0.0)*100,2) if isinstance(getattr(bt, "winrate", 0.0), (float,int)) else 0.0,
         })
-        summary["trades"] += bt.trades
-        summary["wins"]   += bt.wins
-        summary["losses"] += bt.losses
-        summary["draws"]  += bt.draws
+        summary["trades"] += results[-1]["trades"]
+        summary["wins"]   += results[-1]["wins"]
+        summary["losses"] += results[-1]["losses"]
+        summary["draws"]  += results[-1]["draws"]
 
-        if plot_url is None:
-            inds_cfg = _cfg_dict(cfg.get("indicators"))
-            try:
-                plot_url = _save_backtest_plot(sym, tf, expiry, df, inds_cfg, outdir="static/plots", bars=200)
-            except Exception as pe:
-                warnings.append(f"{sym}: plot error {pe}")
+        # plot with entries
+        inds_cfg = _cfg_dict(cfg.get("indicators"))
+        trades = _extract_trades(bt, df, expiry)
+        try:
+            plot_url_local = _save_backtest_plot(sym, tf, expiry, df, inds_cfg, trades, outdir="static/plots", bars=200)
+            # record first plot
+            if plot_url is None:
+                plot_url = plot_url_local
+        except Exception as pe:
+            warnings.append(f"{sym}: plot error {pe}")
 
     try:
         if uploaded and uploaded.filename:
