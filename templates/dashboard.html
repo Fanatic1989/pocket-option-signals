@@ -45,6 +45,8 @@
     .flex{display:flex;gap:10px;align-items:center}
     .grow{flex:1}
     code{background:#0b1220;color:#cfe1ff;border:1px solid #223152;padding:2px 6px;border-radius:6px}
+    .btn[disabled]{opacity:.5;cursor:not-allowed}
+    img.chart{width:100%;border-radius:10px;border:1px solid #223152}
   </style>
 </head>
 <body>
@@ -77,6 +79,7 @@
           <button class="btn">Login</button>
         </form>
       </div>
+
     {% elif view == 'index' %}
       <div class="grid cols-2">
         <div class="card">
@@ -90,6 +93,7 @@
           <div class="row"><a class="btn secondary" href="{{ url_for('dashboard.up_check') }}">Check /_up</a></div>
         </div>
       </div>
+
     {% elif view == 'dashboard' %}
       <div class="grid cols-2">
 
@@ -130,7 +134,7 @@
             </form>
           </div>
 
-          <!-- Strategies (BASE/TREND/CHOP + CUSTOM1-3 toggles) -->
+          <!-- Strategies -->
           <div class="card">
             <h2>Strategies</h2>
             <form method="post" action="{{ url_for('dashboard.update_strategies') }}">
@@ -178,7 +182,7 @@
             </form>
           </div>
 
-          <!-- CUSTOM rules (SIMPLE natural language or JSON) -->
+          <!-- CUSTOM rules -->
           <div class="card">
             <h2>Custom Rules</h2>
             {% for c in customs %}
@@ -205,10 +209,10 @@
                 <details style="margin:.5rem 0">
                   <summary class="muted">Advanced JSON (optional)</summary>
                   <div class="row"><label>buy_rule_json</label>
-                    <textarea class="input" name="buy_rule_json" placeholder='{"price_above_sma": true, "rsi_gt": 50, "stoch_cross_up": true}'>{{ c.buy_rule|tojson if c.buy_rule else '{}' }}</textarea>
+                    <textarea class="input" name="buy_rule_json">{{ c.buy_rule|tojson if c.buy_rule else '{}' }}</textarea>
                   </div>
                   <div class="row"><label>sell_rule_json</label>
-                    <textarea class="input" name="sell_rule_json" placeholder='{"price_below_sma": true, "rsi_lt": 50, "stoch_cross_dn": true}'>{{ c.sell_rule|tojson if c.sell_rule else '{}' }}</textarea>
+                    <textarea class="input" name="sell_rule_json">{{ c.sell_rule|tojson if c.sell_rule else '{}' }}</textarea>
                   </div>
                 </details>
 
@@ -321,7 +325,7 @@
           <!-- Backtest -->
           <div class="card">
             <h2>Backtest</h2>
-            <form method="post" enctype="multipart/form-data" action="{{ url_for('dashboard.backtest') }}">
+            <form method="post" enctype="multipart/form-data" action="{{ url_for('dashboard.backtest') }}" id="bt_form">
               <div class="row">
                 <label>Symbols</label>
                 <select class="input select-multi" multiple name="bt_symbols_multi">
@@ -367,7 +371,10 @@
               <div class="row"><label>Count</label><input class="input" type="number" name="bt_count" value="300"></div>
               <div class="row"><label>CSV upload</label><input class="input" type="file" name="bt_csv" accept=".csv"></div>
               <div class="row"><label></label><label class="muted"><input type="checkbox" name="convert_po_bt" checked> Convert PO → Deriv</label></div>
-              <div class="row right"><button class="btn">Run Backtest</button></div>
+              <div class="row right">
+                <button class="btn">Run Backtest</button>
+                <button type="button" class="btn secondary" onclick="openChart()" {% if not bt or not bt.plot_url %}disabled{% endif %}>Open Last Chart</button>
+              </div>
             </form>
 
             {% if bt %}
@@ -384,6 +391,15 @@
                   <span class="pill">Losses: {{ bt.summary.losses }}</span>
                   <span class="pill">Winrate: {{ '%.2f'|format(bt.summary.winrate) }}%</span>
                 </div>
+
+                {% if bt.plot_url %}
+                  <div class="hr"></div>
+                  <div class="row right">
+                    <a class="btn secondary" href="{{ bt.plot_url }}" target="_blank" rel="noopener">Open Last Chart</a>
+                  </div>
+                  <img class="chart" src="{{ bt.plot_url }}" alt="Backtest chart">
+                {% endif %}
+
                 <div class="hr"></div>
                 <table>
                   <thead><tr><th>Symbol</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Win%</th></tr></thead>
@@ -416,12 +432,12 @@
           <div class="card">
             <h2>Live Engine</h2>
             <div class="row">
-              <button class="btn ok" onclick="fetchJSON('{{ url_for('dashboard.live_start') }}')">Start</button>
+              <form method="get" action="{{ url_for('dashboard.live_start') }}"><button class="btn ok">Start</button></form>
               <form class="right" method="post" action="{{ url_for('dashboard.live_stop') }}" style="margin-left:auto">
                 <button class="btn danger">Stop</button>
               </form>
-              <button class="btn secondary" onclick="debugOn()">Debug ON</button>
-              <button class="btn secondary" onclick="debugOff()">Debug OFF</button>
+              <a class="btn secondary" href="{{ url_for('dashboard.live_debug', state='on') }}">Debug ON</a>
+              <a class="btn secondary" href="{{ url_for('dashboard.live_debug', state='off') }}">Debug OFF</a>
             </div>
             <div class="hr"></div>
             <pre id="live_status" style="white-space:pre-wrap;background:#0b1220;border:1px solid #223152;border-radius:10px;padding:10px;max-height:220px;overflow:auto">Loading status…</pre>
@@ -444,6 +460,11 @@
   </div>
 
   <script>
+    function openChart(){
+      const url = "{{ bt.plot_url if bt and bt.plot_url else '' }}";
+      if(!url){ alert('No chart yet. Run a backtest first.'); return; }
+      window.open(url, '_blank', 'noopener');
+    }
     async function refreshStatus(){
       try{
         const r = await fetch('{{ url_for("dashboard.live_status") }}');
@@ -453,16 +474,6 @@
         document.getElementById('live_status').textContent = 'Status error: '+e;
       }
     }
-    async function fetchJSON(url){
-      try{
-        const r = await fetch(url);
-        const j = await r.json();
-        alert((j.ok?'OK: ':'ERR: ')+ (j.msg || 'done'));
-        refreshStatus();
-      }catch(e){ alert('Error: '+e); }
-    }
-    function debugOn(){ fetchJSON('{{ url_for("dashboard.live_debug", state="on") }}'); }
-    function debugOff(){ fetchJSON('{{ url_for("dashboard.live_debug", state="off") }}'); }
     refreshStatus(); setInterval(refreshStatus, 10000);
   </script>
 </body>
