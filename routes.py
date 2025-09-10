@@ -1,4 +1,4 @@
-# routes.py — full file with backtest plotting
+# routes.py — full file
 import os, re, json, math
 from io import StringIO
 from datetime import datetime
@@ -7,46 +7,65 @@ import pandas as pd
 import requests
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify
 
-# --- Matplotlib (headless) ---
+# --- Matplotlib headless plotting ---
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-bp = Blueprint('dashboard', __name__)
+# ---------------------------------------------------------------------
+# Blueprint
+# ---------------------------------------------------------------------
+bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
-# --- local modules ---
+# ---------------------------------------------------------------------
+# Local modules (keep imports one-way to avoid circulars)
+# ---------------------------------------------------------------------
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
-from indicators import INDICATOR_SPECS  # params & toggles come from here
+from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
 
-# fetch helpers (no circular import)
+# Simple fetch helpers (standalone module; not importing routes)
 from data_fetch import deriv_csv_path as _deriv_csv_path, fetch_one_symbol as _fetch_one_symbol
 
-# live engine (kept decoupled)
+# Live engine (must NOT import routes)
 from live_engine import ENGINE, tg_test
 
-
-# ======================= Symbol groups =======================
-
+# ---------------------------------------------------------------------
+# Symbol sets / helpers
+# ---------------------------------------------------------------------
 DERIV_FRX = [
     "frxEURUSD","frxGBPUSD","frxUSDJPY","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD",
     "frxEURGBP","frxEURJPY","frxEURCHF","frxEURAUD","frxGBPAUD","frxGBPJPY","frxGBPNZD",
     "frxAUDJPY","frxAUDCAD","frxAUDCHF","frxCADJPY","frxCADCHF","frxCHFJPY","frxNZDJPY",
     "frxEURNZD","frxEURCAD","frxGBPCAD","frxGBPCHF","frxNZDCHF","frxNZDCAD"
 ]
-
 PO_MAJOR = [
     "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"
 ]
-
 AVAILABLE_GROUPS = [
     {"label": "Deriv (frx*)", "items": DERIV_FRX},
     {"label": "Pocket Option majors", "items": PO_MAJOR},
 ]
 
+def _cfg_dict(x):
+    if isinstance(x, dict): return x
+    if isinstance(x, str):
+        try:
+            j = json.loads(x)
+            return j if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    return {}
 
-# ======================= Helpers =======================
+def _merge_unique(seq):
+    seen, out = set(), []
+    for x in seq:
+        if not x: continue
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
 
 def _is_po_symbol(sym: str) -> bool:
     s = (sym or "").upper()
@@ -59,24 +78,6 @@ def _to_deriv(sym: str) -> str:
     sU = s.upper().replace("/", "")
     if _is_po_symbol(sU): return "frx" + sU
     return s
-
-def _merge_unique(seq):
-    seen, out = set(), []
-    for x in seq:
-        if not x: continue
-        if x not in seen:
-            out.append(x); seen.add(x)
-    return out
-
-def _cfg_dict(x):
-    if isinstance(x, dict): return x
-    if isinstance(x, str):
-        try:
-            j = json.loads(x)
-            return j if isinstance(j, dict) else {}
-        except Exception:
-            return {}
-    return {}
 
 def _expand_all_symbols(tokens):
     out = []
@@ -94,9 +95,9 @@ def _expand_all_symbols(tokens):
             unique.append(s); seen.add(s)
     return unique
 
-
-# ======================= Simple indicator calcs for plotting =======================
-
+# ---------------------------------------------------------------------
+# Minimal indicator functions (for plotting overlays)
+# ---------------------------------------------------------------------
 def _sma(series: pd.Series, period: int):
     return series.rolling(period, min_periods=1).mean()
 
@@ -104,17 +105,14 @@ def _ema(series: pd.Series, period: int):
     return series.ewm(span=period, adjust=False).mean()
 
 def _wma(series: pd.Series, period: int):
-    # Weighted MA with linear weights 1..period
     weights = pd.Series(range(1, period+1), dtype=float)
     return series.rolling(period).apply(lambda x: (weights.to_numpy()*x).sum()/weights.sum(), raw=True)
 
 def _smma(series: pd.Series, period: int):
-    # Wilder's smoothing (aka RMA)
     alpha = 1.0/period
     return series.ewm(alpha=alpha, adjust=False).mean()
 
 def _tma(series: pd.Series, period: int):
-    # Triangular MA = SMA of SMA with period/2 rounded
     p1 = max(1, int(math.ceil(period/2)))
     return _sma(_sma(series, p1), period)
 
@@ -134,14 +132,11 @@ def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period=14, 
     d = k.rolling(d_period).mean()
     return k, d
 
-
 def _compute_plot_lines(df: pd.DataFrame, inds_cfg: dict):
-    """Return a dict of enabled indicator series for plotting."""
     inds_cfg = _cfg_dict(inds_cfg)
     close = df["close"]; high = df["high"]; low = df["low"]
-
     out = {}
-    # MAs
+
     if inds_cfg.get("sma",{}).get("enabled"):
         p = int(inds_cfg["sma"].get("period", 50))
         out[f"SMA({p})"] = _sma(close, p)
@@ -158,12 +153,10 @@ def _compute_plot_lines(df: pd.DataFrame, inds_cfg: dict):
         p = int(inds_cfg["tma"].get("period", 50))
         out[f"TMA({p})"] = _tma(close, p)
 
-    # RSI
     if inds_cfg.get("rsi",{}).get("enabled"):
         p = int(inds_cfg["rsi"].get("period", 14))
         out[f"RSI({p})"] = _rsi(close, p)
 
-    # Stoch
     if inds_cfg.get("stoch",{}).get("enabled"):
         kp = int(inds_cfg["stoch"].get("k", 14))
         dp = int(inds_cfg["stoch"].get("d", 3))
@@ -174,106 +167,147 @@ def _compute_plot_lines(df: pd.DataFrame, inds_cfg: dict):
 
     return out
 
+# ---------------------------------------------------------------------
+# Candlestick plotting (no extra deps)
+# ---------------------------------------------------------------------
+def _draw_candles(ax, df, ts_col="timestamp", o="open", h="high", l="low", c="close"):
+    ts = pd.to_datetime(df[ts_col])
+    opens  = pd.to_numeric(df[o], errors="coerce")
+    highs  = pd.to_numeric(df[h], errors="coerce")
+    lows   = pd.to_numeric(df[l], errors="coerce")
+    closes = pd.to_numeric(df[c], errors="coerce")
 
-def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_cfg: dict, outdir="static/plots", bars=200):
+    if len(ts) > 1:
+        deltas = ts.diff().dropna().dt.total_seconds()
+        step = (deltas.median() if not deltas.empty else 60.0)
+    else:
+        step = 60.0
+    width = step * 0.6  # seconds → body width proportion
+
+    x = mdates.date2num(ts.dt.to_pydatetime())
+
+    for xi, o_, h_, l_, c_ in zip(x, opens, highs, lows, closes):
+        if pd.isna(o_) or pd.isna(h_) or pd.isna(l_) or pd.isna(c_):
+            continue
+        up = c_ >= o_
+        color = "#17c964" if up else "#f31260"
+        # wick
+        ax.vlines(xi, l_, h_, color=color, linewidth=1.0, alpha=0.9)
+        # body
+        halfw = (width / (24*3600)) * 0.45  # seconds → days
+        y0, y1 = (o_, c_) if up else (c_, o_)
+        ax.add_patch(plt.Rectangle(
+            (xi - halfw, y0), 2*halfw, max(y1 - y0, 1e-9),
+            facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.95
+        ))
+    ax.grid(True, alpha=.15)
+
+def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_cfg: dict,
+                        outdir="static/plots", bars=200):
     os.makedirs(outdir, exist_ok=True)
-    ds = df.tail(bars).copy()
-    ts = ds["timestamp"]
-    cl = ds["close"]; hi = ds["high"]; lo = ds["low"]
 
+    ds = df.copy()
+    if "timestamp" not in ds.columns: raise ValueError("CSV missing 'timestamp' column")
+    ds["timestamp"] = pd.to_datetime(ds["timestamp"])
+    for col in ("open","high","low","close"):
+        if col not in ds.columns: raise ValueError(f"CSV missing '{col}' column")
+        ds[col] = pd.to_numeric(ds[col], errors="coerce")
+    ds = ds.dropna(subset=["open","high","low","close"]).sort_values("timestamp").tail(bars)
+
+    ts = ds["timestamp"]; close = ds["close"]; high = ds["high"]; low = ds["low"]
     lines = _compute_plot_lines(ds, inds_cfg)
+    has_rsi = any(k.startswith("RSI(") for k in lines)
+    has_sto = any(k.startswith("Stoch") for k in lines)
+    rows    = 1 + (1 if has_rsi else 0) + (1 if has_sto else 0)
 
-    # Build figure: 3 rows if RSI+Stoch enabled; else 1–2 rows
-    has_rsi = any(k.startswith("RSI(") for k in lines.keys())
-    has_sto = any(k.startswith("Stoch") for k in lines.keys())
-    rows = 1 + (1 if has_rsi else 0) + (1 if has_sto else 0)
-
-    fig_height = 3.2 * rows
-    fig, axes = plt.subplots(rows, 1, figsize=(11, fig_height), sharex=True)
+    fig_height = 3.0 * rows + 0.4
+    fig, axes = plt.subplots(rows, 1, figsize=(12.5, fig_height), sharex=True)
     if rows == 1: axes = [axes]
 
+    # price
     axp = axes[0]
-    axp.plot(ts, cl, label="Close", linewidth=1.2)
-    # plot MAs on price
+    _draw_candles(axp, ds)
     for name, s in lines.items():
-        if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
-            axp.plot(ts, s, label=name, linewidth=1.0)
+        if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA("))):
+            axp.plot(ts, s, label=name, linewidth=1.1)
     axp.set_title(f"{sym}  •  TF={tf}  •  Expiry={expiry}")
-    axp.grid(True, alpha=.15)
-    axp.legend(loc="upper left", fontsize=8)
+    axp.legend(loc="upper left", fontsize=8, ncols=3)
 
+    # rsi
     idx = 1
     if has_rsi:
         axr = axes[idx]; idx += 1
         for name, s in lines.items():
             if name.startswith("RSI("):
-                axr.plot(ts, s, label=name, linewidth=1.0)
-        axr.axhline(50, color="#888888", linewidth=.8)
-        axr.axhline(70, color="#aa4444", linewidth=.6); axr.axhline(30, color="#44aa44", linewidth=.6)
+                axr.plot(ts, s, label=name, linewidth=1.1)
+        axr.axhline(50, color="#888888", linewidth=.9)
+        axr.axhline(70, color="#aa4444", linewidth=.7)
+        axr.axhline(30, color="#44aa44", linewidth=.7)
         axr.set_ylim(0, 100); axr.set_ylabel("RSI")
-        axr.grid(True, alpha=.15)
-        axr.legend(loc="upper left", fontsize=8)
+        axr.grid(True, alpha=.15); axr.legend(loc="upper left", fontsize=8)
 
+    # stoch
     if has_sto:
         axs = axes[idx]
-        k_names = [n for n in lines if n.startswith("StochK(")]
-        d_names = [n for n in lines if n.startswith("StochD(")]
-        for name in k_names:
-            axs.plot(ts, lines[name], label=name, linewidth=1.0)
-        for name in d_names:
-            axs.plot(ts, lines[name], label=name, linewidth=1.0, linestyle="--")
-        axs.axhline(80, color="#aa4444", linewidth=.6); axs.axhline(20, color="#44aa44", linewidth=.6)
+        for name, s in lines.items():
+            if name.startswith("StochK("):
+                axs.plot(ts, s, label=name, linewidth=1.1)
+        for name, s in lines.items():
+            if name.startswith("StochD("):
+                axs.plot(ts, s, label=name, linewidth=1.1, linestyle="--")
+        axs.axhline(80, color="#aa4444", linewidth=.7)
+        axs.axhline(20, color="#44aa44", linewidth=.7)
         axs.set_ylim(0, 100); axs.set_ylabel("Stoch")
-        axs.grid(True, alpha=.15)
-        axs.legend(loc="upper left", fontsize=8)
+        axs.grid(True, alpha=.15); axs.legend(loc="upper left", fontsize=8)
 
-    fig.autofmt_xdate()
-    fig.tight_layout()
+    fig.autofmt_xdate(); fig.tight_layout()
     fname = f"{sym.replace('/','_')}_{tf}_{expiry}.png"
     fpath = os.path.join(outdir, fname)
-    plt.savefig(fpath, dpi=120)
-    plt.close(fig)
-    return "/" + fpath  # URL path under /static
-# ======================= Auth & Health =======================
+    plt.savefig(fpath, dpi=130); plt.close(fig)
+    return "/" + fpath
 
+# ---------------------------------------------------------------------
+# Auth & Health
+# ---------------------------------------------------------------------
 def require_login(func):
     from functools import wraps
     @wraps(func)
     def wrapper(*args, **kwargs):
         if not session.get("admin"):
-            return redirect(url_for('dashboard.login', next=request.path))
+            return redirect(url_for("dashboard.login", next=request.path))
         return func(*args, **kwargs)
     return wrapper
 
-@bp.route('/_up', methods=['GET','HEAD'])
+@bp.route("/_up", methods=["GET","HEAD"])
 def up_check(): return "OK", 200
 
-@bp.route('/login', methods=['GET','POST'])
+@bp.route("/login", methods=["GET","POST"])
 def login():
-    if request.method == 'POST':
-        if request.form.get('password') == os.getenv('ADMIN_PASSWORD','admin123'):
-            session['admin'] = True; flash("Logged in.")
-            return redirect(request.args.get('next') or url_for('dashboard.dashboard'))
-        flash("Invalid password")
+    if request.method == "POST":
+        if request.form.get("password") == os.getenv("ADMIN_PASSWORD","admin123"):
+            session["admin"] = True; flash("Logged in.")
+            return redirect(request.args.get("next") or url_for("dashboard.dashboard"))
+        flash("Invalid password","error")
     cfg = _cfg_dict(get_config())
-    return render_template('dashboard.html', view='login', window=cfg.get('window', {}), tz=TIMEZONE)
+    return render_template("dashboard.html", view="login", window=cfg.get("window",{}), tz=TIMEZONE)
 
-@bp.route('/logout')
+@bp.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for('dashboard.index'))
+    return redirect(url_for("dashboard.index"))
 
-@bp.route('/')
+@bp.route("/")
 def index():
     cfg = _cfg_dict(get_config())
-    return render_template('dashboard.html', view='index', within=within_window(cfg),
-                           now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
-                           tz=TIMEZONE, window=cfg.get('window', {}))
+    return render_template("dashboard.html", view="index",
+                           within=within_window(cfg),
+                           now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                           tz=TIMEZONE, window=cfg.get("window", {}))
 
-
-# ======================= Dashboard =======================
-
-@bp.route('/dashboard')
+# ---------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------
+@bp.route("/dashboard")
 @require_login
 def dashboard():
     exec_sql("""
@@ -288,12 +322,12 @@ def dashboard():
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
 
     customs = [
-        dict(_cfg_dict(cfg.get('custom1')), _idx=1),
-        dict(_cfg_dict(cfg.get('custom2')), _idx=2),
-        dict(_cfg_dict(cfg.get('custom3')), _idx=3),
+        dict(_cfg_dict(cfg.get("custom1")), _idx=1),
+        dict(_cfg_dict(cfg.get("custom2")), _idx=2),
+        dict(_cfg_dict(cfg.get("custom3")), _idx=3),
     ]
 
-    strategies_core = _cfg_dict(cfg.get('strategies')) or {
+    strategies_core = _cfg_dict(cfg.get("strategies")) or {
         "BASE":{"enabled": True},
         "TREND":{"enabled": False},
         "CHOP":{"enabled": False},
@@ -303,11 +337,12 @@ def dashboard():
         strategies_all[f"CUSTOM{i}"] = {"enabled": bool(c.get("enabled"))}
 
     bt = session.get("bt", {})
-    return render_template('dashboard.html', view='dashboard',
-                           window=cfg.get('window', {}),
+
+    return render_template("dashboard.html", view="dashboard",
+                           window=cfg.get("window", {}),
                            strategies_all=strategies_all,
                            strategies=strategies_core,
-                           indicators=_cfg_dict(cfg.get('indicators')),
+                           indicators=_cfg_dict(cfg.get("indicators")),
                            specs=INDICATOR_SPECS,
                            customs=customs,
                            active_symbols=cfg.get("symbols") or [],
@@ -317,136 +352,136 @@ def dashboard():
                            bt=bt,
                            live_tf=cfg.get("live_tf","M5"),
                            live_expiry=cfg.get("live_expiry","5m"),
-                           now=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                           now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
                            tz=TIMEZONE)
 
-
-# ======================= Config Updates =======================
-
-@bp.route('/update_window', methods=['POST'])
+# ---------------------------------------------------------------------
+# Config updaters
+# ---------------------------------------------------------------------
+@bp.route("/update_window", methods=["POST"])
 @require_login
 def update_window():
     cfg = _cfg_dict(get_config())
-    cfg.setdefault('window', {"start":"08:00","end":"17:00","timezone":TIMEZONE})
-    cfg['window']['start'] = request.form.get('start', cfg['window']['start'])
-    cfg['window']['end']   = request.form.get('end',   cfg['window']['end'])
-    cfg['window']['timezone'] = request.form.get('timezone', cfg['window']['timezone'])
-    if request.form.get('live_tf'): cfg['live_tf'] = request.form.get('live_tf').upper()
-    if request.form.get('live_expiry'): cfg['live_expiry'] = request.form.get('live_expiry')
+    cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":TIMEZONE})
+    cfg["window"]["start"] = request.form.get("start", cfg["window"]["start"])
+    cfg["window"]["end"]   = request.form.get("end",   cfg["window"]["end"])
+    cfg["window"]["timezone"] = request.form.get("timezone", cfg["window"]["timezone"])
+    if request.form.get("live_tf"): cfg["live_tf"] = request.form.get("live_tf").upper()
+    if request.form.get("live_expiry"): cfg["live_expiry"] = request.form.get("live_expiry")
     set_config(cfg); flash("Trading window & live defaults updated.")
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/update_strategies', methods=['POST'])
+@bp.route("/update_strategies", methods=["POST"])
 @require_login
 def update_strategies():
     cfg = _cfg_dict(get_config())
-    cfg.setdefault('strategies', {"BASE":{"enabled":True},"TREND":{"enabled":False},"CHOP":{"enabled":False}})
-    for name in list(cfg['strategies'].keys()):
-        cfg['strategies'][name]['enabled'] = bool(request.form.get(f's_{name}'))
+    cfg.setdefault("strategies", {"BASE":{"enabled":True},"TREND":{"enabled":False},"CHOP":{"enabled":False}})
+    for name in list(cfg["strategies"].keys()):
+        cfg["strategies"][name]["enabled"] = bool(request.form.get(f"s_{name}"))
     for i in (1,2,3):
-        box = bool(request.form.get(f's_CUSTOM{i}'))
-        key = f'custom{i}'
+        box = bool(request.form.get(f"s_CUSTOM{i}"))
+        key = f"custom{i}"
         cfg.setdefault(key, {})
-        cfg[key]['enabled'] = box
-        cfg['strategies'][f"CUSTOM{i}"] = {"enabled": box}
+        cfg[key]["enabled"] = box
+        cfg["strategies"][f"CUSTOM{i}"] = {"enabled": box}
     set_config(cfg)
     flash("Strategies (including CUSTOM) updated.")
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/update_symbols', methods=['POST'])
+@bp.route("/update_symbols", methods=["POST"])
 @require_login
 def update_symbols():
     cfg = _cfg_dict(get_config())
-    sel_po     = request.form.getlist('symbols_po_multi')
-    sel_deriv  = request.form.getlist('symbols_deriv_multi')
-    raw = (request.form.get('symbols_text') or "").strip()
+    sel_po     = request.form.getlist("symbols_po_multi")
+    sel_deriv  = request.form.getlist("symbols_deriv_multi")
+    raw = (request.form.get("symbols_text") or "").strip()
     text_syms = [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
-    convert_po = bool(request.form.get('convert_po'))
+    convert_po = bool(request.form.get("convert_po"))
 
     merged = _merge_unique(sel_po + sel_deriv + text_syms)
     normalized = [_to_deriv(s) if convert_po else s for s in merged]
 
-    cfg['symbols'] = normalized
-    cfg['symbols_raw'] = merged
+    cfg["symbols"] = normalized
+    cfg["symbols_raw"] = merged
     set_config(cfg)
 
     shown = ", ".join(normalized) if normalized else "(none)"
     flash(("Active symbols saved (PO→Deriv conversion ON): " if convert_po else "Active symbols saved: ") + shown)
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/update_indicators', methods=['POST'])
+@bp.route("/update_indicators", methods=["POST"])
 @require_login
 def update_indicators():
     cfg = _cfg_dict(get_config())
     inds = _cfg_dict(cfg.get("indicators"))
     for key, spec in INDICATOR_SPECS.items():
-        enabled = bool(request.form.get(f'ind_{key}_enabled'))
+        enabled = bool(request.form.get(f"ind_{key}_enabled"))
         inds.setdefault(key, {})
-        inds[key]['enabled'] = enabled
+        inds[key]["enabled"] = enabled
         for p in spec.get("params", {}).keys():
-            form_key = f'ind_{key}_{p}'
+            form_key = f"ind_{key}_{p}"
             if form_key in request.form and request.form.get(form_key) != "":
                 val = request.form.get(form_key)
                 try:
                     inds[key][p] = int(val) if re.fullmatch(r"-?\d+", val) else float(val)
                 except Exception:
                     inds[key][p] = val
-        if key == "sma" and 'period' not in inds[key]:
-            inds[key]['period'] = spec['params']['period']
-    cfg['indicators'] = inds
+        if key == "sma" and "period" not in inds[key]:
+            inds[key]["period"] = spec["params"]["period"]
+    cfg["indicators"] = inds
     set_config(cfg)
     flash("Indicators updated.")
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/update_custom', methods=['POST'])
+@bp.route("/update_custom", methods=["POST"])
 @require_login
 def update_custom():
-    slot = (request.form.get('slot') or '1').strip()
-    field_prefix = f'custom{slot}'
+    slot = (request.form.get("slot") or "1").strip()
+    field_prefix = f"custom{slot}"
     cfg = _cfg_dict(get_config())
     cfg.setdefault(field_prefix, {})
 
-    mode = (request.form.get('mode', 'SIMPLE') or 'SIMPLE').upper()
-    cfg[field_prefix]['enabled'] = bool(request.form.get('enabled'))
-    cfg[field_prefix]['mode'] = mode
+    mode = (request.form.get("mode", "SIMPLE") or "SIMPLE").upper()
+    cfg[field_prefix]["enabled"] = bool(request.form.get("enabled"))
+    cfg[field_prefix]["mode"] = mode
 
     if mode == "SIMPLE":
-        cfg[field_prefix]['simple_buy']  = request.form.get('simple_buy', '')
-        cfg[field_prefix]['simple_sell'] = request.form.get('simple_sell', '')
-        cfg[field_prefix]['buy_rule']  = parse_natural_rule(cfg[field_prefix]['simple_buy'])
-        cfg[field_prefix]['sell_rule'] = parse_natural_rule(cfg[field_prefix]['simple_sell'])
+        cfg[field_prefix]["simple_buy"]  = request.form.get("simple_buy", "")
+        cfg[field_prefix]["simple_sell"] = request.form.get("simple_sell", "")
+        cfg[field_prefix]["buy_rule"]  = parse_natural_rule(cfg[field_prefix]["simple_buy"])
+        cfg[field_prefix]["sell_rule"] = parse_natural_rule(cfg[field_prefix]["simple_sell"])
     else:
         try:
-            cfg[field_prefix]['buy_rule']  = json.loads(request.form.get('buy_rule_json','{}'))
-        except Exception: cfg[field_prefix]['buy_rule'] = {}
+            cfg[field_prefix]["buy_rule"]  = json.loads(request.form.get("buy_rule_json","{}"))
+        except Exception: cfg[field_prefix]["buy_rule"] = {}
         try:
-            cfg[field_prefix]['sell_rule'] = json.loads(request.form.get('sell_rule_json','{}'))
-        except Exception: cfg[field_prefix]['sell_rule'] = {}
+            cfg[field_prefix]["sell_rule"] = json.loads(request.form.get("sell_rule_json","{}"))
+        except Exception: cfg[field_prefix]["sell_rule"] = {}
 
-    try: cfg[field_prefix]['tol_pct'] = float(request.form.get('tol_pct', cfg[field_prefix].get('tol_pct', 0.1)))
+    try: cfg[field_prefix]["tol_pct"] = float(request.form.get("tol_pct", cfg[field_prefix].get("tol_pct", 0.1)))
     except Exception: pass
-    try: cfg[field_prefix]['lookback'] = int(request.form.get('lookback', cfg[field_prefix].get('lookback', 3)))
+    try: cfg[field_prefix]["lookback"] = int(request.form.get("lookback", cfg[field_prefix].get("lookback", 3)))
     except Exception: pass
 
-    cfg.setdefault('strategies', {})
-    cfg['strategies'][f"CUSTOM{slot}"] = {"enabled": bool(cfg[field_prefix]['enabled'])}
+    cfg.setdefault("strategies", {})
+    cfg["strategies"][f"CUSTOM{slot}"] = {"enabled": bool(cfg[field_prefix]["enabled"])}
 
     set_config(cfg)
     flash(f"Custom #{slot} saved.")
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-
-# ======================= Users =======================
-
-@bp.route('/users/add', methods=['POST'])
+# ---------------------------------------------------------------------
+# Users
+# ---------------------------------------------------------------------
+@bp.route("/users/add", methods=["POST"])
 @require_login
 def users_add():
-    telegram_id = (request.form.get('telegram_id') or '').strip()
-    tier = (request.form.get('tier') or 'free').strip()
-    expires_at = (request.form.get('expires_at') or '').strip() or None
+    telegram_id = (request.form.get("telegram_id") or "").strip()
+    tier = (request.form.get("tier") or "free").strip()
+    expires_at = (request.form.get("expires_at") or "").strip() or None
     if not telegram_id:
         flash("Telegram ID required.", "error")
-        return redirect(url_for('dashboard.dashboard'))
+        return redirect(url_for("dashboard.dashboard"))
     exec_sql("""
       CREATE TABLE IF NOT EXISTS users(
         telegram_id TEXT PRIMARY KEY,
@@ -462,30 +497,30 @@ def users_add():
         expires_at=excluded.expires_at
     """, (telegram_id, tier, expires_at))
     flash(f"User saved: {telegram_id} ({tier})")
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/users/delete', methods=['POST'])
+@bp.route("/users/delete", methods=["POST"])
 @require_login
 def users_delete():
-    telegram_id = (request.form.get('telegram_id') or '').strip()
+    telegram_id = (request.form.get("telegram_id") or "").strip()
     if not telegram_id:
         flash("Telegram ID required.", "error")
-        return redirect(url_for('dashboard.dashboard'))
+        return redirect(url_for("dashboard.dashboard"))
     exec_sql("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
     flash(f"User deleted: {telegram_id}")
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-
-# ======================= Deriv fetch =======================
-
-@bp.route('/deriv_fetch', methods=['POST'])
+# ---------------------------------------------------------------------
+# Deriv fetch
+# ---------------------------------------------------------------------
+@bp.route("/deriv_fetch", methods=["POST"])
 @require_login
 def deriv_fetch():
     app_id = os.getenv("DERV_APP_ID", None) or os.getenv("DERIV_APP_ID", "1089")
-    symbols = (request.form.get('fetch_symbols') or "").strip()
-    tf = (request.form.get('fetch_tf') or "M5").upper()
-    count = int(request.form.get('fetch_count') or "300")
-    convert_po = bool(request.form.get('convert_po_fetch'))
+    symbols = (request.form.get("fetch_symbols") or "").strip()
+    tf = (request.form.get("fetch_tf") or "M5").upper()
+    count = int(request.form.get("fetch_count") or "300")
+    convert_po = bool(request.form.get("convert_po_fetch"))
 
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
@@ -503,29 +538,29 @@ def deriv_fetch():
 
     if ok: flash(f"Deriv: saved {ok} symbol(s) @ {tf}")
     if fail: flash("Errors: " + "; ".join(fail))
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-
-# ======================= Backtest (with plot) =======================
-
-@bp.route('/backtest', methods=['POST'])
+# ---------------------------------------------------------------------
+# Backtest (with candlestick plot)
+# ---------------------------------------------------------------------
+@bp.route("/backtest", methods=["POST"])
 @require_login
 def backtest():
     cfg = _cfg_dict(get_config())
-    tf = (request.form.get('bt_tf') or 'M5').upper()
-    expiry = request.form.get('bt_expiry') or '5m'
-    strategy = (request.form.get('bt_strategy') or 'BASE').upper()
-    use_server = bool(request.form.get('use_server'))
+    tf = (request.form.get("bt_tf") or "M5").upper()
+    expiry = request.form.get("bt_expiry") or "5m"
+    strategy = (request.form.get("bt_strategy") or "BASE").upper()
+    use_server = bool(request.form.get("use_server"))
     app_id = os.getenv("DERV_APP_ID", None) or os.getenv("DERIV_APP_ID", "1089")
-    count = int(request.form.get('bt_count') or "300")
-    convert_po = bool(request.form.get('convert_po_bt'))
+    count = int(request.form.get("bt_count") or "300")
+    convert_po = bool(request.form.get("convert_po_bt"))
 
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
 
-    raw_syms_text = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
+    raw_syms_text = request.form.get("bt_symbols") or " ".join(cfg.get("symbols") or [])
     text_syms = [s.strip() for s in re.split(r"[,\s]+", raw_syms_text) if s.strip()]
-    from_multi = request.form.getlist('bt_symbols_multi')
+    from_multi = request.form.getlist("bt_symbols_multi")
     chosen = from_multi if from_multi else text_syms
     chosen = _expand_all_symbols(chosen)
     symbols = [_to_deriv(s) if convert_po else s for s in chosen]
@@ -533,13 +568,13 @@ def backtest():
     if not symbols:
         session["bt"] = {"error": "No symbols selected. Choose pairs or use ALL/ALL_DERIV/ALL_PO."}
         flash("Backtest error: no symbols selected.")
-        return redirect(url_for('dashboard.dashboard'))
+        return redirect(url_for("dashboard.dashboard"))
 
-    uploaded = request.files.get('bt_csv')
+    uploaded = request.files.get("bt_csv")
     results = []
     summary = {"trades":0,"wins":0,"losses":0,"draws":0,"winrate":0.0}
-    csv_errors = []
-    plot_url = None  # will carry first symbol plot
+    warnings = []
+    plot_url = None
 
     def run_one(sym, df):
         nonlocal summary, results, plot_url
@@ -552,10 +587,10 @@ def backtest():
             cfg_run = dict(_cfg_dict(cfg))
             core = strategy
 
-        # Execute core backtest (engine decides entries/expiry)
         try:
             bt = run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         except Exception as e:
+            # defensive fallback if any sub-config is unexpectedly a string
             if "object has no attribute 'get'" in str(e):
                 bt = run_backtest_core_binary(df, core, {}, tf, expiry)
             else:
@@ -567,20 +602,19 @@ def backtest():
             "wins": bt.wins,
             "losses": bt.losses,
             "draws": bt.draws,
-            "winrate": round(bt.winrate*100,2)
+            "winrate": round(bt.winrate*100,2),
         })
         summary["trades"] += bt.trades
         summary["wins"]   += bt.wins
         summary["losses"] += bt.losses
         summary["draws"]  += bt.draws
 
-        # make a plot for the FIRST symbol
         if plot_url is None:
             inds_cfg = _cfg_dict(cfg.get("indicators"))
             try:
                 plot_url = _save_backtest_plot(sym, tf, expiry, df, inds_cfg, outdir="static/plots", bars=200)
             except Exception as pe:
-                csv_errors.append(f"{sym}: plot error {pe}")
+                warnings.append(f"{sym}: plot error {pe}")
 
     try:
         if uploaded and uploaded.filename:
@@ -599,7 +633,7 @@ def backtest():
                         _fetch_one_symbol(app_id, sym, gran, count)
                     path = _deriv_csv_path(sym, gran)
                     if not os.path.exists(path):
-                        csv_errors.append(f"{sym}: no server CSV @ tf {tf} (path: {path})")
+                        warnings.append(f"{sym}: no server CSV @ {tf} (path: {path})")
                         continue
                     df = pd.read_csv(path)
                     df.columns = [c.strip().lower() for c in df.columns]
@@ -608,64 +642,67 @@ def backtest():
                         df[c] = pd.to_numeric(df[c], errors="coerce")
                     df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
                     if len(df) < 30:
-                        csv_errors.append(f"{sym}: not enough candles ({len(df)})")
+                        warnings.append(f"{sym}: not enough candles ({len(df)})")
                         continue
                     run_one(sym, df)
                 except Exception as e:
-                    csv_errors.append(f"{sym}: {e}")
+                    warnings.append(f"{sym}: {e}")
 
         summary["winrate"] = round((summary["wins"]/summary["trades"])*100,2) if summary["trades"] else 0.0
         payload = {"summary": summary, "results": results, "tf": tf, "expiry": expiry, "strategy": strategy}
         if plot_url: payload["plot_url"] = plot_url
-        if csv_errors:
-            payload["warnings"] = csv_errors
-            flash("Backtest completed with warnings. Check the results panel.")
+        if warnings:
+            payload["warnings"] = warnings
+            flash("Backtest completed with warnings.")
         else:
             flash("Backtest complete.")
         session["bt"] = payload
 
     except Exception as e:
-        session["bt"] = {"error": str(e), "warnings": csv_errors}
-        flash(f"Backtest error: {e}")
+        session["bt"] = {"error": str(e), "warnings": warnings}
+        flash(f"Backtest error: {e}", "error")
 
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-
-# ======================= Live controls =======================
-
-@bp.route('/live/status')
+# ---------------------------------------------------------------------
+# Live engine endpoints
+# ---------------------------------------------------------------------
+@bp.route("/live/status")
 def live_status():
     return jsonify({"ok": True, "status": ENGINE.status()})
 
-@bp.route('/live/start', methods=['POST','GET'])
+@bp.route("/live/start", methods=["POST","GET"])
 def live_start():
     ok, msg = ENGINE.start()
-    if request.method == 'GET': return jsonify({"ok": ok, "msg": msg})
-    flash(f"Live: {msg}"); return redirect(url_for('dashboard.dashboard'))
+    if request.method == "GET": return jsonify({"ok": ok, "msg": msg})
+    flash(f"Live: {msg}")
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/live/stop', methods=['POST','GET'])
+@bp.route("/live/stop", methods=["POST","GET"])
 def live_stop():
     ok, msg = ENGINE.stop()
-    if request.method == 'GET': return jsonify({"ok": ok, "msg": msg})
-    flash(f"Live: {msg}"); return redirect(url_for('dashboard.dashboard'))
+    if request.method == "GET": return jsonify({"ok": ok, "msg": msg})
+    flash(f"Live: {msg}")
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/live/debug/<state>')
+@bp.route("/live/debug/<state>")
 def live_debug(state):
     s = (state or "").lower()
     ENGINE.debug = (s == "on")
     return jsonify({"ok": True, "debug": ENGINE.debug})
 
-# ======================= Telegram diag =======================
-
-@bp.route('/telegram/test', methods=['POST','GET'])
+# ---------------------------------------------------------------------
+# Telegram diagnostics
+# ---------------------------------------------------------------------
+@bp.route("/telegram/test", methods=["POST","GET"])
 def telegram_test():
     ok, msg = tg_test()
-    if request.method == 'GET':
+    if request.method == "GET":
         return jsonify({"ok": ok, "msg": msg})
     flash("Telegram OK" if ok else f"Telegram error: {msg}")
-    return redirect(url_for('dashboard.dashboard'))
+    return redirect(url_for("dashboard.dashboard"))
 
-@bp.route('/telegram/diag')
+@bp.route("/telegram/diag")
 def telegram_diag():
     from live_engine import _send_telegram, TELEGRAM_CHAT_KEYS
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
