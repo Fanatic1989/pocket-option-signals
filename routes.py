@@ -81,10 +81,6 @@ def _cfg_dict(x):
             return {}
     return {}
 
-def _safe_cfg(x):
-    """Strong version used in backtest to avoid 'str'.get crashes."""
-    return _cfg_dict(x)
-
 def _expand_all_symbols(tokens):
     """Expand special multi-select tokens into actual symbol lists."""
     out = []
@@ -336,7 +332,7 @@ def deriv_fetch():
 @bp.route('/backtest', methods=['POST'])
 @require_login
 def backtest():
-    cfg = _safe_cfg(get_config())
+    cfg = _cfg_dict(get_config())
 
     tf = (request.form.get('bt_tf') or 'M5').upper()
     expiry = request.form.get('bt_expiry') or '5m'
@@ -352,7 +348,7 @@ def backtest():
     # symbols
     raw_syms_text = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
     text_syms = [s.strip() for s in re.split(r"[,\s]+", raw_syms_text) if s.strip()]
-    from_multi = request.form.getlist('bt_symbols_multi')  # may hold ALL tokens
+    from_multi = request.form.getlist('bt_symbols_multi')
     chosen = from_multi if from_multi else text_syms
     chosen = _expand_all_symbols(chosen)
 
@@ -372,19 +368,18 @@ def backtest():
         # build cfg_run safely each time
         if strategy in ("CUSTOM1","CUSTOM2","CUSTOM3"):
             sid = strategy[-1]
-            cfg_run = dict(_safe_cfg(cfg))
-            cfg_run["custom"] = _safe_cfg(cfg.get(f"custom{sid}"))
+            cfg_run = dict(_cfg_dict(cfg))
+            cfg_run["custom"] = _cfg_dict(cfg.get(f"custom{sid}"))
             core = "CUSTOM"
         else:
-            cfg_run = dict(_safe_cfg(cfg))
+            cfg_run = dict(_cfg_dict(cfg))
             core = strategy
 
-        # retry with {} on any 'get' attribute errors
         try:
             bt = run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         except Exception as e:
-            msg = str(e)
-            if "object has no attribute 'get'" in msg or "'get'" in msg:
+            # last resort retry with {}
+            if "object has no attribute 'get'" in str(e):
                 bt = run_backtest_core_binary(df, core, {}, tf, expiry)
             else:
                 raise
@@ -395,8 +390,8 @@ def backtest():
             "wins": bt.wins,
             "losses": bt.losses,
             "draws": bt.draws,
-            "winrate": round(bt.winrate*100,2),
-            "rows": bt.rows
+            "winrate": round(bt.winrate*100,2)
+            # NOTE: not storing rows in session to avoid >4KB cookie
         })
         summary["trades"] += bt.trades
         summary["wins"]   += bt.wins
