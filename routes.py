@@ -1,4 +1,4 @@
-# routes.py  — full file
+# routes.py  — full file with user add + 10m expiry already supported by parser
 
 import os, re, json
 from io import StringIO
@@ -144,6 +144,14 @@ def index():
 @bp.route('/dashboard')
 @require_login
 def dashboard():
+    # Ensure users table exists so the "Add user" form works anywhere
+    exec_sql("""
+      CREATE TABLE IF NOT EXISTS users(
+        telegram_id TEXT PRIMARY KEY,
+        tier TEXT,
+        expires_at TEXT
+      )
+    """)
     cfg = _cfg_dict(get_config())
     rows = exec_sql("SELECT telegram_id, tier, COALESCE(expires_at,'') FROM users", fetch=True) or []
     users = [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2] or None} for r in rows]
@@ -297,6 +305,47 @@ def update_custom():
     return redirect(url_for('dashboard.dashboard'))
 
 
+# ======================= Users (Add/Update/Delete) =======================
+
+@bp.route('/users/add', methods=['POST'])
+@require_login
+def users_add():
+    telegram_id = (request.form.get('telegram_id') or '').strip()
+    tier = (request.form.get('tier') or 'free').strip()
+    expires_at = (request.form.get('expires_at') or '').strip() or None
+    if not telegram_id:
+        flash("Telegram ID required.", "error")
+        return redirect(url_for('dashboard.dashboard'))
+    exec_sql("""
+      CREATE TABLE IF NOT EXISTS users(
+        telegram_id TEXT PRIMARY KEY,
+        tier TEXT,
+        expires_at TEXT
+      )
+    """)
+    # UPSERT by telegram_id
+    exec_sql("""
+      INSERT INTO users(telegram_id, tier, expires_at)
+      VALUES(?,?,?)
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        tier=excluded.tier,
+        expires_at=excluded.expires_at
+    """, (telegram_id, tier, expires_at))
+    flash(f"User saved: {telegram_id} ({tier})")
+    return redirect(url_for('dashboard.dashboard'))
+
+@bp.route('/users/delete', methods=['POST'])
+@require_login
+def users_delete():
+    telegram_id = (request.form.get('telegram_id') or '').strip()
+    if not telegram_id:
+        flash("Telegram ID required.", "error")
+        return redirect(url_for('dashboard.dashboard'))
+    exec_sql("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
+    flash(f"User deleted: {telegram_id}")
+    return redirect(url_for('dashboard.dashboard'))
+
+
 # ======================= Deriv fetch =======================
 
 @bp.route('/deriv_fetch', methods=['POST'])
@@ -335,7 +384,7 @@ def backtest():
     cfg = _cfg_dict(get_config())
 
     tf = (request.form.get('bt_tf') or 'M5').upper()
-    expiry = request.form.get('bt_expiry') or '5m'
+    expiry = request.form.get('bt_expiry') or '5m'     # <-- 10m supported by parser
     strategy = (request.form.get('bt_strategy') or 'BASE').upper()
     use_server = bool(request.form.get('use_server'))
     app_id = os.getenv("DERV_APP_ID", None) or os.getenv("DERIV_APP_ID", "1089")
