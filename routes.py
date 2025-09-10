@@ -1,6 +1,5 @@
-# routes.py  — full file with user add + 10m expiry already supported by parser
-
-import os, re, json
+# routes.py — full file with backtest plotting
+import os, re, json, math
 from io import StringIO
 from datetime import datetime
 
@@ -8,19 +7,23 @@ import pandas as pd
 import requests
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify
 
-# --- create blueprint FIRST (needed before any @bp.route) ---
+# --- Matplotlib (headless) ---
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 bp = Blueprint('dashboard', __name__)
 
-# --- app modules ---
+# --- local modules ---
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
-from indicators import INDICATOR_SPECS
+from indicators import INDICATOR_SPECS  # params & toggles come from here
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
 
-# These helpers are provided by your fetcher module
+# fetch helpers (no circular import)
 from data_fetch import deriv_csv_path as _deriv_csv_path, fetch_one_symbol as _fetch_one_symbol
 
-# Live engine (does NOT import routes; avoids circular import)
+# live engine (kept decoupled)
 from live_engine import ENGINE, tg_test
 
 
@@ -50,29 +53,23 @@ def _is_po_symbol(sym: str) -> bool:
     return s in PO_MAJOR or bool(re.fullmatch(r"[A-Z]{6}", s))
 
 def _to_deriv(sym: str) -> str:
-    if not sym:
-        return sym
+    if not sym: return sym
     s = sym.strip()
-    if s.startswith("frx"):
-        return s
+    if s.startswith("frx"): return s
     sU = s.upper().replace("/", "")
-    if _is_po_symbol(sU):
-        return "frx" + sU
+    if _is_po_symbol(sU): return "frx" + sU
     return s
 
 def _merge_unique(seq):
     seen, out = set(), []
     for x in seq:
-        if not x:
-            continue
+        if not x: continue
         if x not in seen:
             out.append(x); seen.add(x)
     return out
 
 def _cfg_dict(x):
-    """Ensure config is a dict even if storage returned JSON string or None."""
-    if isinstance(x, dict):
-        return x
+    if isinstance(x, dict): return x
     if isinstance(x, str):
         try:
             j = json.loads(x)
@@ -82,7 +79,6 @@ def _cfg_dict(x):
     return {}
 
 def _expand_all_symbols(tokens):
-    """Expand special multi-select tokens into actual symbol lists."""
     out = []
     for t in tokens:
         tt = (t or "").strip().upper()
@@ -92,7 +88,6 @@ def _expand_all_symbols(tokens):
             out.extend(PO_MAJOR)
         else:
             out.append(t)
-    # uniquify while preserving order
     seen, unique = set(), []
     for s in out:
         if s and s not in seen:
@@ -100,6 +95,145 @@ def _expand_all_symbols(tokens):
     return unique
 
 
+# ======================= Simple indicator calcs for plotting =======================
+
+def _sma(series: pd.Series, period: int):
+    return series.rolling(period, min_periods=1).mean()
+
+def _ema(series: pd.Series, period: int):
+    return series.ewm(span=period, adjust=False).mean()
+
+def _wma(series: pd.Series, period: int):
+    # Weighted MA with linear weights 1..period
+    weights = pd.Series(range(1, period+1), dtype=float)
+    return series.rolling(period).apply(lambda x: (weights.to_numpy()*x).sum()/weights.sum(), raw=True)
+
+def _smma(series: pd.Series, period: int):
+    # Wilder's smoothing (aka RMA)
+    alpha = 1.0/period
+    return series.ewm(alpha=alpha, adjust=False).mean()
+
+def _tma(series: pd.Series, period: int):
+    # Triangular MA = SMA of SMA with period/2 rounded
+    p1 = max(1, int(math.ceil(period/2)))
+    return _sma(_sma(series, p1), period)
+
+def _rsi(close: pd.Series, period: int = 14):
+    delta = close.diff()
+    gain = (delta.clip(lower=0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(method="bfill")
+
+def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_period=14, d_period=3, smooth_k=3):
+    lowest_low = low.rolling(k_period).min()
+    highest_high = high.rolling(k_period).max()
+    k = (close - lowest_low) / (highest_high - lowest_low).replace(0, pd.NA) * 100
+    k = k.rolling(smooth_k).mean()
+    d = k.rolling(d_period).mean()
+    return k, d
+
+
+def _compute_plot_lines(df: pd.DataFrame, inds_cfg: dict):
+    """Return a dict of enabled indicator series for plotting."""
+    inds_cfg = _cfg_dict(inds_cfg)
+    close = df["close"]; high = df["high"]; low = df["low"]
+
+    out = {}
+    # MAs
+    if inds_cfg.get("sma",{}).get("enabled"):
+        p = int(inds_cfg["sma"].get("period", 50))
+        out[f"SMA({p})"] = _sma(close, p)
+    if inds_cfg.get("ema",{}).get("enabled"):
+        p = int(inds_cfg["ema"].get("period", 50))
+        out[f"EMA({p})"] = _ema(close, p)
+    if inds_cfg.get("wma",{}).get("enabled"):
+        p = int(inds_cfg["wma"].get("period", 50))
+        out[f"WMA({p})"] = _wma(close, p)
+    if inds_cfg.get("smma",{}).get("enabled"):
+        p = int(inds_cfg["smma"].get("period", 50))
+        out[f"SMMA({p})"] = _smma(close, p)
+    if inds_cfg.get("tma",{}).get("enabled"):
+        p = int(inds_cfg["tma"].get("period", 50))
+        out[f"TMA({p})"] = _tma(close, p)
+
+    # RSI
+    if inds_cfg.get("rsi",{}).get("enabled"):
+        p = int(inds_cfg["rsi"].get("period", 14))
+        out[f"RSI({p})"] = _rsi(close, p)
+
+    # Stoch
+    if inds_cfg.get("stoch",{}).get("enabled"):
+        kp = int(inds_cfg["stoch"].get("k", 14))
+        dp = int(inds_cfg["stoch"].get("d", 3))
+        sp = int(inds_cfg["stoch"].get("smooth_k", 3))
+        k, d = _stochastic(high, low, close, kp, dp, sp)
+        out[f"StochK({kp},{dp},{sp})"] = k
+        out[f"StochD({kp},{dp},{sp})"] = d
+
+    return out
+
+
+def _save_backtest_plot(sym: str, tf: str, expiry: str, df: pd.DataFrame, inds_cfg: dict, outdir="static/plots", bars=200):
+    os.makedirs(outdir, exist_ok=True)
+    ds = df.tail(bars).copy()
+    ts = ds["timestamp"]
+    cl = ds["close"]; hi = ds["high"]; lo = ds["low"]
+
+    lines = _compute_plot_lines(ds, inds_cfg)
+
+    # Build figure: 3 rows if RSI+Stoch enabled; else 1–2 rows
+    has_rsi = any(k.startswith("RSI(") for k in lines.keys())
+    has_sto = any(k.startswith("Stoch") for k in lines.keys())
+    rows = 1 + (1 if has_rsi else 0) + (1 if has_sto else 0)
+
+    fig_height = 3.2 * rows
+    fig, axes = plt.subplots(rows, 1, figsize=(11, fig_height), sharex=True)
+    if rows == 1: axes = [axes]
+
+    axp = axes[0]
+    axp.plot(ts, cl, label="Close", linewidth=1.2)
+    # plot MAs on price
+    for name, s in lines.items():
+        if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
+            axp.plot(ts, s, label=name, linewidth=1.0)
+    axp.set_title(f"{sym}  •  TF={tf}  •  Expiry={expiry}")
+    axp.grid(True, alpha=.15)
+    axp.legend(loc="upper left", fontsize=8)
+
+    idx = 1
+    if has_rsi:
+        axr = axes[idx]; idx += 1
+        for name, s in lines.items():
+            if name.startswith("RSI("):
+                axr.plot(ts, s, label=name, linewidth=1.0)
+        axr.axhline(50, color="#888888", linewidth=.8)
+        axr.axhline(70, color="#aa4444", linewidth=.6); axr.axhline(30, color="#44aa44", linewidth=.6)
+        axr.set_ylim(0, 100); axr.set_ylabel("RSI")
+        axr.grid(True, alpha=.15)
+        axr.legend(loc="upper left", fontsize=8)
+
+    if has_sto:
+        axs = axes[idx]
+        k_names = [n for n in lines if n.startswith("StochK(")]
+        d_names = [n for n in lines if n.startswith("StochD(")]
+        for name in k_names:
+            axs.plot(ts, lines[name], label=name, linewidth=1.0)
+        for name in d_names:
+            axs.plot(ts, lines[name], label=name, linewidth=1.0, linestyle="--")
+        axs.axhline(80, color="#aa4444", linewidth=.6); axs.axhline(20, color="#44aa44", linewidth=.6)
+        axs.set_ylim(0, 100); axs.set_ylabel("Stoch")
+        axs.grid(True, alpha=.15)
+        axs.legend(loc="upper left", fontsize=8)
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fname = f"{sym.replace('/','_')}_{tf}_{expiry}.png"
+    fpath = os.path.join(outdir, fname)
+    plt.savefig(fpath, dpi=120)
+    plt.close(fig)
+    return "/" + fpath  # URL path under /static
 # ======================= Auth & Health =======================
 
 def require_login(func):
@@ -112,15 +246,13 @@ def require_login(func):
     return wrapper
 
 @bp.route('/_up', methods=['GET','HEAD'])
-def up_check():
-    return "OK", 200
+def up_check(): return "OK", 200
 
 @bp.route('/login', methods=['GET','POST'])
 def login():
     if request.method == 'POST':
         if request.form.get('password') == os.getenv('ADMIN_PASSWORD','admin123'):
-            session['admin'] = True
-            flash("Logged in.")
+            session['admin'] = True; flash("Logged in.")
             return redirect(request.args.get('next') or url_for('dashboard.dashboard'))
         flash("Invalid password")
     cfg = _cfg_dict(get_config())
@@ -144,7 +276,6 @@ def index():
 @bp.route('/dashboard')
 @require_login
 def dashboard():
-    # Ensure users table exists so the "Add user" form works anywhere
     exec_sql("""
       CREATE TABLE IF NOT EXISTS users(
         telegram_id TEXT PRIMARY KEY,
@@ -305,7 +436,7 @@ def update_custom():
     return redirect(url_for('dashboard.dashboard'))
 
 
-# ======================= Users (Add/Update/Delete) =======================
+# ======================= Users =======================
 
 @bp.route('/users/add', methods=['POST'])
 @require_login
@@ -323,7 +454,6 @@ def users_add():
         expires_at TEXT
       )
     """)
-    # UPSERT by telegram_id
     exec_sql("""
       INSERT INTO users(telegram_id, tier, expires_at)
       VALUES(?,?,?)
@@ -376,15 +506,14 @@ def deriv_fetch():
     return redirect(url_for('dashboard.dashboard'))
 
 
-# ======================= Backtest =======================
+# ======================= Backtest (with plot) =======================
 
 @bp.route('/backtest', methods=['POST'])
 @require_login
 def backtest():
     cfg = _cfg_dict(get_config())
-
     tf = (request.form.get('bt_tf') or 'M5').upper()
-    expiry = request.form.get('bt_expiry') or '5m'     # <-- 10m supported by parser
+    expiry = request.form.get('bt_expiry') or '5m'
     strategy = (request.form.get('bt_strategy') or 'BASE').upper()
     use_server = bool(request.form.get('use_server'))
     app_id = os.getenv("DERV_APP_ID", None) or os.getenv("DERIV_APP_ID", "1089")
@@ -394,14 +523,13 @@ def backtest():
     gran_map = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
     gran = gran_map.get(tf, 300)
 
-    # symbols
     raw_syms_text = request.form.get('bt_symbols') or " ".join(cfg.get('symbols') or [])
     text_syms = [s.strip() for s in re.split(r"[,\s]+", raw_syms_text) if s.strip()]
     from_multi = request.form.getlist('bt_symbols_multi')
     chosen = from_multi if from_multi else text_syms
     chosen = _expand_all_symbols(chosen)
-
     symbols = [_to_deriv(s) if convert_po else s for s in chosen]
+
     if not symbols:
         session["bt"] = {"error": "No symbols selected. Choose pairs or use ALL/ALL_DERIV/ALL_PO."}
         flash("Backtest error: no symbols selected.")
@@ -411,10 +539,10 @@ def backtest():
     results = []
     summary = {"trades":0,"wins":0,"losses":0,"draws":0,"winrate":0.0}
     csv_errors = []
+    plot_url = None  # will carry first symbol plot
 
     def run_one(sym, df):
-        nonlocal summary, results
-        # build cfg_run safely each time
+        nonlocal summary, results, plot_url
         if strategy in ("CUSTOM1","CUSTOM2","CUSTOM3"):
             sid = strategy[-1]
             cfg_run = dict(_cfg_dict(cfg))
@@ -424,10 +552,10 @@ def backtest():
             cfg_run = dict(_cfg_dict(cfg))
             core = strategy
 
+        # Execute core backtest (engine decides entries/expiry)
         try:
             bt = run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         except Exception as e:
-            # last resort retry with {}
             if "object has no attribute 'get'" in str(e):
                 bt = run_backtest_core_binary(df, core, {}, tf, expiry)
             else:
@@ -440,12 +568,19 @@ def backtest():
             "losses": bt.losses,
             "draws": bt.draws,
             "winrate": round(bt.winrate*100,2)
-            # NOTE: not storing rows in session to avoid >4KB cookie
         })
         summary["trades"] += bt.trades
         summary["wins"]   += bt.wins
         summary["losses"] += bt.losses
         summary["draws"]  += bt.draws
+
+        # make a plot for the FIRST symbol
+        if plot_url is None:
+            inds_cfg = _cfg_dict(cfg.get("indicators"))
+            try:
+                plot_url = _save_backtest_plot(sym, tf, expiry, df, inds_cfg, outdir="static/plots", bars=200)
+            except Exception as pe:
+                csv_errors.append(f"{sym}: plot error {pe}")
 
     try:
         if uploaded and uploaded.filename:
@@ -480,8 +615,8 @@ def backtest():
                     csv_errors.append(f"{sym}: {e}")
 
         summary["winrate"] = round((summary["wins"]/summary["trades"])*100,2) if summary["trades"] else 0.0
-
         payload = {"summary": summary, "results": results, "tf": tf, "expiry": expiry, "strategy": strategy}
+        if plot_url: payload["plot_url"] = plot_url
         if csv_errors:
             payload["warnings"] = csv_errors
             flash("Backtest completed with warnings. Check the results panel.")
@@ -505,18 +640,14 @@ def live_status():
 @bp.route('/live/start', methods=['POST','GET'])
 def live_start():
     ok, msg = ENGINE.start()
-    if request.method == 'GET':
-        return jsonify({"ok": ok, "msg": msg})
-    flash(f"Live: {msg}")
-    return redirect(url_for('dashboard.dashboard'))
+    if request.method == 'GET': return jsonify({"ok": ok, "msg": msg})
+    flash(f"Live: {msg}"); return redirect(url_for('dashboard.dashboard'))
 
 @bp.route('/live/stop', methods=['POST','GET'])
 def live_stop():
     ok, msg = ENGINE.stop()
-    if request.method == 'GET':
-        return jsonify({"ok": ok, "msg": msg})
-    flash(f"Live: {msg}")
-    return redirect(url_for('dashboard.dashboard'))
+    if request.method == 'GET': return jsonify({"ok": ok, "msg": msg})
+    flash(f"Live: {msg}"); return redirect(url_for('dashboard.dashboard'))
 
 @bp.route('/live/debug/<state>')
 def live_debug(state):
