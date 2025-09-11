@@ -1,227 +1,326 @@
-# live_engine.py — signal engine with rate limits + live tally
+# live_engine.py — fully featured, with per-channel caps & tally
 import os
+import re
 import time
-from datetime import datetime, timedelta, timezone
-from collections import deque, defaultdict
+import json
+import queue
 import threading
+from datetime import datetime, timedelta, date, timezone
+
 import requests
+import pandas as pd
 
-from utils import TZ, within_window, get_config
+from utils import exec_sql, get_config, within_window, TZ, TIMEZONE
 
-# ====== Telegram config & helpers =============================================
+# -----------------------------------------------------------------------------
+# Telegram wiring
+# -----------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# You can set one or many chat IDs. Any env that starts with TELEGRAM_CHAT_ID will be used.
-TELEGRAM_CHAT_KEYS = [k for k in os.environ.keys() if k.upper().startswith("TELEGRAM_CHAT_ID")]
-TELEGRAM_CHAT_IDS = [os.getenv(k, "").strip() for k in TELEGRAM_CHAT_KEYS if os.getenv(k, "").strip()]
+# Auto-detect all chat ids: TELEGRAM_CHAT_ID_*, e.g. TELEGRAM_CHAT_ID_VIP, TELEGRAM_CHAT_ID_FREE, TELEGRAM_CHAT_ID_SIGNALS1
+TELEGRAM_CHAT_KEYS = sorted([k for k in os.environ.keys() if k.startswith("TELEGRAM_CHAT_ID_")])
+TELEGRAM_CHATS = {k: os.getenv(k, "").strip() for k in TELEGRAM_CHAT_KEYS if os.getenv(k, "").strip()}
 
-def _post_json(url, payload, timeout=12):
+# Optional per-channel caps: TELEGRAM_DAILY_CAP_<SUFFIX>, e.g. TELEGRAM_DAILY_CAP_VIP=150
+# Defaults if not set
+DEFAULT_DAILY_CAP = int(os.getenv("TELEGRAM_DAILY_CAP_DEFAULT", "250"))  # sane default
+DAILY_CAPS = {}
+for k in TELEGRAM_CHAT_KEYS:
+    suffix = k.replace("TELEGRAM_CHAT_ID_", "", 1)
+    cap_key = f"TELEGRAM_DAILY_CAP_{suffix}"
     try:
-        r = requests.post(url, json=payload, timeout=timeout)
-        return True, r.json()
+        DAILY_CAPS[k] = int(os.getenv(cap_key, str(DEFAULT_DAILY_CAP)))
+    except Exception:
+        DAILY_CAPS[k] = DEFAULT_DAILY_CAP
+
+# Min interval between any two sends (global throttle), in seconds
+MIN_INTERVAL_S = int(os.getenv("TELEGRAM_MIN_INTERVAL_S", "3"))
+# Optional cool down if API rate-limits occur
+COOLDOWN_S = int(os.getenv("TELEGRAM_COOLDOWN_S", "10"))
+
+# -----------------------------------------------------------------------------
+# Database (tally + last send)
+# -----------------------------------------------------------------------------
+exec_sql("""
+CREATE TABLE IF NOT EXISTS tally(
+  d TEXT,                 -- UTC date YYYY-MM-DD
+  chat_key TEXT,          -- env var key, e.g. TELEGRAM_CHAT_ID_VIP
+  symbol TEXT,            -- symbol of the signal
+  outcome TEXT,           -- 'sent', 'win', 'loss', 'draw'
+  ts TEXT                 -- ISO time
+)
+""")
+
+exec_sql("""
+CREATE TABLE IF NOT EXISTS engine_meta(
+  k TEXT PRIMARY KEY,
+  v TEXT
+)
+""")
+
+def _meta_get(k, default=None):
+    row = exec_sql("SELECT v FROM engine_meta WHERE k=?", (k,), fetch=True)
+    if row:
+        try:
+            return json.loads(row[0][0])
+        except Exception:
+            return row[0][0]
+    return default
+
+def _meta_set(k, v):
+    exec_sql("INSERT INTO engine_meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, json.dumps(v)))
+
+def _today_utc():
+    return datetime.utcnow().date().isoformat()
+
+def _tally_count_today(chat_key):
+    d = _today_utc()
+    row = exec_sql("SELECT COUNT(*) FROM tally WHERE d=? AND chat_key=? AND outcome='sent'", (d, chat_key), fetch=True)
+    return int(row[0][0]) if row else 0
+
+def _tally_bump(chat_key, symbol, outcome):
+    exec_sql("INSERT INTO tally(d, chat_key, symbol, outcome, ts) VALUES(?,?,?,?,?)",
+             (_today_utc(), chat_key, symbol, outcome, datetime.utcnow().isoformat(timespec="seconds")))
+
+def reset_daily_if_new_day():
+    # Nothing to clear—query is by date—but we keep last_date to know when to do weekly recaps, etc.
+    last_date = _meta_get("last_date")
+    today = _today_utc()
+    if last_date != today:
+        _meta_set("last_date", today)
+
+# -----------------------------------------------------------------------------
+# Telegram helpers
+# -----------------------------------------------------------------------------
+def _send_telegram_raw(chat_id: str, text: str, disable_web_page_preview=True):
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "No TELEGRAM_BOT_TOKEN provided"
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": disable_web_page_preview,
+            },
+            timeout=12,
+        )
+        ok = r.ok
+        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {"text": r.text}
+        if not ok:
+            return False, f"{r.status_code}: {data}"
+        return True, data
     except Exception as e:
         return False, str(e)
 
-def _send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN:
-        return False, "No TELEGRAM_BOT_TOKEN provided"
+def _can_send_to(chat_key: str) -> (bool, str):
+    # enforce daily cap
+    cap = DAILY_CAPS.get(chat_key, DEFAULT_DAILY_CAP)
+    used = _tally_count_today(chat_key)
+    if used >= cap:
+        return False, f"daily cap reached ({used}/{cap})"
+    # enforce global min interval
+    last_send = _meta_get("last_send_ts")
+    if last_send:
+        try:
+            last_dt = datetime.fromisoformat(last_send)
+            if (datetime.utcnow() - last_dt).total_seconds() < MIN_INTERVAL_S:
+                return False, f"global throttle (min interval {MIN_INTERVAL_S}s)"
+        except Exception:
+            pass
+    # enforce trading window (TT)
+    cfg = get_config()
+    if not within_window(cfg):
+        return False, "outside trading window"
+    return True, "ok"
 
-    ok_all = True
-    infos = []
-    for chat_id in TELEGRAM_CHAT_IDS:
-        ok, info = ENGINE.send_with_limits(chat_id, text)
-        ok_all = ok_all and ok
-        infos.append((chat_id, info))
-    if not TELEGRAM_CHAT_IDS:
-        return False, "No TELEGRAM_CHAT_ID* provided"
-    return ok_all, infos
+def _format_signal(sym, tf, expiry, direction, strategy, extra=""):
+    # short, clean message
+    line1 = f"📣 <b>{direction}</b> • <code>{sym}</code>"
+    line2 = f"⏱ TF={tf} • Exp={expiry} • Strat={strategy}"
+    return line1 + "\n" + line2 + (("\n" + extra) if extra else "")
 
-def tg_test():
-    return _send_telegram("✅ Telegram test from Pocket Option Signals")
+def _audiences_from_cfg(cfg: dict):
+    """
+    Decide which chat keys to send to.
+    Strategy: send to all configured chats by default, but if cfg has tiers, you can filter here.
+    """
+    # Example: you can gate by user tiers later; for now return all configured
+    return list(TELEGRAM_CHATS.keys())
 
-# ====== ENGINE ================================================================
+def _send_telegram(msg: str, symbol: str, audience_keys=None):
+    """
+    Sends a message to a set of chats respecting per-channel caps & global interval.
+    Returns (ok, info)
+    """
+    audience_keys = audience_keys or list(TELEGRAM_CHATS.keys())
+    if not audience_keys:
+        return False, "No TELEGRAM_CHAT_ID_* configured"
+
+    sent_to = []
+    blocked = []
+    for chat_key in audience_keys:
+        ok, why = _can_send_to(chat_key)
+        if not ok:
+            blocked.append(f"{chat_key}:{why}")
+            continue
+        chat_id = TELEGRAM_CHATS[chat_key]
+        ok2, info = _send_telegram_raw(chat_id, msg)
+        if ok2:
+            sent_to.append(chat_key)
+            _tally_bump(chat_key, symbol, "sent")
+            _meta_set("last_send_ts", datetime.utcnow().isoformat(timespec="seconds"))
+            time.sleep(max(0.0, MIN_INTERVAL_S))  # spacing between channels as well
+        else:
+            blocked.append(f"{chat_key}:ERR {info}")
+            # Optional: back off a bit on error
+            time.sleep(COOLDOWN_S)
+
+    if sent_to:
+        return True, {"sent_to": sent_to, "blocked": blocked}
+    return False, {"blocked": blocked}
+
+# -----------------------------------------------------------------------------
+# Strategy evaluation stub
+# -----------------------------------------------------------------------------
+def evaluate_symbols_for_signals(cfg: dict):
+    """
+    Return a list of signals to send:
+    [{"symbol":"frxEURUSD","tf":"M5","expiry":"5m","direction":"BUY","strategy":"TREND", "extra":""}, ...]
+    This function should link to your real strategy engine.
+    """
+    # Hook your real generator here; keep a safe fallback to avoid crashes
+    try:
+        from strategies import generate_live_signals
+        sigs = generate_live_signals(cfg)
+        if isinstance(sigs, list):
+            return sigs
+    except Exception:
+        pass
+    return []  # no-op fallback
+
+# -----------------------------------------------------------------------------
+# Engine (start/stop/status/loop)
+# -----------------------------------------------------------------------------
 class _Engine:
     def __init__(self):
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
+        self._thread = None
         self._running = False
         self.debug = False
-        self._thread = None
-
-        # Tally / rate limiting
-        self._sent_times_global = deque()  # timestamps (epoch seconds) for all sends
-        self._sent_times_by_chat = defaultdict(deque)
-        self._sent_count_today = 0
-        self._sent_count_today_by_chat = defaultdict(int)
-        self._midnight_epoch = self._today_midnight_epoch()
-
-        # rolling status
         self._last_error = None
         self._last_loop = None
         self._last_reasons = []
+        self._sent_count = 0
 
-        # limits (read from env, with safe defaults)
-        self.LIMIT_PER_MIN = int(os.getenv("TELEGRAM_LIMIT_PER_MIN", "30"))
-        self.LIMIT_PER_HOUR = int(os.getenv("TELEGRAM_LIMIT_PER_HOUR", "500"))
-        self.LIMIT_PER_DAY = int(os.getenv("TELEGRAM_LIMIT_PER_DAY", "5000"))
-
-    def _today_midnight_epoch(self):
-        now = datetime.now(TZ)
-        mid = datetime(now.year, now.month, now.day, tzinfo=TZ)
-        return int(mid.timestamp())
-
-    def _maybe_reset_daily(self):
-        # Reset counters at local midnight
-        now_epoch = int(time.time())
-        if now_epoch - self._midnight_epoch >= 86400:
-            self._midnight_epoch = self._today_midnight_epoch()
-            self._sent_count_today = 0
-            self._sent_count_today_by_chat = defaultdict(int)
-
-    def _prune(self):
-        # prune >1h from global, and >1h for chats; also compute minute/hour windows
-        cutoff_min = time.time() - 60
-        cutoff_hr = time.time() - 3600
-        while self._sent_times_global and self._sent_times_global[0] < cutoff_hr:
-            self._sent_times_global.popleft()
-        # prune chat deques
-        for dq in self._sent_times_by_chat.values():
-            while dq and dq[0] < cutoff_hr:
-                dq.popleft()
-
-    def _window_counts(self, dq):
-        now = time.time()
-        one_min = now - 60
-        one_hr = now - 3600
-        min_count = sum(1 for t in dq if t >= one_min)
-        hr_count = sum(1 for t in dq if t >= one_hr)
-        return min_count, hr_count
-
-    def send_with_limits(self, chat_id: str, text: str):
-        with self._lock:
-            self._maybe_reset_daily()
-            self._prune()
-
-            # global windows
-            g_min, g_hr = self._window_counts(self._sent_times_global)
-
-            # per-chat windows
-            dq = self._sent_times_by_chat[chat_id]
-            c_min, c_hr = self._window_counts(dq)
-
-            # per-day (local)
-            if self._sent_count_today >= self.LIMIT_PER_DAY:
-                reason = f"daily cap reached ({self._sent_count_today}/{self.LIMIT_PER_DAY})"
-                self._last_reasons.append(reason)
-                return False, reason
-            if g_min >= self.LIMIT_PER_MIN or c_min >= self.LIMIT_PER_MIN:
-                reason = "per-minute cap"
-                self._last_reasons.append(reason)
-                return False, reason
-            if g_hr >= self.LIMIT_PER_HOUR or c_hr >= self.LIMIT_PER_HOUR:
-                reason = "per-hour cap"
-                self._last_reasons.append(reason)
-                return False, reason
-
-        # actually send
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        ok, info = _post_json(url, {"chat_id": chat_id, "text": text})
-        with self._lock:
-            if ok and isinstance(info, dict) and info.get("ok"):
-                now = time.time()
-                self._sent_times_global.append(now)
-                self._sent_times_by_chat[chat_id].append(now)
-                self._sent_count_today += 1
-                self._sent_count_today_by_chat[chat_id] += 1
-                return True, "sent"
-            else:
-                self._last_error = str(info)
-                return False, f"send failed: {info}"
-
-    # ============= Loop control ==============================================
+    # public API used by routes.py
     def start(self):
         with self._lock:
             if self._running:
                 return True, "already running"
             self._running = True
-            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread = threading.Thread(target=self._run, name="live-engine", daemon=True)
             self._thread.start()
-            return True, "started"
+            return True, "engine started"
 
     def stop(self):
         with self._lock:
-            if not self._running:
-                return True, "already stopped"
             self._running = False
-            return True, "stopped"
+        return True, "engine stopped"
 
     def status(self):
-        with self._lock:
-            return {
-                "running": self._running,
-                "last_loop": self._last_loop,
-                "last_error": self._last_error,
-                "last_reasons": list(self._last_reasons[-10:]),
-                "sent": self._sent_count_today,
-            }
+        return {
+            "running": self._running,
+            "last_error": self._last_error,
+            "last_loop": self._last_loop,
+            "last_reasons": self._last_reasons[-6:],  # recent notes
+            "sent": self._sent_count,
+            "debug": self.debug,
+        }
 
     def tally(self):
-        """Return live tallies for UI."""
-        with self._lock:
-            now = datetime.now(TZ)
-            # minute/hour counts from global
-            g_min, g_hr = self._window_counts(self._sent_times_global)
-            # per chat latest totals
-            per_chat = []
-            for chat_id, dq in self._sent_times_by_chat.items():
-                cmin, chr_ = self._window_counts(dq)
-                per_chat.append({
-                    "chat_id": chat_id,
-                    "last_min": cmin,
-                    "last_hour": chr_,
-                    "today": self._sent_count_today_by_chat.get(chat_id, 0),
-                })
-            return {
-                "now": now.strftime("%Y-%m-%d %H:%M:%S"),
-                "tz": str(TZ),
-                "global": {
-                    "last_min": g_min,
-                    "last_hour": g_hr,
-                    "today": self._sent_count_today,
-                    "per_min_cap": self.LIMIT_PER_MIN,
-                    "per_hour_cap": self.LIMIT_PER_HOUR,
-                    "per_day_cap": self.LIMIT_PER_DAY,
-                },
-                "per_chat": per_chat,
+        """Daily per-channel send counts + simple W/L/D (if you record outcomes elsewhere)."""
+        d = _today_utc()
+        out = {"date": d, "channels": {}, "wl": {"win":0, "loss":0, "draw":0}}
+        # counts per channel
+        for chat_key in TELEGRAM_CHATS.keys():
+            out["channels"][chat_key] = {
+                "sent": _tally_count_today(chat_key),
+                "cap": DAILY_CAPS.get(chat_key, DEFAULT_DAILY_CAP),
             }
+        # wl summary
+        for k in ("win","loss","draw"):
+            row = exec_sql("SELECT COUNT(*) FROM tally WHERE d=? AND outcome=?", (d, k), fetch=True)
+            out["wl"][k] = int(row[0][0]) if row else 0
+        return out
 
-    # ============= Main loop ==================================================
-    def _loop(self):
+    # core loop
+    def _run(self):
+        self._last_error = None
+        self._last_reasons = []
+        cooldown = 2  # loop sleep baseline
         while True:
             with self._lock:
-                if not self._running:
-                    break
-                self._last_loop = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-                self._last_reasons = []
+                running = self._running
+            if not running:
+                break
+            try:
+                reset_daily_if_new_day()
 
-            # Respect trading window
-            cfg = get_config()
-            if not within_window(cfg):
-                time.sleep(10)
-                continue
-
-            # TODO: plug your live strategy selection & signal generation here.
-            # Example (pseudo):
-            # signals = generate_signals(cfg)
-            signals = []  # keep as no-op until plugged
-
-            # Dispatch
-            for sig in signals:
-                text = sig.get("text") or sig  # allow string or dict with text
-                if not text:
+                cfg = get_config() or {}
+                if not within_window(cfg):
+                    self._note("outside window")
+                    time.sleep(10)
                     continue
-                _send_telegram(text)
 
-            # loop throttle
-            time.sleep(5)
+                # Collect signals from strategies
+                sigs = evaluate_symbols_for_signals(cfg)
+
+                if self.debug:
+                    self._note(f"debug=ON, got {len(sigs)} signals")
+
+                # Send each signal to all allowed chats
+                for sig in sigs:
+                    sym = sig.get("symbol")
+                    tf  = (sig.get("tf") or cfg.get("live_tf") or "M5").upper()
+                    exp = (sig.get("expiry") or cfg.get("live_expiry") or "5m")
+                    direction = (sig.get("direction") or "").upper()
+                    strat = sig.get("strategy") or "BASE"
+                    if direction not in ("BUY","SELL"):
+                        continue
+                    msg = _format_signal(sym, tf, exp, direction, strat, sig.get("extra",""))
+                    audience = _audiences_from_cfg(cfg)
+                    ok, info = _send_telegram(msg, sym, audience_keys=audience)
+                    if ok:
+                        self._sent_count += 1
+                        self._note(f"sent {direction} {sym} -> {info.get('sent_to')}")
+                    else:
+                        self._note(f"blocked {direction} {sym}: {info}")
+
+                # soft sleep
+                time.sleep(cooldown)
+                self._last_loop = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            except Exception as e:
+                self._last_error = str(e)
+                self._note(f"loop error: {e}")
+                time.sleep(COOLDOWN_S)
+
+    def _note(self, s):
+        self._last_reasons.append(s)
+        if len(self._last_reasons) > 50:
+            self._last_reasons = self._last_reasons[-50:]
+        if self.debug:
+            print("[ENGINE]", s)
 
 ENGINE = _Engine()
+
+# ----- routes.py import helpers expect these ----------------------------------
+def tg_test():
+    """Used by /telegram/test route."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "No TELEGRAM_BOT_TOKEN provided"
+    if not TELEGRAM_CHATS:
+        return False, "No TELEGRAM_CHAT_ID_* configured"
+    ok, info = _send_telegram("🧪 Test from Pocket Option Signals.", symbol="TEST")
+    return ok, info
