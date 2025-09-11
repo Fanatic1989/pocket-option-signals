@@ -1,223 +1,248 @@
-# live_engine.py — Live signal loop with tiered per-channel caps & tally
-import os, re, time, json, threading
-from datetime import datetime
+# live_engine.py — Telegram routing (4 channels) + daily caps + engine shell
+
+from __future__ import annotations
+import os
+import json
+import time
+import threading
+from datetime import datetime, timezone
+
 import requests
 
-from utils import exec_sql, get_config, within_window, TZ
+# --------------------- Environment & constants ---------------------
 
-# ---------------------------------- Telegram ---------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Detect all chats: TELEGRAM_CHAT_ID_*
-TELEGRAM_CHAT_KEYS = sorted([k for k in os.environ if k.startswith("TELEGRAM_CHAT_ID_")])
-TELEGRAM_CHATS = {k: os.getenv(k, "").strip() for k in TELEGRAM_CHAT_KEYS if os.getenv(k, "").strip()}
+# 4 channel IDs (can be supergroup/channel IDs like -1001234567890)
+CHAT_FREE  = os.getenv("TELEGRAM_CHAT_ID_FREE",  "").strip()
+CHAT_BASIC = os.getenv("TELEGRAM_CHAT_ID_BASIC", "").strip()
+CHAT_PRO   = os.getenv("TELEGRAM_CHAT_ID_PRO",   "").strip()
+CHAT_VIP   = os.getenv("TELEGRAM_CHAT_ID_VIP",   "").strip()
 
-# Tier caps by key name
-TIER_DEFAULT_CAPS = {"FREE": 3, "BASIC": 6, "PRO": 15, "VIP": None}  # None = unlimited
-def _infer_tier_from_key(chat_key: str) -> str:
-    k = chat_key.upper()
-    for tier in ("FREE","BASIC","PRO","VIP"):
-        if re.search(rf"(?:^|_){tier}(?:_|$)", k): return tier
-    if "VIP" in k: return "VIP"
-    if "PRO" in k: return "PRO"
-    if "BASIC" in k: return "BASIC"
-    return "FREE"
+# expose the keys so routes.py /telegram/diag can show what’s set
+TELEGRAM_CHAT_KEYS = [
+    "TELEGRAM_CHAT_ID_FREE",
+    "TELEGRAM_CHAT_ID_BASIC",
+    "TELEGRAM_CHAT_ID_PRO",
+    "TELEGRAM_CHAT_ID_VIP",
+]
 
-# Build per-channel caps with optional overrides TELEGRAM_DAILY_CAP_<SUFFIX>
-DAILY_CAPS = {}
-for chat_key in TELEGRAM_CHAT_KEYS:
-    suffix = chat_key.replace("TELEGRAM_CHAT_ID_", "", 1)
-    ov_key = f"TELEGRAM_DAILY_CAP_{suffix}"
-    raw = os.getenv(ov_key, "").strip()
-    if raw != "":
-        if raw.lower() in ("none","unlimited","inf","infinite"):
-            DAILY_CAPS[chat_key] = None
-        else:
-            try: DAILY_CAPS[chat_key] = int(raw)
-            except: DAILY_CAPS[chat_key] = TIER_DEFAULT_CAPS[_infer_tier_from_key(chat_key)]
-    else:
-        DAILY_CAPS[chat_key] = TIER_DEFAULT_CAPS[_infer_tier_from_key(chat_key)]
+# Per-tier daily caps (per channel per UTC day)
+DAILY_CAPS: dict[str, int | None] = {
+    "free":  3,
+    "basic": 6,
+    "pro":   15,
+    "vip":   None,   # unlimited
+}
 
-MIN_INTERVAL_S = int(os.getenv("TELEGRAM_MIN_INTERVAL_S", "3"))
-COOLDOWN_S    = int(os.getenv("TELEGRAM_COOLDOWN_S", "10"))
+# Map tier -> chat id (missing values are ignored at send time)
+TIER_TO_CHAT = {
+    "free":  CHAT_FREE,
+    "basic": CHAT_BASIC,
+    "pro":   CHAT_PRO,
+    "vip":   CHAT_VIP,
+}
 
-# ---------------------------------- Storage ----------------------------------
-exec_sql("""CREATE TABLE IF NOT EXISTS tally(
-  d TEXT, chat_key TEXT, symbol TEXT, outcome TEXT, ts TEXT)""")
-exec_sql("""CREATE TABLE IF NOT EXISTS engine_meta(
-  k TEXT PRIMARY KEY, v TEXT)""")
+# --------------------- Telegram low-level helpers ---------------------
 
-def _meta_get(k, default=None):
-    row = exec_sql("SELECT v FROM engine_meta WHERE k=?", (k,), fetch=True)
-    if row:
-        try: return json.loads(row[0][0])
-        except: return row[0][0]
-    return default
+def _tg_api(method: str) -> str:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
-def _meta_set(k, v):
-    exec_sql("INSERT INTO engine_meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-             (k, json.dumps(v)))
-
-def _today_utc(): return datetime.utcnow().date().isoformat()
-def _tally_count_today(chat_key):
-    row = exec_sql("SELECT COUNT(*) FROM tally WHERE d=? AND chat_key=? AND outcome='sent'",
-                   (_today_utc(), chat_key), fetch=True)
-    return int(row[0][0]) if row else 0
-def _tally_bump(chat_key, symbol, outcome):
-    exec_sql("INSERT INTO tally(d,chat_key,symbol,outcome,ts) VALUES(?,?,?,?,?)",
-             (_today_utc(), chat_key, symbol, outcome, datetime.utcnow().isoformat(timespec="seconds")))
-
-# --------------------------------- Telegram API -------------------------------
-def _send_telegram_raw(chat_id: str, text: str):
-    if not TELEGRAM_BOT_TOKEN: return False, "No TELEGRAM_BOT_TOKEN"
+def _tg_send_message(chat_id: str, text: str, disable_web_page_preview=True) -> tuple[bool, str]:
+    """Returns (ok, info). Never raises."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "Missing TELEGRAM_BOT_TOKEN"
+    if not chat_id:
+        return False, "Missing chat_id"
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": chat_id, "text": text, "parse_mode":"HTML",
-                                "disable_web_page_preview": True}, timeout=12)
-        if not r.ok:
-            return False, f"{r.status_code}: {r.text}"
-        return True, r.json()
+        r = requests.post(
+            _tg_api("sendMessage"),
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": disable_web_page_preview,
+            },
+            timeout=15,
+        )
+        ok = r.ok and r.json().get("ok", False)
+        return (ok, r.text if not ok else "ok")
     except Exception as e:
         return False, str(e)
 
-def _can_send_to(chat_key: str):
-    cap = DAILY_CAPS.get(chat_key, TIER_DEFAULT_CAPS[_infer_tier_from_key(chat_key)])
-    if cap is not None:
-        used = _tally_count_today(chat_key)
-        if used >= cap:
-            return False, f"daily cap {used}/{cap}"
-    last = _meta_get("last_send_ts")
-    if last:
-        try:
-            from datetime import datetime as _dt
-            if (_dt.utcnow() - _dt.fromisoformat(last)).total_seconds() < MIN_INTERVAL_S:
-                return False, f"throttle {MIN_INTERVAL_S}s"
-        except: pass
-    cfg = get_config()
-    if not within_window(cfg): return False, "outside window"
-    return True, "ok"
+def _send_telegram(text: str, tier: str | None = None) -> tuple[bool, str]:
+    """
+    Public helper used by routes.telegram_diag().
+    If tier is None, broadcasts to all configured channels (FREE/BASIC/PRO/VIP).
+    Applies caps when ENGINE is running; for diag/test we still apply caps to avoid overflow.
+    """
+    targets = []
+    if tier:
+        t = tier.lower()
+        cid = TIER_TO_CHAT.get(t, "")
+        if cid:
+            targets.append((t, cid))
+    else:
+        for t, cid in TIER_TO_CHAT.items():
+            if cid:
+                targets.append((t, cid))
 
-def _format_signal(sym, tf, expiry, direction, strategy, extra=""):
-    return (f"📣 <b>{direction}</b> • <code>{sym}</code>\n"
-            f"⏱ TF={tf} • Exp={expiry} • Strat={strategy}"
-            + (f"\n{extra}" if extra else ""))
+    if not targets:
+        return False, "No Telegram channels configured"
 
-def _audiences_from_cfg(cfg):  # can later filter by tier
-    return list(TELEGRAM_CHATS.keys())
-
-def _send_telegram(msg: str, symbol: str, audience_keys=None):
-    audience_keys = audience_keys or list(TELEGRAM_CHATS.keys())
-    if not audience_keys: return False, "no chats configured"
-    sent_to, blocked = [], []
-    for chat_key in audience_keys:
-        ok, why = _can_send_to(chat_key)
+    results = []
+    all_ok = True
+    for t, chat in targets:
+        ok, info = ENGINE._send_with_caps(tier=t, chat_id=chat, text=text)
+        results.append(f"{t}:{'ok' if ok else 'fail'}")
         if not ok:
-            blocked.append(f"{chat_key}:{why}"); continue
-        ok2, info = _send_telegram_raw(TELEGRAM_CHATS[chat_key], msg)
-        if ok2:
-            sent_to.append(chat_key)
-            _tally_bump(chat_key, symbol, "sent")
-            _meta_set("last_send_ts", datetime.utcnow().isoformat(timespec="seconds"))
-            time.sleep(max(0.0, MIN_INTERVAL_S))
-        else:
-            blocked.append(f"{chat_key}:ERR {info}")
-            time.sleep(COOLDOWN_S)
-    return (True, {"sent_to": sent_to, "blocked": blocked}) if sent_to else (False, {"blocked": blocked})
+            all_ok = False
 
-# ------------------------------ Strategy adapter ------------------------------
-def evaluate_symbols_for_signals(cfg: dict):
-    """Call your generator, fallback empty list."""
-    try:
-        from strategies import generate_live_signals
-        sigs = generate_live_signals(cfg)
-        if isinstance(sigs, list): return sigs
-    except Exception:
-        pass
-    return []
+    return all_ok, ", ".join(results)
 
-# ----------------------------------- Engine ----------------------------------
-class _Engine:
-    def __init__(self):
+# --------------------- Live engine (shell) ---------------------
+
+class LiveEngine:
+    """
+    Lightweight engine wrapper:
+    - start/stop: flips running flag
+    - debug: when True, still sends; when debug_only_send_to is set to a tier, only that tier is used
+    - per-tier per-day caps enforced in _send_with_caps()
+    - tally: totals per tier & overall, reset at UTC day boundary
+    """
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._running = False
-        self._thread = None
         self.debug = False
-        self._last_error = None
-        self._last_loop = None
-        self._last_reasons = []
-        self._sent = 0
+        self.debug_only_send_to: str | None = None  # e.g. "vip" to test only VIP
 
-    def start(self):
+        # per-UTC-day counters
+        self._day_key = self._utc_day_key()
+        self._tally = {
+            "free": 0, "basic": 0, "pro": 0, "vip": 0,
+            "total": 0,
+            # optional: deliver per-channel logs last 50
+            "last": [],   # list of dicts {ts, tier, ok, info}
+        }
+
+        # worker placeholder (if you later add loops)
+        self._thread: threading.Thread | None = None
+
+    # ---------- internals ----------
+    def _utc_day_key(self) -> str:
+        now = datetime.now(timezone.utc)
+        return now.strftime("%Y-%m-%d")
+
+    def _rollover_if_needed(self) -> None:
+        day = self._utc_day_key()
+        if day != self._day_key:
+            self._day_key = day
+            self._tally = {"free":0,"basic":0,"pro":0,"vip":0,"total":0,"last":[]}
+
+    # ---------- public controls ----------
+    def start(self) -> tuple[bool, str]:
         with self._lock:
-            if self._running: return True, "already running"
+            if self._running:
+                return True, "already running"
             self._running = True
-            self._thread = threading.Thread(target=self._run, daemon=True, name="live-engine")
-            self._thread.start()
-            return True, "engine started"
+            # (optional) spin worker if you later implement loops
+            return True, "started"
 
-    def stop(self):
-        with self._lock: self._running = False
-        return True, "engine stopped"
+    def stop(self) -> tuple[bool, str]:
+        with self._lock:
+            if not self._running:
+                return True, "already stopped"
+            self._running = False
+            return True, "stopped"
 
-    def status(self):
-        return {"running": self._running, "last_error": self._last_error,
-                "last_loop": self._last_loop, "last_reasons": self._last_reasons[-6:],
-                "sent": self._sent, "debug": self.debug}
+    def status(self) -> dict:
+        with self._lock:
+            self._rollover_if_needed()
+            return {
+                "running": self._running,
+                "debug": self.debug,
+                "day": self._day_key,
+                "tally": {k:self._tally[k] for k in ("free","basic","pro","vip","total")},
+                "last": list(self._tally["last"]),
+            }
 
-    def tally(self):
-        d = _today_utc()
-        out = {"date": d, "channels": {}, "wl": {"win":0, "loss":0, "draw":0}}
-        for chat_key in TELEGRAM_CHATS:
-            out["channels"][chat_key] = {"sent": _tally_count_today(chat_key),
-                                         "cap": DAILY_CAPS.get(chat_key)}
-        for k in ("win","loss","draw"):
-            row = exec_sql("SELECT COUNT(*) FROM tally WHERE d=? AND outcome=?", (d,k), fetch=True)
-            out["wl"][k] = int(row[0][0]) if row else 0
+    def tally(self) -> dict:
+        with self._lock:
+            self._rollover_if_needed()
+            return {
+                "day": self._day_key,
+                "per_tier": {k:self._tally[k] for k in ("free","basic","pro","vip")},
+                "total": self._tally["total"],
+            }
+
+    # ---------- sending with caps ----------
+    def _cap_for_tier(self, tier: str) -> int | None:
+        return DAILY_CAPS.get(tier.lower())
+
+    def _send_with_caps(self, tier: str, chat_id: str, text: str) -> tuple[bool, str]:
+        tier = (tier or "").lower().strip()
+        with self._lock:
+            self._rollover_if_needed()
+
+            # Debug: restrict to a single tier if set
+            if self.debug_only_send_to and tier != self.debug_only_send_to.lower():
+                # pretend success but skip actual send to avoid confusion
+                info = f"debug_only_send_to={self.debug_only_send_to}, skipped {tier}"
+                self._tally["last"].append({"ts": int(time.time()), "tier": tier, "ok": True, "info": info})
+                self._trim_log()
+                return True, info
+
+            cap = self._cap_for_tier(tier)
+            used = self._tally.get(tier, 0)
+            if cap is not None and used >= cap:
+                info = f"cap reached ({used}/{cap})"
+                self._tally["last"].append({"ts": int(time.time()), "tier": tier, "ok": False, "info": info})
+                self._trim_log()
+                return False, info
+
+        # send outside the lock
+        ok, info = _tg_send_message(chat_id, text)
+
+        with self._lock:
+            self._rollover_if_needed()
+            self._tally["last"].append({"ts": int(time.time()), "tier": tier, "ok": ok, "info": info})
+            self._trim_log()
+            if ok:
+                self._tally[tier] = self._tally.get(tier, 0) + 1
+                self._tally["total"] += 1
+        return ok, info
+
+    def _trim_log(self):
+        if len(self._tally["last"]) > 50:
+            self._tally["last"] = self._tally["last"][-50:]
+
+    # ---------- high-level helper you can call from signal logic ----------
+    def send_signal(self, text: str, tiers: list[str] | None = None) -> dict:
+        """
+        Send the same signal text to one or more tiers with cap enforcement.
+        tiers=None => send to all configured tiers.
+        Returns per-tier results.
+        """
+        if tiers is None:
+            tiers = ["free","basic","pro","vip"]
+
+        out = {}
+        for t in tiers:
+            chat = TIER_TO_CHAT.get(t.lower())
+            if not chat:
+                out[t] = {"ok": False, "info": "no chat configured"}
+                continue
+            ok, info = self._send_with_caps(t, chat, text)
+            out[t] = {"ok": ok, "info": info}
         return out
 
-    def _note(self, s):
-        self._last_reasons.append(s)
-        if len(self._last_reasons) > 50: self._last_reasons = self._last_reasons[-50:]
-        if self.debug: print("[ENGINE]", s)
 
-    def _run(self):
-        while True:
-            with self._lock: run = self._running
-            if not run: break
-            try:
-                cfg = get_config() or {}
-                if not within_window(cfg):
-                    self._note("outside window"); time.sleep(10); continue
+# Singleton instance used by routes.py
+ENGINE = LiveEngine()
 
-                sigs = evaluate_symbols_for_signals(cfg)
-                if self.debug: self._note(f"got {len(sigs)} signals")
-
-                for s in sigs:
-                    sym = s.get("symbol")
-                    tf  = (s.get("tf") or cfg.get("live_tf") or "M5").upper()
-                    exp = (s.get("expiry") or cfg.get("live_expiry") or "5m")
-                    direction = (s.get("direction") or "").upper()
-                    strat = s.get("strategy") or "BASE"
-                    if direction not in ("BUY","SELL"): continue
-                    msg = _format_signal(sym, tf, exp, direction, strat, s.get("extra",""))
-                    ok, info = _send_telegram(msg, sym, audience_keys=_audiences_from_cfg(cfg))
-                    if ok:
-                        self._sent += 1
-                        self._note(f"sent {direction} {sym} -> {info.get('sent_to')}")
-                    else:
-                        self._note(f"blocked {direction} {sym}: {info}")
-
-                time.sleep(2)
-                self._last_loop = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            except Exception as e:
-                self._last_error = str(e)
-                self._note(f"loop error: {e}")
-                time.sleep(COOLDOWN_S)
-
-ENGINE = _Engine()
-
-def tg_test():
-    if not TELEGRAM_BOT_TOKEN: return False, "No TELEGRAM_BOT_TOKEN"
-    if not TELEGRAM_CHATS: return False, "No TELEGRAM_CHAT_ID_*"
-    ok, info = _send_telegram("🧪 Test from Pocket Option Signals.", "TEST")
-    return ok, info
+# Simple test used by routes.telegram_test()
+def tg_test() -> tuple[bool, str]:
+    msg = "🧪 Test from server — if this appears, routing & caps are wired."
+    return _send_telegram(msg)
