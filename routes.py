@@ -36,7 +36,13 @@ import matplotlib.dates as mdates
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
 # --- Project modules (avoid circular imports by importing here) ---------------
-from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
+from utils import exec_sql, get_config, set_config, within_window, TZ
+try:
+    # TIMEZONE is optional; if your utils defines it, import, else fall back to TZ.zone
+    from utils import TIMEZONE  # type: ignore
+except Exception:
+    TIMEZONE = getattr(TZ, "zone", "America/Port_of_Spain")
+
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
@@ -67,8 +73,7 @@ AVAILABLE_GROUPS = [
 
 # ===== Small helpers ===========================================================
 def _cfg_dict(x):
-    if isinstance(x, dict):
-        return x
+    if isinstance(x, dict): return x
     if isinstance(x, str):
         try:
             j = json.loads(x)
@@ -80,11 +85,9 @@ def _cfg_dict(x):
 def _merge_unique(xs):
     out, seen = [], set()
     for x in xs:
-        if not x: 
-            continue
+        if not x: continue
         if x not in seen:
-            out.append(x)
-            seen.add(x)
+            out.append(x); seen.add(x)
     return out
 
 def _is_po_symbol(sym: str) -> bool:
@@ -92,11 +95,9 @@ def _is_po_symbol(sym: str) -> bool:
     return s in PO_MAJOR or bool(re.fullmatch(r"[A-Z]{6}", s))
 
 def _to_deriv(sym: str) -> str:
-    if not sym:
-        return sym
+    if not sym: return sym
     s = sym.strip()
-    if s.startswith("frx"):
-        return s
+    if s.startswith("frx"): return s
     sU = s.upper().replace("/", "")
     return "frx" + sU if _is_po_symbol(sU) else s
 
@@ -223,7 +224,6 @@ def _extract_trades(bt, df, expiry):
     elif hasattr(bt,"signals") and isinstance(bt.signals, list):
         for e in bt.signals:
             t=to_ts(e.get("time")); side=(e.get("side") or e.get("signal") or "").upper()
-        # default expiry from entry time
             if t is None or side not in ("BUY","SELL"): continue
             out.append({"t":t,"expiry":t+timedelta(seconds=exp_s),"side":side})
     return out
@@ -246,7 +246,7 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
     axp=axes[0]; _draw_candles(axp, ds)
     ts=ds["timestamp"]
 
-    # --- FIXED LINE (no extra paren) ---
+    # ---- FIXED: corrected parentheses in any() check ----
     if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
         for name, s in lines.items():
             if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
