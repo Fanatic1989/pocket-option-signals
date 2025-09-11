@@ -1,15 +1,15 @@
-# routes.py — FULL BUILD (all helpers + endpoints)
+# routes.py — FULL BUILD (fixed)
 # Features:
-# - Dashboard: window, TF/expiry, strategies (BASE/TREND/CHOP + CUSTOM1..3),
-#   indicators (SMA/EMA/WMA/SMMA/TMA/RSI/Stoch with periods and toggles),
-#   multi-symbol selectors (PO majors + Deriv frx* + free text) + PO→Deriv converter.
-# - Backtest: multi-symbol, CSV upload or server CSVs, candles + overlays,
-#   BUY/SELL markers and shaded expiry, JSON/CSV export, no-cache PNG serving.
-# - Live: start/stop/debug/status, live tally JSON for UI.
-# - Telegram: test + diag.
-# - Users: add/delete + tier/expiry.
-# - Deriv fetch: optional (requires data_fetch.py), otherwise warns.
-# - UptimeRobot HEAD health route.
+# - Dashboard: window (08:00–17:00 TT), TF/expiry, strategies (BASE/TREND/CHOP + CUSTOM1..3),
+#   indicators (SMA/EMA/WMA/SMMA/TMA/RSI/Stoch with periods & toggles),
+#   multi-symbol selectors (PO majors + Deriv frx*) + free text + PO→Deriv auto-convert.
+# - Backtest: multi-symbol, server CSV or uploaded CSV, price candles + MA/RSI/Stoch overlays,
+#   BUY/SELL markers + shaded expiry, JSON/CSV export, plot served with no-cache.
+# - Live engine: start/stop/debug/status, tally endpoint.
+# - Telegram: test & diag.
+# - Users: add/delete (tier, expiry).
+# - Deriv fetch: optional (data_fetch.py); if missing, message shown.
+# - UptimeRobot HEAD /_up.
 
 import os
 import re
@@ -17,7 +17,6 @@ import csv
 import json
 import math
 import uuid
-import time
 from io import StringIO
 from datetime import datetime, timedelta
 
@@ -28,7 +27,7 @@ from flask import (
     send_from_directory, make_response, Response
 )
 
-# Matplotlib headless
+# Matplotlib in headless mode
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -36,24 +35,24 @@ import matplotlib.dates as mdates
 
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
-# --- project modules (avoid circular imports) ---------------------------------
+# --- Project modules (avoid circular imports by importing here) ---------------
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
 from live_engine import ENGINE, tg_test
 
-# optional fetch helpers (if present)
+# Optional data fetch helpers
 try:
     from data_fetch import deriv_csv_path as _deriv_csv_path, fetch_one_symbol as _fetch_one_symbol
 except Exception:
     _deriv_csv_path = None
     _fetch_one_symbol = None
 
-# ensure plot dir exists
+# Ensure plot dir exists
 os.makedirs("static/plots", exist_ok=True)
 
-# ===== Symbols & groups ========================================================
+# ===== Symbol groups ===========================================================
 DERIV_FRX = [
     "frxEURUSD","frxGBPUSD","frxUSDJPY","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD",
     "frxEURGBP","frxEURJPY","frxEURCHF","frxEURAUD","frxGBPAUD","frxGBPJPY","frxGBPNZD",
@@ -62,59 +61,69 @@ DERIV_FRX = [
 ]
 PO_MAJOR = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"]
 AVAILABLE_GROUPS = [
-    {"label":"Deriv (frx*)", "items": DERIV_FRX},
-    {"label":"Pocket Option majors", "items": PO_MAJOR},
+    {"label": "Deriv (frx*)", "items": DERIV_FRX},
+    {"label": "Pocket Option majors", "items": PO_MAJOR},
 ]
 
-# ===== Helpers =================================================================
+# ===== Small helpers ===========================================================
 def _cfg_dict(x):
-    if isinstance(x, dict): return x
+    if isinstance(x, dict):
+        return x
     if isinstance(x, str):
         try:
-            j=json.loads(x);  return j if isinstance(j, dict) else {}
+            j = json.loads(x)
+            return j if isinstance(j, dict) else {}
         except Exception:
             return {}
     return {}
 
 def _merge_unique(xs):
-    out=[]; seen=set()
+    out, seen = [], set()
     for x in xs:
-        if not x: continue
+        if not x: 
+            continue
         if x not in seen:
-            out.append(x); seen.add(x)
+            out.append(x)
+            seen.add(x)
     return out
 
 def _is_po_symbol(sym: str) -> bool:
-    s=(sym or "").upper()
+    s = (sym or "").upper()
     return s in PO_MAJOR or bool(re.fullmatch(r"[A-Z]{6}", s))
 
 def _to_deriv(sym: str) -> str:
-    if not sym: return sym
-    s=sym.strip()
-    if s.startswith("frx"): return s
-    sU=s.upper().replace("/","")
-    return "frx"+sU if _is_po_symbol(sU) else s
+    if not sym:
+        return sym
+    s = sym.strip()
+    if s.startswith("frx"):
+        return s
+    sU = s.upper().replace("/", "")
+    return "frx" + sU if _is_po_symbol(sU) else s
 
 def _expand_all_symbols(tokens):
-    out=[]
+    out = []
     for t in tokens:
-        tt=(t or "").strip().upper()
+        tt = (t or "").strip().upper()
         if tt in ("ALL","ALL_DERIV","__ALL__","__ALL_DERIV__"):
-            out+=DERIV_FRX
+            out += DERIV_FRX
         elif tt in ("ALL_PO","__ALL_PO__","PO_ALL"):
-            out+=PO_MAJOR
+            out += PO_MAJOR
         else:
             out.append(t)
     return _merge_unique(out)
 
-# ===== Minimal indicators for plotting (overlays) ==============================
+# ===== Minimal indicators for plotting (overlays only) ========================
 def _sma(s, p):   return s.rolling(int(p), min_periods=1).mean()
 def _ema(s, p):   return s.ewm(span=int(p), adjust=False).mean()
 def _wma(s, p):
-    p=int(p); w=pd.Series(range(1, p+1), dtype=float)
+    p=int(p)
+    w=pd.Series(range(1, p+1), dtype=float)
     return s.rolling(p).apply(lambda x: (w.to_numpy()*x).sum()/w.sum(), raw=True)
 def _smma(s, p):  return s.ewm(alpha=1.0/float(p), adjust=False).mean()
-def _tma(s, p):   p=int(p); p1=max(1, int(math.ceil(p/2))); return _sma(_sma(s,p1), p)
+def _tma(s, p):
+    p=int(p)
+    p1=max(1, int(math.ceil(p/2)))
+    return _sma(_sma(s, p1), p)
 
 def _rsi(close, period=14):
     period=int(period)
@@ -163,7 +172,7 @@ def _compute_lines(df, ind_cfg):
         k,d=_stoch(h,l,c,kp,dp,sp); out[f"StochK({kp},{dp},{sp})"]=k; out[f"StochD({kp},{dp},{sp})"]=d
     return out
 
-# ===== Candle plotting with entries/expiry shading =============================
+# ===== Candle plotting with entries/expiry shading ============================
 def _draw_candles(ax, df):
     ts=pd.to_datetime(df["timestamp"])
     o,h,l,c=[pd.to_numeric(df[k], errors="coerce") for k in ("open","high","low","close")]
@@ -214,6 +223,7 @@ def _extract_trades(bt, df, expiry):
     elif hasattr(bt,"signals") and isinstance(bt.signals, list):
         for e in bt.signals:
             t=to_ts(e.get("time")); side=(e.get("side") or e.get("signal") or "").upper()
+        # default expiry from entry time
             if t is None or side not in ("BUY","SELL"): continue
             out.append({"t":t,"expiry":t+timedelta(seconds=exp_s),"side":side})
     return out
@@ -224,22 +234,27 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
     ds["timestamp"]=pd.to_datetime(ds["timestamp"])
     for k in ("open","high","low","close"):
         ds[k]=pd.to_numeric(ds[k], errors="coerce")
-    ds=ds.dropna(subset=["open","high","low","close"]).sort_values("timestamp").tail(bars)
+    ds=ds.dropna(subset=["open","high","close"]).sort_values("timestamp").tail(bars)
 
     lines=_compute_lines(ds, ind_cfg)
-    has_rsi=any(k.startswith("RSI(") for k in lines)
-    has_sto=any(k.startswith("Stoch") for k in lines)
+    has_rsi=any(name.startswith("RSI(") for name in lines)
+    has_sto=any(name.startswith("Stoch") for name in lines)
     rows=1 + (1 if has_rsi else 0) + (1 if has_sto else 0)
     fig, axes = plt.subplots(rows, 1, figsize=(14, 3.0*rows+0.8), sharex=True)
     if rows==1: axes=[axes]
 
     axp=axes[0]; _draw_candles(axp, ds)
     ts=ds["timestamp"]
-    for name, s in lines.items():
-        if any(name.startswith(p) for p in ("SMA(","EMA(","WMA(","SMMA(","TMA("))):
-            axp.plot(ts, s, label=name, linewidth=1.05)
+
+    # --- FIXED LINE (no extra paren) ---
+    if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
+        for name, s in lines.items():
+            if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
+                axp.plot(ts, s, label=name, linewidth=1.05)
+        if axp.get_legend_handles_labels()[0]:
+            axp.legend(loc="upper left", fontsize=8, ncols=3)
+
     axp.set_title(f"{sym} • TF={tf} • Expiry={expiry}")
-    if axp.get_legend_handles_labels()[0]: axp.legend(loc="upper left", fontsize=8, ncols=3)
 
     # trades overlay
     if trades:
@@ -259,7 +274,6 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
         axp.text(0.01, 0.02, "No trades in window", transform=axp.transAxes,
                  fontsize=9, color="#999")
 
-    # rsi
     i=1
     if has_rsi:
         ax=axes[i]; i+=1
@@ -271,7 +285,6 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
         ax.set_ylim(0,100); ax.set_ylabel("RSI"); ax.grid(True, alpha=.15)
         if ax.get_legend_handles_labels()[0]: ax.legend(loc="upper left", fontsize=8)
 
-    # stochastic
     if has_sto:
         ax=axes[i]
         for name, s in lines.items():
@@ -283,14 +296,12 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
         if ax.get_legend_handles_labels()[0]: ax.legend(loc="upper left", fontsize=8)
 
     fig.autofmt_xdate(); fig.tight_layout()
-
-    stamp=datetime.utcnow().strftime("%Y%m%d%H%M%S"); uid=uuid.uuid4().hex[:6]
-    name=f"{sym.replace('/','_')}_{tf}_{expiry}_{stamp}_{uid}.png"
+    stamp=datetime.utcnow().strftime("%Y%m%d%H%M%S"); name=f"{sym.replace('/','_')}_{tf}_{expiry}_{stamp}_{uuid.uuid4().hex[:6]}.png"
     path=os.path.join(outdir, name)
     plt.savefig(path, dpi=140); plt.close(fig)
     return name
 
-# ===== Auth & basic pages ======================================================
+# ===== Auth & basic pages =====================================================
 def require_login(func):
     from functools import wraps
     @wraps(func)
@@ -327,7 +338,7 @@ def index():
                            now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
                            tz=TIMEZONE, window=cfg.get("window", {}))
 
-# ===== Dashboard ============================================================== 
+# ===== Dashboard ==============================================================
 @bp.route("/dashboard")
 @require_login
 def dashboard():
@@ -362,7 +373,7 @@ def dashboard():
                            now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
                            tz=TIMEZONE)
 
-# ===== Settings updates ========================================================
+# ===== Settings updates =======================================================
 @bp.route("/update_window", methods=["POST"])
 @require_login
 def update_window():
@@ -439,7 +450,7 @@ def update_custom():
     cfg.setdefault("strategies", {}); cfg["strategies"][f"CUSTOM{slot}"]={"enabled": bool(cfg[prefix]["enabled"])}
     set_config(cfg); flash(f"Custom #{slot} saved."); return redirect(url_for("dashboard.dashboard"))
 
-# ===== Users (tiers) ===========================================================
+# ===== Users ==================================================================
 @bp.route("/users/add", methods=["POST"])
 @require_login
 def users_add():
@@ -461,7 +472,7 @@ def users_delete():
     exec_sql("DELETE FROM users WHERE telegram_id=?", (telegram_id,))
     flash(f"User deleted: {telegram_id}"); return redirect(url_for("dashboard.dashboard"))
 
-# ===== Deriv fetch (optional helper present) ==================================
+# ===== Deriv fetch (optional) =================================================
 @bp.route("/deriv_fetch", methods=["POST"])
 @require_login
 def deriv_fetch():
@@ -483,7 +494,7 @@ def deriv_fetch():
     if fail: flash("Errors: " + "; ".join(fail))
     return redirect(url_for("dashboard.dashboard"))
 
-# ===== Backtest ================================================================
+# ===== Backtest ===============================================================
 @bp.route("/backtest", methods=["POST"])
 @require_login
 def backtest():
@@ -514,11 +525,11 @@ def backtest():
     def run_one(sym, df):
         nonlocal results, summary, first_plot_name
         core = "CUSTOM" if strategy.startswith("CUSTOM") else strategy
-        cfg_run = dict(cfg)
+        cfg_run = dict(cfg)  # pass full cfg to strategy core
         try:
             bt=run_backtest_core_binary(df, core, cfg_run, tf, expiry)
-        except Exception as e:
-            # guard for "'str' object has no attribute 'get'"
+        except Exception:
+            # guard odd cases like "'str' object has no attribute 'get'"
             bt=run_backtest_core_binary(df, core, {}, tf, expiry)
         r={"symbol":sym,
            "trades": getattr(bt,"trades",0) if isinstance(getattr(bt,"trades",0),(int,float)) else (getattr(bt,"trades_count",0) or 0),
@@ -570,7 +581,6 @@ def backtest():
         session["bt"]={"error": str(e), "warnings": warnings}; flash(f"Backtest error: {e}", "error")
     return redirect(url_for("dashboard.dashboard"))
 
-# JSON + CSV of last backtest
 @bp.route("/backtest/last.json")
 @require_login
 def backtest_last_json():
@@ -587,7 +597,7 @@ def backtest_last_csv():
     return Response(si.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition":"attachment; filename=backtest_results.csv"})
 
-# ===== No-cache plot serving ===================================================
+# ===== No-cache plot serving ==================================================
 @bp.route("/plots/<name>")
 def plot_file(name):
     resp = make_response(send_from_directory("static/plots", name, max_age=0))
@@ -596,7 +606,7 @@ def plot_file(name):
     resp.headers["Expires"]="0"
     return resp
 
-# ===== Live engine controls + tally ===========================================
+# ===== Live engine controls + tally ==========================================
 @bp.route("/live/status")
 def live_status():
     return jsonify({"ok":True, "status": ENGINE.status()})
@@ -622,7 +632,7 @@ def live_debug(state):
     ENGINE.debug = (state or "").lower()=="on"
     return jsonify({"ok":True, "debug": ENGINE.debug})
 
-# ===== Telegram diagnostics ====================================================
+# ===== Telegram diagnostics ===================================================
 @bp.route("/telegram/test", methods=["POST","GET"])
 def telegram_test():
     ok, msg = tg_test()
