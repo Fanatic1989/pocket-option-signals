@@ -1,15 +1,12 @@
-# routes.py — full feature build
-# - Dashboard with: trading window, strategy toggles (BASE/TREND/CHOP + CUSTOM1..3),
-#   indicators (SMA/EMA/WMA/SMMA/TMA + RSI + Stoch with periods), symbol selectors
-#   (PO majors + Deriv frx* + free text) and “convert PO→Deriv” switch
-# - Deriv historical fetch (uses data_fetch.py if present)
-# - Backtest (multi-symbol, CSV upload OR server CSVs), plots with candles + overlays,
-#   BUY/SELL markers and shaded expiry windows, cache-busted image route
-# - JSON & CSV download of last backtest, warnings surfaced in UI
-# - Telegram diag & test, user/tier admin
-# - Live engine start/stop/status/debug
-# - HEAD/health endpoint for UptimeRobot
-# -------------------------------------------------------------------------------
+# routes.py — full feature build (FIXED)
+#   - Dashboard: window, strategies (BASE/TREND/CHOP + CUSTOM1..3), indicators with periods,
+#     multi-symbol selectors (PO majors + Deriv frx* + free text) + PO→Deriv converter
+#   - Deriv fetcher hook (optional data_fetch.py)
+#   - Backtest: multi-symbol, CSV upload or server CSVs, candles + overlays, entry/expiry shaded,
+#     JSON/CSV exports, no-cache plot serving
+#   - Telegram diag + test, users/tier admin
+#   - Live engine controls
+#   - HEAD/health endpoint for UptimeRobot
 
 import os, re, json, math, uuid, csv
 from io import StringIO
@@ -217,7 +214,7 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
     axp=axes[0]; _draw_candles(axp, ds)
     ts=ds["timestamp"]
     for name, s in lines.items():
-        if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA("))):
+        if any(name.startswith(p) for p in ("SMA(","EMA(","WMA(","SMMA(","TMA(")):
             axp.plot(ts, s, label=name, linewidth=1.05)
     axp.set_title(f"{sym} • TF={tf} • Expiry={expiry}")
     if axp.get_legend_handles_labels()[0]: axp.legend(loc="upper left", fontsize=8, ncols=3)
@@ -283,7 +280,8 @@ def require_login(func):
     return wrapper
 
 @bp.route("/_up", methods=["GET","HEAD"])
-def up_check(): return "OK", 200
+def up_check():
+    return "OK", 200
 
 @bp.route("/login", methods=["GET","POST"])
 def login():
@@ -296,7 +294,9 @@ def login():
     return render_template("dashboard.html", view="login", window=cfg.get("window",{}), tz=TIMEZONE)
 
 @bp.route("/logout")
-def logout(): session.clear(); return redirect(url_for("dashboard.index"))
+def logout():
+    session.clear()
+    return redirect(url_for("dashboard.index"))
 
 @bp.route("/")
 def index():
@@ -341,7 +341,8 @@ def dashboard():
                            tz=TIMEZONE)
 
 # ===== Settings updates ========================================================
-@bp.route("/update_window", methods=["POST"]); @require_login
+@bp.route("/update_window", methods=["POST"])
+@require_login
 def update_window():
     cfg=_cfg_dict(get_config()); cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":TIMEZONE})
     for k in ("start","end","timezone"): cfg["window"][k]=request.form.get(k, cfg["window"][k])
@@ -349,7 +350,8 @@ def update_window():
     if request.form.get("live_expiry"): cfg["live_expiry"]=request.form.get("live_expiry")
     set_config(cfg); flash("Trading window & live defaults updated."); return redirect(url_for("dashboard.dashboard"))
 
-@bp.route("/update_strategies", methods=["POST"]); @require_login
+@bp.route("/update_strategies", methods=["POST"])
+@require_login
 def update_strategies():
     cfg=_cfg_dict(get_config()); cfg.setdefault("strategies", {"BASE":{"enabled":True},"TREND":{"enabled":False},"CHOP":{"enabled":False}})
     for name in list(cfg["strategies"].keys()):
@@ -359,7 +361,8 @@ def update_strategies():
         cfg.setdefault(key, {}); cfg[key]["enabled"]=box; cfg["strategies"][f"CUSTOM{i}"]={"enabled":box}
     set_config(cfg); flash("Strategies (including CUSTOM) updated."); return redirect(url_for("dashboard.dashboard"))
 
-@bp.route("/update_symbols", methods=["POST"]); @require_login
+@bp.route("/update_symbols", methods=["POST"])
+@require_login
 def update_symbols():
     cfg=_cfg_dict(get_config())
     sel_po=request.form.getlist("symbols_po_multi"); sel_deriv=request.form.getlist("symbols_deriv_multi")
@@ -372,7 +375,8 @@ def update_symbols():
     flash(("Active symbols saved (PO→Deriv conversion ON): " if convert_po else "Active symbols saved: ")+ (", ".join(normalized) if normalized else "(none)"))
     return redirect(url_for("dashboard.dashboard"))
 
-@bp.route("/update_indicators", methods=["POST"]); @require_login
+@bp.route("/update_indicators", methods=["POST"])
+@require_login
 def update_indicators():
     cfg=_cfg_dict(get_config()); inds=_cfg_dict(cfg.get("indicators"))
     for key, spec in INDICATOR_SPECS.items():
@@ -389,7 +393,8 @@ def update_indicators():
     cfg["indicators"]=inds; set_config(cfg); flash("Indicators updated.")
     return redirect(url_for("dashboard.dashboard"))
 
-@bp.route("/update_custom", methods=["POST"]); @require_login
+@bp.route("/update_custom", methods=["POST"])
+@require_login
 def update_custom():
     slot=(request.form.get("slot") or "1").strip(); prefix=f"custom{slot}"
     cfg=_cfg_dict(get_config()); cfg.setdefault(prefix, {})
@@ -413,7 +418,8 @@ def update_custom():
     set_config(cfg); flash(f"Custom #{slot} saved."); return redirect(url_for("dashboard.dashboard"))
 
 # ===== Users (tiers) ===========================================================
-@bp.route("/users/add", methods=["POST"]); @require_login
+@bp.route("/users/add", methods=["POST"])
+@require_login
 def users_add():
     telegram_id=(request.form.get("telegram_id") or "").strip()
     tier=(request.form.get("tier") or "free").strip()
@@ -425,7 +431,8 @@ def users_add():
              (telegram_id,tier,expires_at))
     flash(f"User saved: {telegram_id} ({tier})"); return redirect(url_for("dashboard.dashboard"))
 
-@bp.route("/users/delete", methods=["POST"]); @require_login
+@bp.route("/users/delete", methods=["POST"])
+@require_login
 def users_delete():
     telegram_id=(request.form.get("telegram_id") or "").strip()
     if not telegram_id: flash("Telegram ID required.","error"); return redirect(url_for("dashboard.dashboard"))
@@ -433,7 +440,8 @@ def users_delete():
     flash(f"User deleted: {telegram_id}"); return redirect(url_for("dashboard.dashboard"))
 
 # ===== Deriv fetch (optional helper present) ==================================
-@bp.route("/deriv_fetch", methods=["POST"]); @require_login
+@bp.route("/deriv_fetch", methods=["POST"])
+@require_login
 def deriv_fetch():
     if not (_fetch_one_symbol and _deriv_csv_path):
         flash("Deriv fetch helper (data_fetch.py) not found in this build.","error")
@@ -454,7 +462,8 @@ def deriv_fetch():
     return redirect(url_for("dashboard.dashboard"))
 
 # ===== Backtest ================================================================
-@bp.route("/backtest", methods=["POST"]); @require_login
+@bp.route("/backtest", methods=["POST"])
+@require_login
 def backtest():
     cfg=_cfg_dict(get_config())
     tf=(request.form.get("bt_tf") or "M5").upper()
@@ -481,10 +490,8 @@ def backtest():
 
     def run_one(sym, df):
         nonlocal results, summary, first_plot_name
-        # choose strategy (CUSTOMx shares engine with CUSTOM)
         core = "CUSTOM" if strategy.startswith("CUSTOM") else strategy
-        cfg_run = dict(cfg)  # includes custom rules/indicators
-        # run strategy (defensive against dict/str mixups)
+        cfg_run = dict(cfg)
         try:
             bt=run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         except Exception as e:
@@ -499,7 +506,6 @@ def backtest():
            "winrate": round((getattr(bt,"winrate",0.0) or 0.0)*100,2) if isinstance(getattr(bt,"winrate",0.0),(int,float)) else 0.0}
         results.append(r)
         for k in ("trades","wins","losses","draws"): summary[k]+=r[k]
-        # indicators EXACTLY as saved (fallback if all off)
         ind_cfg=_cfg_dict(cfg.get("indicators") or {})
         if not _any_on(ind_cfg):
             ind_cfg={"sma":{"enabled":True,"period":50},"rsi":{"enabled":True,"period":14},
@@ -571,7 +577,8 @@ def plot_file(name):
 
 # ===== Live engine controls ====================================================
 @bp.route("/live/status")
-def live_status(): return jsonify({"ok":True, "status": ENGINE.status()})
+def live_status():
+    return jsonify({"ok":True, "status": ENGINE.status()})
 
 @bp.route("/live/start", methods=["POST","GET"])
 def live_start():
