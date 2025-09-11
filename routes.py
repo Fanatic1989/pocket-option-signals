@@ -1,5 +1,17 @@
-# routes.py — cache-busted plots, indicator-accurate overlays, entry/expiry markers
-import os, re, json, math, uuid
+# routes.py — full feature build
+# - Dashboard with: trading window, strategy toggles (BASE/TREND/CHOP + CUSTOM1..3),
+#   indicators (SMA/EMA/WMA/SMMA/TMA + RSI + Stoch with periods), symbol selectors
+#   (PO majors + Deriv frx* + free text) and “convert PO→Deriv” switch
+# - Deriv historical fetch (uses data_fetch.py if present)
+# - Backtest (multi-symbol, CSV upload OR server CSVs), plots with candles + overlays,
+#   BUY/SELL markers and shaded expiry windows, cache-busted image route
+# - JSON & CSV download of last backtest, warnings surfaced in UI
+# - Telegram diag & test, user/tier admin
+# - Live engine start/stop/status/debug
+# - HEAD/health endpoint for UptimeRobot
+# -------------------------------------------------------------------------------
+
+import os, re, json, math, uuid, csv
 from io import StringIO
 from datetime import datetime, timedelta
 
@@ -7,7 +19,7 @@ import pandas as pd
 import requests
 from flask import (
     Blueprint, render_template, request, redirect, url_for, session, flash, jsonify,
-    send_from_directory, make_response
+    send_from_directory, make_response, Response
 )
 
 # Matplotlib headless
@@ -18,19 +30,21 @@ import matplotlib.dates as mdates
 
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
-# ---- local modules (no circular imports) ----
+# --- project modules (no circular imports) -------------------------------------
 from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
-
-# fetchers (no import back to routes)
-from data_fetch import deriv_csv_path as _deriv_csv_path, fetch_one_symbol as _fetch_one_symbol
-
-# live engine
 from live_engine import ENGINE, tg_test
 
-# ===== Symbols =====
+# optional fetch helpers (if present)
+try:
+    from data_fetch import deriv_csv_path as _deriv_csv_path, fetch_one_symbol as _fetch_one_symbol
+except Exception:
+    _deriv_csv_path = None
+    _fetch_one_symbol = None
+
+# ===== Symbols & groups ========================================================
 DERIV_FRX = [
     "frxEURUSD","frxGBPUSD","frxUSDJPY","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD",
     "frxEURGBP","frxEURJPY","frxEURCHF","frxEURAUD","frxGBPAUD","frxGBPJPY","frxGBPNZD",
@@ -38,22 +52,27 @@ DERIV_FRX = [
     "frxEURNZD","frxEURCAD","frxGBPCAD","frxGBPCHF","frxNZDCHF","frxNZDCAD"
 ]
 PO_MAJOR = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"]
-AVAILABLE_GROUPS = [{"label":"Deriv (frx*)","items":DERIV_FRX},{"label":"Pocket Option majors","items":PO_MAJOR}]
+AVAILABLE_GROUPS = [
+    {"label":"Deriv (frx*)", "items": DERIV_FRX},
+    {"label":"Pocket Option majors", "items": PO_MAJOR},
+]
 
-# ===== helpers =====
+# ===== Helpers =================================================================
 def _cfg_dict(x):
     if isinstance(x, dict): return x
     if isinstance(x, str):
         try:
             j = json.loads(x);  return j if isinstance(j, dict) else {}
-        except Exception: return {}
+        except Exception:
+            return {}
     return {}
 
 def _merge_unique(xs):
     out, seen = [], set()
     for x in xs:
         if not x: continue
-        if x not in seen: out.append(x); seen.add(x)
+        if x not in seen:
+            out.append(x); seen.add(x)
     return out
 
 def _is_po_symbol(sym: str) -> bool:
@@ -71,12 +90,15 @@ def _expand_all_symbols(tokens):
     out = []
     for t in tokens:
         tt = (t or "").strip().upper()
-        if tt in ("ALL","ALL_DERIV","__ALL__","__ALL_DERIV__"): out += DERIV_FRX
-        elif tt in ("ALL_PO","__ALL_PO__","PO_ALL"): out += PO_MAJOR
-        else: out.append(t)
+        if tt in ("ALL","ALL_DERIV","__ALL__","__ALL_DERIV__"):
+            out += DERIV_FRX
+        elif tt in ("ALL_PO","__ALL_PO__","PO_ALL"):
+            out += PO_MAJOR
+        else:
+            out.append(t)
     return _merge_unique(out)
 
-# ===== minimal indicators (for plotting) =====
+# ===== Minimal indicators for plotting (overlays) ==============================
 def _sma(s, p):   return s.rolling(int(p), min_periods=1).mean()
 def _ema(s, p):   return s.ewm(span=int(p), adjust=False).mean()
 def _wma(s, p):
@@ -124,14 +146,14 @@ def _compute_lines(df, ind_cfg):
         k,d=_stoch(h,l,c,kp,dp,sp); out[f"StochK({kp},{dp},{sp})"]=k; out[f"StochD({kp},{dp},{sp})"]=d
     return out
 
-# ===== candles & entries =====
+# ===== Candle plotting with entries/expiry shading =============================
 def _draw_candles(ax, df):
     ts = pd.to_datetime(df["timestamp"])
     o,h,l,c = [pd.to_numeric(df[k], errors="coerce") for k in ("open","high","low","close")]
     if len(ts)>1:
         step = ts.diff().dropna().dt.total_seconds().median() or 60.0
     else: step = 60.0
-    width = (step/(24*3600))*0.9  # in days
+    width = (step/(24*3600))*0.9
     x = mdates.date2num(ts.dt.to_pydatetime())
     for xi, oo, hh, ll, cc in zip(x,o,h,l,c):
         if pd.isna([oo,hh,ll,cc]).any(): continue
@@ -147,7 +169,7 @@ def _expiry_seconds(expiry):
     if s.endswith("h"): return int(re.sub(r"\D","",s))*3600
     if s.endswith("d"): return int(re.sub(r"\D","",s))*86400
     if s.isdigit():     return int(s)*60
-    return 300
+    return 300  # default 5m
 
 def _extract_trades(bt, df, expiry):
     out=[]; exp_s=_expiry_seconds(expiry)
@@ -158,7 +180,6 @@ def _extract_trades(bt, df, expiry):
             return None
         try: return pd.to_datetime(x)
         except Exception: return None
-    # try common shapes
     if hasattr(bt,"trades_df") and isinstance(bt.trades_df, pd.DataFrame):
         for _,r in bt.trades_df.iterrows():
             t=to_ts(r.get("entry_time") or r.get("time")); side=(r.get("side") or r.get("direction") or "").upper()
@@ -193,12 +214,11 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
     fig, axes = plt.subplots(rows, 1, figsize=(14, 3.0*rows+0.8), sharex=True)
     if rows==1: axes=[axes]
 
-    # price
     axp=axes[0]; _draw_candles(axp, ds)
     ts=ds["timestamp"]
     for name, s in lines.items():
         if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA("))):
-            axp.plot(ts, s, label=name, linewidth=1.1)
+            axp.plot(ts, s, label=name, linewidth=1.05)
     axp.set_title(f"{sym} • TF={tf} • Expiry={expiry}")
     if axp.get_legend_handles_labels()[0]: axp.legend(loc="upper left", fontsize=8, ncols=3)
 
@@ -208,7 +228,6 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
             t=pd.to_datetime(tr["t"]); te=pd.to_datetime(tr["expiry"])
             side=tr["side"].upper(); marker="▲" if side=="BUY" else "▼"
             color="#17c964" if side=="BUY" else "#f31260"
-            # y near close at that time
             try:
                 idx=ds["timestamp"].searchsorted(t)
                 y=float(ds["close"].iloc[max(0,min(idx,len(ds)-1))])
@@ -216,7 +235,7 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
                 y=float(ds["close"].iloc[-1])
             axp.annotate(marker, (t,y), color=color, fontsize=11,
                          ha="center", va="bottom" if side=="BUY" else "top")
-            axp.axvspan(t, te, color=color, alpha=.1)
+            axp.axvspan(t, te, color=color, alpha=.10)
     else:
         axp.text(0.01, 0.02, "No trades in window", transform=axp.transAxes,
                  fontsize=9, color="#999")
@@ -226,7 +245,7 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
     if has_rsi:
         ax=axes[i]; i+=1
         for name, s in lines.items():
-            if name.startswith("RSI("): ax.plot(ts, s, label=name, linewidth=1.1)
+            if name.startswith("RSI("): ax.plot(ts, s, label=name, linewidth=1.0)
         ax.axhline(50, color="#888", linewidth=.9)
         ax.axhline(70, color="#aa4444", linewidth=.7)
         ax.axhline(30, color="#44aa44", linewidth=.7)
@@ -237,28 +256,29 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
     if has_sto:
         ax=axes[i]
         for name, s in lines.items():
-            if name.startswith("StochK("): ax.plot(ts, s, label=name, linewidth=1.1)
+            if name.startswith("StochK("): ax.plot(ts, s, label=name, linewidth=1.0)
         for name, s in lines.items():
-            if name.startswith("StochD("): ax.plot(ts, s, label=name, linewidth=1.1, linestyle="--")
+            if name.startswith("StochD("): ax.plot(ts, s, label=name, linewidth=1.0, linestyle="--")
         ax.axhline(80, color="#aa4444", linewidth=.7); ax.axhline(20, color="#44aa44", linewidth=.7)
         ax.set_ylim(0,100); ax.set_ylabel("Stoch"); ax.grid(True, alpha=.15)
         if ax.get_legend_handles_labels()[0]: ax.legend(loc="upper left", fontsize=8)
 
     fig.autofmt_xdate(); fig.tight_layout()
 
-    # unique filename + return name only (served via /plots/<name>)
+    # unique name, served with no-cache route
     stamp=datetime.utcnow().strftime("%Y%m%d%H%M%S"); uid=uuid.uuid4().hex[:6]
     name=f"{sym.replace('/','_')}_{tf}_{expiry}_{stamp}_{uid}.png"
     path=os.path.join(outdir, name)
     plt.savefig(path, dpi=140); plt.close(fig)
     return name
 
-# ===== auth & basic =====
+# ===== Auth & basic pages ======================================================
 def require_login(func):
     from functools import wraps
     @wraps(func)
     def wrapper(*a, **kw):
-        if not session.get("admin"): return redirect(url_for("dashboard.login", next=request.path))
+        if not session.get("admin"):
+            return redirect(url_for("dashboard.login", next=request.path))
         return func(*a, **kw)
     return wrapper
 
@@ -269,7 +289,8 @@ def up_check(): return "OK", 200
 def login():
     if request.method=="POST":
         if request.form.get("password")==os.getenv("ADMIN_PASSWORD","admin123"):
-            session["admin"]=True; flash("Logged in."); return redirect(request.args.get("next") or url_for("dashboard.dashboard"))
+            session["admin"]=True; flash("Logged in.")
+            return redirect(request.args.get("next") or url_for("dashboard.dashboard"))
         flash("Invalid password","error")
     cfg=_cfg_dict(get_config())
     return render_template("dashboard.html", view="login", window=cfg.get("window",{}), tz=TIMEZONE)
@@ -285,7 +306,7 @@ def index():
                            now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
                            tz=TIMEZONE, window=cfg.get("window", {}))
 
-# ===== dashboard =====
+# ===== Dashboard ===============================================================
 @bp.route("/dashboard")
 @require_login
 def dashboard():
@@ -298,7 +319,7 @@ def dashboard():
              dict(_cfg_dict(cfg.get("custom2")),_idx=2),
              dict(_cfg_dict(cfg.get("custom3")),_idx=3)]
     strategies_core=_cfg_dict(cfg.get("strategies")) or {"BASE":{"enabled":True},"TREND":{"enabled":False},"CHOP":{"enabled":False}}
-    strategies_all=dict(strategies_core);  # include toggles for customs
+    strategies_all=dict(strategies_core)
     for i,c in enumerate(customs, start=1): strategies_all[f"CUSTOM{i}"]={"enabled": bool(c.get("enabled"))}
 
     bt=session.get("bt", {})
@@ -319,7 +340,7 @@ def dashboard():
                            now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
                            tz=TIMEZONE)
 
-# ===== config update endpoints (unchanged logic) =====
+# ===== Settings updates ========================================================
 @bp.route("/update_window", methods=["POST"]); @require_login
 def update_window():
     cfg=_cfg_dict(get_config()); cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":TIMEZONE})
@@ -391,7 +412,7 @@ def update_custom():
     cfg.setdefault("strategies", {}); cfg["strategies"][f"CUSTOM{slot}"]={"enabled": bool(cfg[prefix]["enabled"])}
     set_config(cfg); flash(f"Custom #{slot} saved."); return redirect(url_for("dashboard.dashboard"))
 
-# ===== users =====
+# ===== Users (tiers) ===========================================================
 @bp.route("/users/add", methods=["POST"]); @require_login
 def users_add():
     telegram_id=(request.form.get("telegram_id") or "").strip()
@@ -411,9 +432,12 @@ def users_delete():
     exec_sql("DELETE FROM users WHERE telegram_id=?", (telegram_id,))
     flash(f"User deleted: {telegram_id}"); return redirect(url_for("dashboard.dashboard"))
 
-# ===== deriv fetch =====
+# ===== Deriv fetch (optional helper present) ==================================
 @bp.route("/deriv_fetch", methods=["POST"]); @require_login
 def deriv_fetch():
+    if not (_fetch_one_symbol and _deriv_csv_path):
+        flash("Deriv fetch helper (data_fetch.py) not found in this build.","error")
+        return redirect(url_for("dashboard.dashboard"))
     app_id=os.getenv("DERV_APP_ID") or os.getenv("DERIV_APP_ID","1089")
     tf=(request.form.get("fetch_tf") or "M5").upper()
     count=int(request.form.get("fetch_count") or "300")
@@ -429,12 +453,12 @@ def deriv_fetch():
     if fail: flash("Errors: " + "; ".join(fail))
     return redirect(url_for("dashboard.dashboard"))
 
-# ===== backtest (plot + cache-bust) =====
+# ===== Backtest ================================================================
 @bp.route("/backtest", methods=["POST"]); @require_login
 def backtest():
     cfg=_cfg_dict(get_config())
     tf=(request.form.get("bt_tf") or "M5").upper()
-    expiry=request.form.get("bt_expiry") or "5m"
+    expiry=request.form.get("bt_expiry") or "5m"   # supports 1m,3m,5m,10m,30m,1h,4h…
     strategy=(request.form.get("bt_strategy") or "BASE").upper()
     use_server=bool(request.form.get("use_server"))
     app_id=os.getenv("DERV_APP_ID") or os.getenv("DERIV_APP_ID","1089")
@@ -457,20 +481,17 @@ def backtest():
 
     def run_one(sym, df):
         nonlocal results, summary, first_plot_name
-        if strategy.startswith("CUSTOM"):
-            cfg_run=dict(cfg);  # includes custom rules
-            core="CUSTOM"
-        else:
-            cfg_run=dict(cfg); core=strategy
-        # run strategy
+        # choose strategy (CUSTOMx shares engine with CUSTOM)
+        core = "CUSTOM" if strategy.startswith("CUSTOM") else strategy
+        cfg_run = dict(cfg)  # includes custom rules/indicators
+        # run strategy (defensive against dict/str mixups)
         try:
             bt=run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         except Exception as e:
-            if "object has no attribute 'get'" in str(e):
+            if "attribute 'get'" in str(e):
                 bt=run_backtest_core_binary(df, core, {}, tf, expiry)
             else:
                 raise
-        # collect totals
         r={"symbol":sym,
            "trades": getattr(bt,"trades",0) if isinstance(getattr(bt,"trades",0),(int,float)) else (getattr(bt,"trades_count",0) or 0),
            "wins": getattr(bt,"wins",0), "losses": getattr(bt,"losses",0),
@@ -499,7 +520,9 @@ def backtest():
             for sym in symbols:
                 try:
                     if use_server:
+                        if not _fetch_one_symbol: raise RuntimeError("data_fetch helper not present")
                         _fetch_one_symbol(app_id, sym, gran, count)
+                    if not _deriv_csv_path: raise RuntimeError("data_fetch helper not present")
                     path=_deriv_csv_path(sym, gran)
                     if not os.path.exists(path): warnings.append(f"{sym}: no CSV"); continue
                     df=pd.read_csv(path); df.columns=[c.strip().lower() for c in df.columns]
@@ -520,17 +543,33 @@ def backtest():
         session["bt"]={"error": str(e), "warnings": warnings}; flash(f"Backtest error: {e}", "error")
     return redirect(url_for("dashboard.dashboard"))
 
-# ===== no-cache plot serving =====
+# JSON + CSV of last backtest
+@bp.route("/backtest/last.json")
+@require_login
+def backtest_last_json():
+    return jsonify(session.get("bt") or {"error":"no backtest"})
+
+@bp.route("/backtest/last.csv")
+@require_login
+def backtest_last_csv():
+    bt=session.get("bt") or {}
+    rows=bt.get("results") or []
+    si=StringIO(); w=csv.writer(si)
+    w.writerow(["symbol","trades","wins","losses","draws","winrate"])
+    for r in rows: w.writerow([r["symbol"],r["trades"],r["wins"],r["losses"],r["draws"],r["winrate"]])
+    return Response(si.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition":"attachment; filename=backtest_results.csv"})
+
+# ===== No-cache plot serving ===================================================
 @bp.route("/plots/<name>")
 def plot_file(name):
-    # serve with no-store so Render/CDN/browsers never cache it
     resp = make_response(send_from_directory("static/plots", name, max_age=0))
     resp.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"]="no-cache"
     resp.headers["Expires"]="0"
     return resp
 
-# ===== live engine =====
+# ===== Live engine controls ====================================================
 @bp.route("/live/status")
 def live_status(): return jsonify({"ok":True, "status": ENGINE.status()})
 
@@ -551,7 +590,7 @@ def live_debug(state):
     ENGINE.debug = (state or "").lower()=="on"
     return jsonify({"ok":True, "debug": ENGINE.debug})
 
-# ===== Telegram diag =====
+# ===== Telegram diagnostics ====================================================
 @bp.route("/telegram/test", methods=["POST","GET"])
 def telegram_test():
     ok, msg = tg_test()
