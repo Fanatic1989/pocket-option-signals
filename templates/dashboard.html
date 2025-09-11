@@ -1,480 +1,424 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Pocket Option Signals — Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8"/>
+  <title>Pocket Option Signals • Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
     :root{
-      --bg:#0f1420; --card:#12192a; --muted:#8aa0c6; --text:#e6eefc; --accent:#4da3ff;
-      --ok:#27c93f; --warn:#ffc107; --err:#ff5f56;
+      --bg:#0b0f14; --panel:#131a22; --panel2:#0f141a;
+      --text:#e6edf3; --muted:#91a4b7; --accent:#00d4ff; --ok:#17c964; --err:#f31260; --warn:#f5a524;
+      --line:#22303c;
     }
-    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.45}
-    a{color:var(--accent);text-decoration:none}
-    .wrap{max-width:1200px;margin:0 auto;padding:24px}
-    .topbar{display:flex;gap:16px;align-items:center;justify-content:space-between;margin-bottom:16px}
-    .grid{display:grid;gap:16px}
-    @media(min-width:900px){.grid.cols-2{grid-template-columns:1fr 1fr}
-                             .grid.cols-3{grid-template-columns:1fr 1fr 1fr}}
-    .card{background:var(--card);border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
-    .card h2,.card h3{margin:.2rem 0 1rem}
-    .row{display:flex;gap:10px;align-items:center;margin:.5rem 0}
-    .row > label{min-width:160px;color:var(--muted)}
-    .input, select, textarea{background:#0e1423;color:var(--text);border:1px solid #1f2a44;border-radius:10px;padding:10px;flex:1;outline:none}
-    textarea{min-height:80px}
-    .btn{background:var(--accent);color:#061123;border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600}
-    .btn.secondary{background:#223152;color:#cfe1ff}
-    .btn.danger{background:#a83232;color:#fff}
-    .btn.ok{background:var(--ok);color:#06210f}
-    .btn.warn{background:var(--warn);color:#332400}
-    .muted{color:var(--muted);font-size:.9rem}
-    .flash{padding:10px 12px;border-radius:10px;background:#1a2440;margin:8px 0}
-    .flash.warn{background:#3b3206}
-    .flash.err{background:#3b0f0f}
-    .kpi{display:flex;gap:14px;flex-wrap:wrap}
-    .pill{background:#0e1423;border:1px solid #233053;padding:6px 10px;border-radius:999px;color:#c9dafc}
-    table{width:100%;border-collapse:collapse;background:#0e1423;border-radius:12px;overflow:hidden}
-    thead th{background:#0b1220;color:#b9caee;text-align:left;padding:10px;border-bottom:1px solid #1f2a44}
-    td{padding:10px;border-bottom:1px solid #17223d}
-    .stack{display:flex;flex-direction:column;gap:10px}
-    .select-multi{min-height:140px}
-    .section-title{display:flex;align-items:center;gap:10px;margin:0 0 12px}
-    .section-title small{color:var(--muted)}
-    .hr{height:1px;background:#1f2a44;margin:12px 0}
-    .right{justify-content:flex-end}
-    .flex{display:flex;gap:10px;align-items:center}
-    .grow{flex:1}
-    code{background:#0b1220;color:#cfe1ff;border:1px solid #223152;padding:2px 6px;border-radius:6px}
-    .btn[disabled]{opacity:.5;cursor:not-allowed}
-    img.chart{width:100%;border-radius:10px;border:1px solid #223152}
+    *{box-sizing:border-box}
+    body{margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    header{padding:14px 18px; background:linear-gradient(90deg,var(--panel),var(--panel2)); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5}
+    h1{margin:0; font-size:18px; letter-spacing:.4px}
+    .wrap{max-width:1280px; margin:0 auto; padding:18px}
+    .grid{display:grid; gap:14px}
+    .g2{grid-template-columns:1fr 1fr}
+    .g3{grid-template-columns:repeat(3,1fr)}
+    @media(max-width:1024px){.g3{grid-template-columns:1fr}.g2{grid-template-columns:1fr}}
+    .card{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px}
+    .card h2{margin:0 0 10px; font-size:16px}
+    .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+    label{color:var(--muted); font-size:12px}
+    input, select, textarea{background:#0b1218; color:var(--text); border:1px solid #1f2a35; border-radius:8px; padding:8px 10px}
+    textarea{min-height:70px; width:100%}
+    .btn{background:#0b141c; color:var(--text); border:1px solid #234; padding:8px 12px; border-radius:8px; cursor:pointer}
+    .btn:hover{border-color:#345}
+    .btn-primary{background:linear-gradient(90deg,#00b4ff,#00e1d9); color:#001018; border:none}
+    .btn-ok{background:rgba(23,201,100,.12); border:1px solid rgba(23,201,100,.45); color:#bdf6d2}
+    .btn-warn{background:rgba(245,165,36,.12); border:1px solid rgba(245,165,36,.45); color:#fde1b5}
+    .btn-err{background:rgba(243,18,96,.12); border:1px solid rgba(243,18,96,.45); color:#ffd6e3}
+    .muted{color:var(--muted)}
+    .pill{display:inline-block; padding:3px 8px; border:1px solid var(--line); border-radius:999px; color:#b9c9d8; font-size:12px}
+    .flash{padding:10px 12px; border-radius:8px; margin:6px 0; border:1px solid #2a3a45; background:#0f1720}
+    .table{width:100%; border-collapse:collapse}
+    .table th,.table td{border-bottom:1px solid #1d2834; padding:8px 6px; text-align:left; font-size:13px}
+    .plot{width:100%; border-radius:10px; border:1px solid var(--line); background:#0e141b}
+    .legend{font-size:12px; color:#abc; margin-top:6px}
+    .sep{height:1px; background:var(--line); margin:10px 0}
+    .hint{font-size:12px; color:#8aa2b4}
+    .badge{font-size:11px; padding:2px 6px; border-radius:6px; border:1px solid #2a3a45; color:#a9bed0}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="topbar">
-      <div>
-        <h1 style="margin:0;font-size:1.4rem">Pocket Option Signals</h1>
-        <div class="muted">{{ now }} ({{ tz }})</div>
-      </div>
-      <div class="flex">
-        <a class="btn secondary" href="{{ url_for('dashboard.index') }}">Home</a>
-        <a class="btn secondary" href="{{ url_for('dashboard.logout') }}">Logout</a>
-      </div>
-    </div>
-
-    <!-- Flash messages -->
-    {% with msgs = get_flashed_messages(with_categories=true) %}
-      {% if msgs %}
-        {% for cat, m in msgs %}
-          <div class="flash {{ 'warn' if cat=='warning' else ('err' if cat=='error' else '') }}">{{ m }}</div>
-        {% endfor %}
+<header>
+  <div class="row" style="justify-content:space-between">
+    <h1>📊 Pocket Option Signals — Dashboard</h1>
+    <div>
+      <a class="pill" href="{{ url_for('dashboard.index') }}">Home</a>
+      {% if session.get('admin') %}
+      <a class="pill" href="{{ url_for('dashboard.logout') }}">Logout</a>
+      {% else %}
+      <a class="pill" href="{{ url_for('dashboard.login') }}">Login</a>
       {% endif %}
-    {% endwith %}
+    </div>
+  </div>
+</header>
 
-    {% if view == 'login' %}
-      <div class="card" style="max-width:440px;margin:24px auto">
+<div class="wrap">
+
+  {% with msgs = get_flashed_messages(with_categories=true) %}
+    {% if msgs %}
+      {% for cat,msg in msgs %}
+        <div class="flash">{{ msg }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  {% if view == 'login' %}
+    <div class="grid">
+      <div class="card">
         <h2>Admin Login</h2>
         <form method="post">
-          <div class="row"><label>Password</label><input class="input" type="password" name="password" required></div>
-          <button class="btn">Login</button>
+          <div class="row">
+            <label>Password</label>
+            <input type="password" name="password" placeholder="••••••••"/>
+            <button class="btn btn-primary" type="submit">Login</button>
+          </div>
         </form>
       </div>
-
-    {% elif view == 'index' %}
-      <div class="grid cols-2">
-        <div class="card">
-          <h2>Welcome</h2>
-          <p class="muted">Trading window: {{ window.start if window and window.start else '08:00' }} — {{ window.end if window and window.end else '17:00' }} {{ window.timezone if window and window.timezone else tz }}.</p>
-          <p>Go to <a href="{{ url_for('dashboard.dashboard') }}">Dashboard</a> to configure strategies, pairs, and run backtests.</p>
+    </div>
+  {% elif view == 'index' %}
+    <div class="grid">
+      <div class="card">
+        <h2>Status</h2>
+        <div class="row">
+          <div class="pill">Now ({{ tz }}): {{ now }}</div>
+          {% if within %}
+            <div class="pill" style="border-color:#195b38;color:#bff5d5">Within Trading Window</div>
+          {% else %}
+            <div class="pill" style="border-color:#5b1919;color:#ffd1d9">Outside Trading Window</div>
+          {% endif %}
         </div>
-        <div class="card">
-          <h3>Health</h3>
-          <div class="row"><span class="pill">Service: UP</span> <span class="pill">UptimeRobot HEAD: enabled</span></div>
-          <div class="row"><a class="btn secondary" href="{{ url_for('dashboard.up_check') }}">Check /_up</a></div>
-        </div>
+        <div class="sep"></div>
+        <div class="muted">Window: {{ window.start|default('08:00') }} → {{ window.end|default('17:00') }} ({{ tz }})</div>
+        <div class="sep"></div>
+        <a class="btn btn-primary" href="{{ url_for('dashboard.login') }}">Go to Dashboard</a>
       </div>
+    </div>
+  {% elif view == 'dashboard' %}
+  <div class="grid g3">
 
-    {% elif view == 'dashboard' %}
-      <div class="grid cols-2">
+    <!-- Window & Live Defaults -->
+    <div class="card">
+      <h2>⏱️ Trading Window & Live Defaults</h2>
+      <form method="post" action="{{ url_for('dashboard.update_window') }}" class="grid">
+        <div class="row">
+          <label>Start</label><input name="start" value="{{ window.start|default('08:00') }}" style="width:90px"/>
+          <label>End</label><input name="end" value="{{ window.end|default('17:00') }}" style="width:90px"/>
+          <label>Timezone</label><input name="timezone" value="{{ window.timezone|default(tz) }}" style="width:180px"/>
+        </div>
+        <div class="row">
+          <label>Live TF</label>
+          <select name="live_tf">
+            {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+              <option value="{{ tf }}" {% if live_tf==tf %}selected{% endif %}>{{ tf }}</option>
+            {% endfor %}
+          </select>
+          <label>Live Expiry</label>
+          <select name="live_expiry">
+            {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
+              <option value="{{ e }}" {% if live_expiry==e %}selected{% endif %}>{{ e }}</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-primary" type="submit">Save</button>
+        </div>
+      </form>
+      <div class="hint">Window is enforced in the live engine. UptimeRobot hits <code>/\_up</code> to keep alive.</div>
+    </div>
 
-        <!-- Left column -->
-        <div class="stack">
-
-          <!-- Trading window + live defaults -->
-          <div class="card">
-            <div class="section-title"><h2>Trading Window</h2><small>TT/Port of Spain</small></div>
-            <form method="post" action="{{ url_for('dashboard.update_window') }}">
-              <div class="row">
-                <label>Start</label><input class="input" name="start" type="time" value="{{ window.start if window and window.start else '08:00' }}">
-              </div>
-              <div class="row">
-                <label>End</label><input class="input" name="end" type="time" value="{{ window.end if window and window.end else '17:00' }}">
-              </div>
-              <div class="row">
-                <label>Timezone</label><input class="input" name="timezone" value="{{ window.timezone if window and window.timezone else tz }}">
-              </div>
-              <div class="hr"></div>
-              <div class="row">
-                <label>Live TF</label>
-                <select name="live_tf" class="input">
-                  {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                    <option value="{{t}}" {{ 'selected' if live_tf==t else '' }}>{{t}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="row">
-                <label>Live Expiry</label>
-                <select name="live_expiry" class="input">
-                  {% for e in ['1m','3m','5m','10m','15m','30m','H1','H4'] %}
-                    <option value="{{e}}" {{ 'selected' if live_expiry==e else '' }}>{{e}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="row right"><button class="btn">Save</button></div>
-            </form>
-          </div>
-
-          <!-- Strategies -->
-          <div class="card">
-            <h2>Strategies</h2>
-            <form method="post" action="{{ url_for('dashboard.update_strategies') }}">
-              <div class="row">
-                <label><input type="checkbox" name="s_BASE" {{ 'checked' if strategies_all.BASE.enabled else '' }}> BASE</label>
-              </div>
-              <div class="row">
-                <label><input type="checkbox" name="s_TREND" {{ 'checked' if strategies_all.TREND.enabled else '' }}> TREND</label>
-              </div>
-              <div class="row">
-                <label><input type="checkbox" name="s_CHOP" {{ 'checked' if strategies_all.CHOP.enabled else '' }}> CHOP</label>
-              </div>
-              <div class="hr"></div>
-              {% for c in customs %}
-                <div class="row">
-                  <label><input type="checkbox" name="s_CUSTOM{{c._idx}}" {{ 'checked' if c.enabled else '' }}> CUSTOM {{c._idx}}</label>
-                </div>
-              {% endfor %}
-              <div class="row right"><button class="btn">Save</button></div>
-            </form>
-          </div>
-
-          <!-- Indicators -->
-          <div class="card">
-            <h2>Indicators</h2>
-            <form method="post" action="{{ url_for('dashboard.update_indicators') }}">
-              {% for key, spec in specs.items() %}
-                <div class="row" style="align-items:flex-start">
-                  <label style="min-width:140px">
-                    <input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if indicators.get(key,{}).get('enabled') else '' }}>
-                    {{ key.upper() }}
-                  </label>
-                  <div class="grow">
-                    {% for p, default in spec.params.items() %}
-                      <div class="row">
-                        <label style="min-width:120px">{{ p }}</label>
-                        <input class="input" type="text" name="ind_{{key}}_{{p}}" value="{{ indicators.get(key,{}).get(p, default) }}">
-                      </div>
-                    {% endfor %}
-                  </div>
-                </div>
-                <div class="hr"></div>
-              {% endfor %}
-              <div class="row right"><button class="btn">Save</button></div>
-            </form>
-          </div>
-
-          <!-- CUSTOM rules -->
-          <div class="card">
-            <h2>Custom Rules</h2>
-            {% for c in customs %}
-              <form method="post" action="{{ url_for('dashboard.update_custom') }}" class="card" style="background:#0f1627">
-                <input type="hidden" name="slot" value="{{ c._idx }}">
-                <div class="row">
-                  <label><input type="checkbox" name="enabled" {{ 'checked' if c.enabled else '' }}> Enable CUSTOM {{c._idx}}</label>
-                </div>
-                <div class="row">
-                  <label>Mode</label>
-                  <select name="mode" class="input">
-                    <option value="SIMPLE" {{ 'selected' if c.mode=='SIMPLE' or not c.mode else '' }}>SIMPLE (English)</option>
-                    <option value="JSON" {{ 'selected' if c.mode=='JSON' else '' }}>JSON</option>
-                  </select>
-                </div>
-
-                <div class="row"><label style="min-width:140px">SIMPLE Buy</label>
-                  <textarea class="input" name="simple_buy" placeholder="If price above 50 SMA and RSI bounce above 50 and Stochastic crosses up then buy">{{ c.simple_buy or '' }}</textarea>
-                </div>
-                <div class="row"><label style="min-width:140px">SIMPLE Sell</label>
-                  <textarea class="input" name="simple_sell" placeholder="If price below 50 SMA and RSI bounce below 50 and Stochastic crosses down then sell">{{ c.simple_sell or '' }}</textarea>
-                </div>
-
-                <details style="margin:.5rem 0">
-                  <summary class="muted">Advanced JSON (optional)</summary>
-                  <div class="row"><label>buy_rule_json</label>
-                    <textarea class="input" name="buy_rule_json">{{ c.buy_rule|tojson if c.buy_rule else '{}' }}</textarea>
-                  </div>
-                  <div class="row"><label>sell_rule_json</label>
-                    <textarea class="input" name="sell_rule_json">{{ c.sell_rule|tojson if c.sell_rule else '{}' }}</textarea>
-                  </div>
-                </details>
-
-                <div class="row">
-                  <label>Lookback</label><input class="input" name="lookback" type="number" value="{{ c.lookback or 3 }}">
-                </div>
-                <div class="row">
-                  <label>Tolerance %</label><input class="input" name="tol_pct" type="number" step="0.01" value="{{ c.tol_pct or 0.1 }}">
-                </div>
-                <div class="row right"><button class="btn">Save CUSTOM {{c._idx}}</button></div>
-              </form>
+    <!-- Strategies (BASE/TREND/CHOP + CUSTOM1..3) -->
+    <div class="card">
+      <h2>🧠 Strategies</h2>
+      <form method="post" action="{{ url_for('dashboard.update_strategies') }}">
+        <div class="grid">
+          <div class="row">
+            {% for name, conf in strategies_all.items() %}
+              <label><input type="checkbox" name="s_{{ name }}" {% if conf.enabled %}checked{% endif %}/> {{ name }}</label>
             {% endfor %}
           </div>
-
-          <!-- Users -->
-          <div class="card">
-            <h2>Users</h2>
-            <form method="post" action="{{ url_for('dashboard.users_add') }}">
-              <div class="row"><label>Telegram ID</label><input class="input" name="telegram_id" required placeholder="e.g. 123456789"></div>
-              <div class="row"><label>Tier</label>
-                <select name="tier" class="input">
-                  <option value="free">free</option><option value="basic">basic</option>
-                  <option value="pro">pro</option><option value="vip">vip</option>
-                </select>
-              </div>
-              <div class="row"><label>Expires</label><input class="input" name="expires_at" placeholder="YYYY-MM-DD"></div>
-              <div class="row right"><button class="btn">Save User</button></div>
-            </form>
-            {% if users %}
-            <div class="hr"></div>
-            <table>
-              <thead><tr><th>Telegram ID</th><th>Tier</th><th>Expires</th><th></th></tr></thead>
-              <tbody>
-                {% for u in users %}
-                <tr>
-                  <td>{{ u.telegram_id }}</td>
-                  <td>{{ u.tier or '—' }}</td>
-                  <td>{{ u.expires_at or '—' }}</td>
-                  <td style="text-align:right">
-                    <form method="post" action="{{ url_for('dashboard.users_delete') }}" onsubmit="return confirm('Delete {{u.telegram_id}}?')">
-                      <input type="hidden" name="telegram_id" value="{{ u.telegram_id }}">
-                      <button class="btn danger">Delete</button>
-                    </form>
-                  </td>
-                </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-            {% endif %}
+          <div class="row">
+            <span class="badge">Backtest TF</span>
+            <select name="bt_tf">
+              {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+                <option value="{{ tf }}">{{ tf }}</option>
+              {% endfor %}
+            </select>
+            <span class="badge">Backtest Expiry</span>
+            <select name="bt_expiry">
+              {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
+                <option value="{{ e }}">{{ e }}</option>
+              {% endfor %}
+            </select>
+            <button class="btn btn-primary" type="submit">Save</button>
           </div>
+        </div>
+      </form>
+      <div class="hint">Enable multiple strategies; CUSTOM slots are configured below.</div>
+    </div>
 
-        </div> <!-- /left column -->
-
-        <!-- Right column -->
-        <div class="stack">
-
-          <!-- Symbols -->
-          <div class="card">
-            <h2>Symbols</h2>
-            <form method="post" action="{{ url_for('dashboard.update_symbols') }}">
-              <div class="grid cols-2">
+    <!-- Indicators (dynamic from specs) -->
+    <div class="card">
+      <h2>📐 Indicators</h2>
+      <form method="post" action="{{ url_for('dashboard.update_indicators') }}">
+        <div class="grid">
+          {% for key, spec in specs.items() %}
+            {% set conf = indicators.get(key, {}) if indicators else {} %}
+            <div class="row" style="gap:14px; align-items:flex-end">
+              <label><input type="checkbox" name="ind_{{ key }}_enabled" {% if conf.get('enabled') %}checked{% endif %}/> {{ spec.label }}</label>
+              {% for pname, pdef in spec.params.items() %}
                 <div>
-                  <h3 style="margin:0 0 8px">Pocket Option Majors</h3>
-                  <select class="input select-multi" multiple name="symbols_po_multi">
-                    {% for s in available_groups[1]["items"] %}
-                      <option value="{{s}}" {{ 'selected' if s in active_symbols else '' }}>{{s}}</option>
-                    {% endfor %}
-                  </select>
+                  <label>{{ pname }}</label>
+                  <input name="ind_{{ key }}_{{ pname }}" value="{{ conf.get(pname, pdef) }}" style="width:90px"/>
                 </div>
-                <div>
-                  <h3 style="margin:0 0 8px">Deriv FRX</h3>
-                  <select class="input select-multi" multiple name="symbols_deriv_multi">
-                    {% for s in available_groups[0]["items"] %}
-                      <option value="{{s}}" {{ 'selected' if s in active_symbols else '' }}>{{s}}</option>
-                    {% endfor %}
-                  </select>
-                </div>
-              </div>
-              <div class="row">
-                <label>Manual list</label>
-                <input class="input" name="symbols_text" placeholder="EURUSD, GBPUSD or frxEURUSD, frxGBPUSD" value="{{ ', '.join(symbols_raw) if symbols_raw else '' }}">
-              </div>
-              <div class="row">
-                <label></label>
-                <label class="muted"><input type="checkbox" name="convert_po" checked> Convert PO majors to Deriv (EURUSD → frxEURUSD)</label>
-              </div>
-              <div class="row right"><button class="btn">Save Symbols</button></div>
-            </form>
-          </div>
-
-          <!-- Deriv Fetch -->
-          <div class="card">
-            <h2>Deriv Fetch</h2>
-            <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
-              <div class="row"><label>Symbols</label><input class="input" name="fetch_symbols" placeholder="frxEURUSD frxGBPUSD or EURUSD GBPUSD"></div>
-              <div class="row">
-                <label>TF</label>
-                <select name="fetch_tf" class="input">
-                  {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                    <option value="{{t}}">{{t}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="row"><label>Count</label><input class="input" type="number" name="fetch_count" value="300"></div>
-              <div class="row"><label></label><label class="muted"><input type="checkbox" name="convert_po_fetch" checked> Convert PO → Deriv</label></div>
-              <div class="row right"><button class="btn">Pull from Deriv</button></div>
-            </form>
-          </div>
-
-          <!-- Backtest -->
-          <div class="card">
-            <h2>Backtest</h2>
-            <form method="post" enctype="multipart/form-data" action="{{ url_for('dashboard.backtest') }}" id="bt_form">
-              <div class="row">
-                <label>Symbols</label>
-                <select class="input select-multi" multiple name="bt_symbols_multi">
-                  <optgroup label="Deriv (ALL)">
-                    <option value="ALL_DERIV">ALL_DERIV</option>
-                    {% for s in available_groups[0]["items"] %}
-                      <option value="{{s}}">{{s}}</option>
-                    {% endfor %}
-                  </optgroup>
-                  <optgroup label="PO Majors (ALL)">
-                    <option value="ALL_PO">ALL_PO</option>
-                    {% for s in available_groups[1]["items"] %}
-                      <option value="{{s}}">{{s}}</option>
-                    {% endfor %}
-                  </optgroup>
-                </select>
-              </div>
-              <div class="row"><label>Or manual</label><input class="input" name="bt_symbols" placeholder="space/comma separated; supports ALL, ALL_PO, ALL_DERIV"></div>
-              <div class="row">
-                <label>TF</label>
-                <select name="bt_tf" class="input">
-                  {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                    <option value="{{t}}" {{ 'selected' if t=='M5' else '' }}>{{t}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="row">
-                <label>Expiry</label>
-                <select name="bt_expiry" class="input">
-                  {% for e in ['1m','3m','5m','10m','15m','30m','H1','H4'] %}
-                    <option value="{{e}}" {{ 'selected' if e=='5m' else '' }}>{{e}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="row">
-                <label>Strategy</label>
-                <select name="bt_strategy" class="input">
-                  <option>BASE</option><option>TREND</option><option>CHOP</option>
-                  <option>CUSTOM1</option><option>CUSTOM2</option><option>CUSTOM3</option>
-                </select>
-              </div>
-              <div class="row"><label>Server candles</label><label class="muted"><input type="checkbox" name="use_server" checked> Use server CSV (fetch if needed)</label></div>
-              <div class="row"><label>Count</label><input class="input" type="number" name="bt_count" value="300"></div>
-              <div class="row"><label>CSV upload</label><input class="input" type="file" name="bt_csv" accept=".csv"></div>
-              <div class="row"><label></label><label class="muted"><input type="checkbox" name="convert_po_bt" checked> Convert PO → Deriv</label></div>
-              <div class="row right">
-                <button class="btn">Run Backtest</button>
-                <button type="button" class="btn secondary" onclick="openChart()" {% if not bt or not bt.plot_url %}disabled{% endif %}>Open Last Chart</button>
-              </div>
-            </form>
-
-            {% if bt %}
-              <div class="hr"></div>
-              {% if bt.error %}
-                <div class="flash err"><strong>Error:</strong> {{ bt.error }}</div>
-              {% else %}
-                <div class="kpi">
-                  <span class="pill">TF: {{ bt.tf }}</span>
-                  <span class="pill">Expiry: {{ bt.expiry }}</span>
-                  <span class="pill">Strategy: {{ bt.strategy }}</span>
-                  <span class="pill">Trades: {{ bt.summary.trades }}</span>
-                  <span class="pill">Wins: {{ bt.summary.wins }}</span>
-                  <span class="pill">Losses: {{ bt.summary.losses }}</span>
-                  <span class="pill">Winrate: {{ '%.2f'|format(bt.summary.winrate) }}%</span>
-                </div>
-
-                {% if bt.plot_url %}
-                  <div class="hr"></div>
-                  <div class="row right">
-                    <a class="btn secondary" href="{{ bt.plot_url }}" target="_blank" rel="noopener">Open Last Chart</a>
-                  </div>
-                  <img class="chart" src="{{ bt.plot_url }}" alt="Backtest chart">
-                {% endif %}
-
-                <div class="hr"></div>
-                <table>
-                  <thead><tr><th>Symbol</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Win%</th></tr></thead>
-                  <tbody>
-                    {% for r in bt.results %}
-                      <tr>
-                        <td>{{ r.symbol }}</td>
-                        <td>{{ r.trades }}</td>
-                        <td style="color:var(--ok)">{{ r.wins }}</td>
-                        <td style="color:var(--err)">{{ r.losses }}</td>
-                        <td>{{ r.draws }}</td>
-                        <td>{{ '%.2f'|format(r.winrate) }}%</td>
-                      </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-                {% if bt.warnings %}
-                  <div class="flash warn" style="margin-top:10px">
-                    <div><strong>Warnings</strong></div>
-                    <ul>
-                      {% for w in bt.warnings %}<li>{{ w }}</li>{% endfor %}
-                    </ul>
-                  </div>
-                {% endif %}
-              {% endif %}
-            {% endif %}
-          </div>
-
-          <!-- Live engine -->
-          <div class="card">
-            <h2>Live Engine</h2>
-            <div class="row">
-              <form method="get" action="{{ url_for('dashboard.live_start') }}"><button class="btn ok">Start</button></form>
-              <form class="right" method="post" action="{{ url_for('dashboard.live_stop') }}" style="margin-left:auto">
-                <button class="btn danger">Stop</button>
-              </form>
-              <a class="btn secondary" href="{{ url_for('dashboard.live_debug', state='on') }}">Debug ON</a>
-              <a class="btn secondary" href="{{ url_for('dashboard.live_debug', state='off') }}">Debug OFF</a>
+              {% endfor %}
             </div>
-            <div class="hr"></div>
-            <pre id="live_status" style="white-space:pre-wrap;background:#0b1220;border:1px solid #223152;border-radius:10px;padding:10px;max-height:220px;overflow:auto">Loading status…</pre>
-          </div>
+          {% endfor %}
+          <button class="btn btn-primary" type="submit">Save Indicators</button>
+        </div>
+      </form>
+      <div class="legend">Tip: For MAs enter exact period numbers. RSI/Stoch respect their periods and K/D/smoothing.</div>
+    </div>
 
-          <!-- Telegram diag -->
+    <!-- Custom #1 -->
+    {% for c in customs %}
+    <div class="card">
+      <h2>🛠️ Custom #{{ c._idx }}</h2>
+      <form method="post" action="{{ url_for('dashboard.update_custom') }}">
+        <input type="hidden" name="slot" value="{{ c._idx }}"/>
+        <div class="row">
+          <label><input type="checkbox" name="enabled" {% if c.get('enabled') %}checked{% endif %}/> Enabled</label>
+          <label>Mode</label>
+          <select name="mode">
+            <option value="SIMPLE" {% if c.get('mode','SIMPLE')=='SIMPLE' %}selected{% endif %}>SIMPLE (English)</option>
+            <option value="ADV" {% if c.get('mode')=='ADV' %}selected{% endif %}>ADV (JSON)</option>
+          </select>
+          <label>Tolerance %</label><input name="tol_pct" value="{{ c.get('tol_pct',0.1) }}" style="width:90px"/>
+          <label>Lookback</label><input name="lookback" value="{{ c.get('lookback',3) }}" style="width:70px"/>
+          <button class="btn btn-primary" type="submit">Save</button>
+        </div>
+        <div class="sep"></div>
+        <div>
+          <label>Simple BUY rule (English)</label>
+          <textarea name="simple_buy" placeholder="If price respects 50 SMA and RSI bounces off 50 and Stoch crosses up then BUY">{{ c.get('simple_buy','') }}</textarea>
+          <label>Simple SELL rule (English)</label>
+          <textarea name="simple_sell" placeholder="If price rejects 50 SMA and RSI rejects 50 and Stoch crosses down then SELL">{{ c.get('simple_sell','') }}</textarea>
+        </div>
+        <div class="sep"></div>
+        <div>
+          <label>Advanced BUY JSON</label>
+          <textarea name="buy_rule_json" placeholder='{"all":[{"sma_above":{"period":50}},{"rsi_bounce":{"period":14,"level":50}}]}' >{{ c.get('buy_rule')|tojson }}</textarea>
+          <label>Advanced SELL JSON</label>
+          <textarea name="sell_rule_json" placeholder='{"all":[{"sma_below":{"period":50}},{"rsi_reject":{"period":14,"level":50}}]}' >{{ c.get('sell_rule')|tojson }}</textarea>
+        </div>
+      </form>
+    </div>
+    {% endfor %}
+
+    <!-- Symbols: PO + Deriv + free text -->
+    <div class="card">
+      <h2>🔢 Symbols</h2>
+      <form method="post" action="{{ url_for('dashboard.update_symbols') }}">
+        <div class="grid g2">
+          <div>
+            <label>Pocket Option majors</label>
+            <select name="symbols_po_multi" multiple size="10" style="width:100%">
+              {% for s in available_groups[1].items %}
+                <option value="{{ s }}" {% if s in symbols_raw %}selected{% endif %}>{{ s }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label>Deriv (frx*)</label>
+            <select name="symbols_deriv_multi" multiple size="10" style="width:100%">
+              {% for s in available_groups[0].items %}
+                <option value="{{ s }}" {% if s in symbols_raw %}selected{% endif %}>{{ s }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div class="sep"></div>
+        <label>Free text (comma/space separated). Use <code>ALL</code> or <code>ALL_PO</code> / <code>ALL_DERIV</code>.</label>
+        <textarea name="symbols_text">{{ (symbols_raw|join(' ')) if symbols_raw else '' }}</textarea>
+        <div class="row">
+          <label><input type="checkbox" name="convert_po" checked/> Convert PO → Deriv (e.g. EURUSD → frxEURUSD)</label>
+          <button class="btn btn-primary" type="submit">Save Symbols</button>
+        </div>
+        <div class="hint">Active: {{ active_symbols|join(', ') if active_symbols else '(none)' }}</div>
+      </form>
+    </div>
+
+    <!-- Deriv fetch (optional helper) -->
+    <div class="card">
+      <h2>⬇️ Deriv Fetch (Optional)</h2>
+      <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
+        <div class="row">
+          <label>Symbols</label><input name="fetch_symbols" placeholder="frxEURUSD frxGBPUSD or EURUSD (use convert)" style="min-width:320px"/>
+        </div>
+        <div class="row">
+          <label>TF</label>
+          <select name="fetch_tf">
+            {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+              <option value="{{ tf }}">{{ tf }}</option>
+            {% endfor %}
+          </select>
+          <label>Count</label><input name="fetch_count" value="300" style="width:90px"/>
+          <label><input type="checkbox" name="convert_po_fetch" checked/> Convert PO → Deriv</label>
+          <button class="btn" type="submit">Fetch & Save CSV</button>
+        </div>
+        <div class="hint">Requires <code>data_fetch.py</code> with <code>fetch_one_symbol</code> & <code>deriv_csv_path</code>.</div>
+      </form>
+    </div>
+
+    <!-- Backtest -->
+    <div class="card" style="grid-column:1/-1">
+      <h2>🧪 Backtest</h2>
+      <form method="post" action="{{ url_for('dashboard.backtest') }}" enctype="multipart/form-data">
+        <div class="row">
+          <label>TF</label>
+          <select name="bt_tf">
+            {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+              <option value="{{ tf }}">{{ tf }}</option>
+            {% endfor %}
+          </select>
+          <label>Expiry</label>
+          <select name="bt_expiry">
+            {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
+              <option value="{{ e }}">{{ e }}</option>
+            {% endfor %}
+          </select>
+          <label>Strategy</label>
+          <select name="bt_strategy">
+            {% for k in ['BASE','TREND','CHOP','CUSTOM1','CUSTOM2','CUSTOM3'] %}
+              <option value="{{ k }}">{{ k }}</option>
+            {% endfor %}
+          </select>
+          <label>Count</label><input name="bt_count" value="300" style="width:90px"/>
+        </div>
+        <div class="row">
+          <label>Symbols (text)</label>
+          <input name="bt_symbols" placeholder="space/comma separated; use ALL / ALL_PO / ALL_DERIV" style="min-width:360px"/>
+          <label><input type="checkbox" name="convert_po_bt" checked/> Convert PO → Deriv</label>
+          <label><input type="checkbox" name="use_server"/> Pull fresh via helper</label>
+          <input type="file" name="bt_csv" accept=".csv"/>
+          <button class="btn btn-primary" type="submit">Run Backtest</button>
+        </div>
+        <div class="hint">Upload a CSV **or** use saved server CSV (Deriv fetch). Backtest draws price candles, MAs/RSI/Stoch overlays, and marks entry + expiry windows.</div>
+      </form>
+
+      {% set bt = bt or {} %}
+      {% if bt.error %}
+        <div class="flash" style="border-color:#5b1919;color:#ffd1d9">{{ bt.error }}</div>
+      {% endif %}
+      {% if bt.summary %}
+        <div class="grid g3" style="margin-top:10px">
           <div class="card">
-            <h2>Telegram</h2>
-            <form method="post" action="{{ url_for('dashboard.telegram_test') }}">
-              <div class="row"><label>Test message</label><span class="muted">Sends a test to configured chats.</span></div>
-              <div class="row right"><button class="btn">Send Test</button></div>
-            </form>
-            <div class="row"><a class="btn secondary" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Open Diagnostics JSON</a></div>
+            <h3>Summary</h3>
+            <div>Trades: <b>{{ bt.summary.trades }}</b></div>
+            <div>Wins: <b style="color:var(--ok)">{{ bt.summary.wins }}</b></div>
+            <div>Losses: <b style="color:var(--err)">{{ bt.summary.losses }}</b></div>
+            <div>Draws: <b>{{ bt.summary.draws }}</b></div>
+            <div>Winrate: <b>{{ bt.summary.winrate }}%</b></div>
           </div>
+          <div class="card">
+            <h3>Context</h3>
+            <div>Symbol: <b>{{ bt.symbol|default('(multi)') }}</b></div>
+            <div>TF: <b>{{ bt.tf }}</b> &nbsp; Expiry: <b>{{ bt.expiry }}</b></div>
+            <div>Strategy: <b>{{ bt.strategy }}</b></div>
+            {% if bt.warnings %}
+              <div class="sep"></div>
+              <div class="hint">Warnings: {{ bt.warnings|join(' | ') }}</div>
+            {% endif %}
+          </div>
+          <div class="card">
+            <h3>Export</h3>
+            <div class="row">
+              <a class="btn" href="{{ url_for('dashboard.backtest_last_json') }}">JSON</a>
+              <a class="btn" href="{{ url_for('dashboard.backtest_last_csv') }}">CSV</a>
+            </div>
+          </div>
+        </div>
+      {% endif %}
 
-        </div> <!-- /right column -->
+      {% if bt.plot_name %}
+        <div style="margin-top:10px">
+          <img class="plot" src="{{ url_for('dashboard.plot_file', name=bt.plot_name) }}?t={{ (now|replace(':','')|replace(' ','') if now else '') }}" alt="Backtest plot"/>
+          <div class="legend">Plot shows: candles + enabled indicators; ▲ BUY / ▼ SELL at entry; shaded region is expiry window.</div>
+        </div>
+      {% endif %}
+    </div>
 
-      </div> <!-- /grid -->
-    {% endif %}
+    <!-- Live controls -->
+    <div class="card">
+      <h2>🟢 Live Control</h2>
+      <form method="post" action="{{ url_for('dashboard.live_start') }}" class="row">
+        <button class="btn btn-ok" type="submit">Start</button>
+      </form>
+      <div class="row" style="margin-top:6px">
+        <form method="post" action="{{ url_for('dashboard.live_stop') }}"><button class="btn btn-err" type="submit">Stop</button></form>
+        <a class="btn" href="{{ url_for('dashboard.live_status') }}" target="_blank">Status JSON</a>
+        <a class="btn" href="{{ url_for('dashboard.live_tally') }}" target="_blank">Tally JSON</a>
+        <a class="btn" href="{{ url_for('dashboard.live_debug', state='on') }}">Debug ON</a>
+        <a class="btn" href="{{ url_for('dashboard.live_debug', state='off') }}">Debug OFF</a>
+      </div>
+      <div class="hint">Live engine enforces caps per user tier and trading window.</div>
+    </div>
+
+    <!-- Telegram -->
+    <div class="card">
+      <h2>✈️ Telegram</h2>
+      <form method="post" action="{{ url_for('dashboard.telegram_test') }}" class="row">
+        <button class="btn" type="submit">Send Test</button>
+        <a class="btn" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Diagnostics</a>
+      </form>
+      <div class="hint">Ensure <code>TELEGRAM_BOT_TOKEN</code> and your <code>TELEGRAM_CHAT_ID_*</code> env vars are set.</div>
+    </div>
+
+    <!-- Users -->
+    <div class="card" style="grid-column:1/-1">
+      <h2>👥 Users</h2>
+      <form method="post" action="{{ url_for('dashboard.users_add') }}" class="row">
+        <label>Telegram ID</label><input name="telegram_id" placeholder="123456789"/>
+        <label>Tier</label>
+        <select name="tier">
+          <option value="free">free</option>
+          <option value="basic">basic</option>
+          <option value="pro">pro</option>
+          <option value="vip">vip</option>
+        </select>
+        <label>Expires (YYYY-MM-DD)</label><input name="expires_at" placeholder="2025-12-31" style="width:130px"/>
+        <button class="btn btn-primary" type="submit">Add/Update</button>
+      </form>
+      <div class="sep"></div>
+      <table class="table">
+        <thead><tr><th>Telegram ID</th><th>Tier</th><th>Expires</th><th></th></tr></thead>
+        <tbody>
+          {% for u in users %}
+            <tr>
+              <td>{{ u.telegram_id }}</td>
+              <td>{{ u.tier }}</td>
+              <td>{{ u.expires_at or '—' }}</td>
+              <td>
+                <form method="post" action="{{ url_for('dashboard.users_delete') }}">
+                  <input type="hidden" name="telegram_id" value="{{ u.telegram_id }}"/>
+                  <button class="btn btn-err" type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          {% if not users or users|length==0 %}
+            <tr><td colspan="4" class="muted">No users yet.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+
   </div>
+  {% endif %}
 
-  <script>
-    function openChart(){
-      const url = "{{ bt.plot_url if bt and bt.plot_url else '' }}";
-      if(!url){ alert('No chart yet. Run a backtest first.'); return; }
-      window.open(url, '_blank', 'noopener');
-    }
-    async function refreshStatus(){
-      try{
-        const r = await fetch('{{ url_for("dashboard.live_status") }}');
-        const j = await r.json();
-        document.getElementById('live_status').textContent = JSON.stringify(j, null, 2);
-      }catch(e){
-        document.getElementById('live_status').textContent = 'Status error: '+e;
-      }
-    }
-    refreshStatus(); setInterval(refreshStatus, 10000);
-  </script>
+</div>
 </body>
 </html>
