@@ -1,9 +1,9 @@
-# routes.py — FULL BUILD (fixed)
+# routes.py — FULL BUILD
 # Features:
 # - Dashboard: window (08:00–17:00 TT), TF/expiry, strategies (BASE/TREND/CHOP + CUSTOM1..3),
-#   indicators (SMA/EMA/WMA/SMMA/TMA/RSI/Stoch with periods & toggles),
-#   multi-symbol selectors (PO majors + Deriv frx*) + free text + PO→Deriv auto-convert.
-# - Backtest: multi-symbol, server CSV or uploaded CSV, price candles + MA/RSI/Stoch overlays,
+#   indicators (entire catalog via pandas_ta), multi-symbol selectors (PO majors + Deriv frx*)
+#   + free text + PO→Deriv auto-convert.
+# - Backtest: multi-symbol, server CSV or uploaded CSV, price candles + all overlays/panels,
 #   BUY/SELL markers + shaded expiry, JSON/CSV export, plot served with no-cache.
 # - Live engine: start/stop/debug/status, tally endpoint.
 # - Telegram: test & diag.
@@ -35,15 +35,9 @@ import matplotlib.dates as mdates
 
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
-# --- Project modules (avoid circular imports by importing here) ---------------
-from utils import exec_sql, get_config, set_config, within_window, TZ
-try:
-    # TIMEZONE is optional; if your utils defines it, import, else fall back to TZ.zone
-    from utils import TIMEZONE  # type: ignore
-except Exception:
-    TIMEZONE = getattr(TZ, "zone", "America/Port_of_Spain")
-
-from indicators import INDICATOR_SPECS
+# --- Project modules (import here to avoid circulars) -------------------------
+from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
+from indicators import INDICATOR_SPECS, apply_indicators
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
 from live_engine import ENGINE, tg_test
@@ -58,7 +52,7 @@ except Exception:
 # Ensure plot dir exists
 os.makedirs("static/plots", exist_ok=True)
 
-# ===== Symbol groups ===========================================================
+# ===== Symbol groups ==========================================================
 DERIV_FRX = [
     "frxEURUSD","frxGBPUSD","frxUSDJPY","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD",
     "frxEURGBP","frxEURJPY","frxEURCHF","frxEURAUD","frxGBPAUD","frxGBPJPY","frxGBPNZD",
@@ -71,9 +65,10 @@ AVAILABLE_GROUPS = [
     {"label": "Pocket Option majors", "items": PO_MAJOR},
 ]
 
-# ===== Small helpers ===========================================================
+# ===== Small helpers ==========================================================
 def _cfg_dict(x):
-    if isinstance(x, dict): return x
+    if isinstance(x, dict):
+        return x
     if isinstance(x, str):
         try:
             j = json.loads(x)
@@ -85,9 +80,11 @@ def _cfg_dict(x):
 def _merge_unique(xs):
     out, seen = [], set()
     for x in xs:
-        if not x: continue
+        if not x:
+            continue
         if x not in seen:
-            out.append(x); seen.add(x)
+            out.append(x)
+            seen.add(x)
     return out
 
 def _is_po_symbol(sym: str) -> bool:
@@ -95,9 +92,11 @@ def _is_po_symbol(sym: str) -> bool:
     return s in PO_MAJOR or bool(re.fullmatch(r"[A-Z]{6}", s))
 
 def _to_deriv(sym: str) -> str:
-    if not sym: return sym
+    if not sym:
+        return sym
     s = sym.strip()
-    if s.startswith("frx"): return s
+    if s.startswith("frx"):
+        return s
     sU = s.upper().replace("/", "")
     return "frx" + sU if _is_po_symbol(sU) else s
 
@@ -113,67 +112,7 @@ def _expand_all_symbols(tokens):
             out.append(t)
     return _merge_unique(out)
 
-# ===== Minimal indicators for plotting (overlays only) ========================
-def _sma(s, p):   return s.rolling(int(p), min_periods=1).mean()
-def _ema(s, p):   return s.ewm(span=int(p), adjust=False).mean()
-def _wma(s, p):
-    p=int(p)
-    w=pd.Series(range(1, p+1), dtype=float)
-    return s.rolling(p).apply(lambda x: (w.to_numpy()*x).sum()/w.sum(), raw=True)
-def _smma(s, p):  return s.ewm(alpha=1.0/float(p), adjust=False).mean()
-def _tma(s, p):
-    p=int(p)
-    p1=max(1, int(math.ceil(p/2)))
-    return _sma(_sma(s, p1), p)
-
-def _rsi(close, period=14):
-    period=int(period)
-    d=close.diff()
-    gain=d.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    loss=(-d.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs=gain / loss.replace(0, pd.NA)
-    return (100 - (100/(1+rs))).fillna(method="bfill")
-
-def _stoch(h, l, c, k=14, d=3, smooth_k=3):
-    k=int(k); d=int(d); smooth_k=int(smooth_k)
-    ll=l.rolling(k).min(); hh=h.rolling(k).max()
-    K=(c-ll) / (hh-ll).replace(0, pd.NA) * 100
-    K=K.rolling(smooth_k).mean()
-    D=K.rolling(d).mean()
-    return K, D
-
-def _any_on(d):
-    d=_cfg_dict(d)
-    for k in ("sma","ema","wma","smma","tma","rsi","stoch"):
-        if _cfg_dict(d.get(k)).get("enabled"):
-            return True
-    return False
-
-def _compute_lines(df, ind_cfg):
-    ind_cfg=_cfg_dict(ind_cfg)
-    if not _any_on(ind_cfg):
-        ind_cfg={"sma":{"enabled":True,"period":50},"rsi":{"enabled":True,"period":14},
-                 "stoch":{"enabled":True,"k":14,"d":3,"smooth_k":3}}
-    o,h,l,c = df["open"], df["high"], df["low"], df["close"]
-    out={}
-    if ind_cfg.get("sma",{}).get("enabled"):
-        p=int(ind_cfg["sma"].get("period",50)); out[f"SMA({p})"]=_sma(c,p)
-    if ind_cfg.get("ema",{}).get("enabled"):
-        p=int(ind_cfg["ema"].get("period",50)); out[f"EMA({p})"]=_ema(c,p)
-    if ind_cfg.get("wma",{}).get("enabled"):
-        p=int(ind_cfg["wma"].get("period",50)); out[f"WMA({p})"]=_wma(c,p)
-    if ind_cfg.get("smma",{}).get("enabled"):
-        p=int(ind_cfg["smma"].get("period",50)); out[f"SMMA({p})"]=_smma(c,p)
-    if ind_cfg.get("tma",{}).get("enabled"):
-        p=int(ind_cfg["tma"].get("period",50)); out[f"TMA({p})"]=_tma(c,p)
-    if ind_cfg.get("rsi",{}).get("enabled"):
-        p=int(ind_cfg["rsi"].get("period",14)); out[f"RSI({p})"]=_rsi(c,p)
-    if ind_cfg.get("stoch",{}).get("enabled"):
-        kp=int(ind_cfg["stoch"].get("k",14)); dp=int(ind_cfg["stoch"].get("d",3)); sp=int(ind_cfg["stoch"].get("smooth_k",3))
-        k,d=_stoch(h,l,c,kp,dp,sp); out[f"StochK({kp},{dp},{sp})"]=k; out[f"StochD({kp},{dp},{sp})"]=d
-    return out
-
-# ===== Candle plotting with entries/expiry shading ============================
+# ===== Candle plotting + trades/expiry =======================================
 def _draw_candles(ax, df):
     ts=pd.to_datetime(df["timestamp"])
     o,h,l,c=[pd.to_numeric(df[k], errors="coerce") for k in ("open","high","low","close")]
@@ -228,75 +167,163 @@ def _extract_trades(bt, df, expiry):
             out.append({"t":t,"expiry":t+timedelta(seconds=exp_s),"side":side})
     return out
 
-def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars=200):
+def _save_plot(sym, tf, expiry, df_raw, cfg, bt=None, outdir="static/plots", bars=220):
+    """Compute enabled indicators, then plot dynamically on price + panels."""
     os.makedirs(outdir, exist_ok=True)
-    ds=df.copy()
-    ds["timestamp"]=pd.to_datetime(ds["timestamp"])
-    for k in ("open","high","low","close"):
-        ds[k]=pd.to_numeric(ds[k], errors="coerce")
-    ds=ds.dropna(subset=["open","high","close"]).sort_values("timestamp").tail(bars)
 
-    lines=_compute_lines(ds, ind_cfg)
-    has_rsi=any(name.startswith("RSI(") for name in lines)
-    has_sto=any(name.startswith("Stoch") for name in lines)
-    rows=1 + (1 if has_rsi else 0) + (1 if has_sto else 0)
+    df = df_raw.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    for c in ("open","high","low","close"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["open","high","close"]).sort_values("timestamp").tail(bars).reset_index(drop=True)
+
+    # compute indicators
+    df = apply_indicators(df, cfg)
+
+    # enabled indicators
+    enabled = {k:v for k,v in (cfg.get("indicators") or {}).items() if v.get("enabled")}
+    overlays = [k for k in enabled if INDICATOR_SPECS.get(k,{}).get("kind")=="overlay"]
+    panels   = [k for k in enabled if INDICATOR_SPECS.get(k,{}).get("kind")=="panel"]
+
+    # defaults if nothing selected
+    if not overlays and not panels:
+        overlays = ["SMA"]; panels = ["RSI","STOCH"]
+
+    rows = 1 + len(panels)
     fig, axes = plt.subplots(rows, 1, figsize=(14, 3.0*rows+0.8), sharex=True)
-    if rows==1: axes=[axes]
+    if rows == 1: axes = [axes]
+    ax_price = axes[0]
 
-    axp=axes[0]; _draw_candles(axp, ds)
-    ts=ds["timestamp"]
+    # candles
+    _draw_candles(ax_price, df)
+    ts = df["timestamp"]
 
-    # ---- FIXED: corrected parentheses in any() check ----
-    if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
-        for name, s in lines.items():
-            if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
-                axp.plot(ts, s, label=name, linewidth=1.05)
-        if axp.get_legend_handles_labels()[0]:
-            axp.legend(loc="upper left", fontsize=8, ncols=3)
+    # overlays on price
+    def line(ax, y, label=None, ls="-", lw=1.1):
+        ax.plot(ts, y, label=label, linestyle=ls, linewidth=lw)
 
-    axp.set_title(f"{sym} • TF={tf} • Expiry={expiry}")
+    # --------------------- Moving averages (parentheses fix present) ----------
+    if any(name in overlays for name in ("SMA","EMA","WMA","SMMA","TMA","MA")):
+        if "EMA" in overlays and "ema" in df:   line(ax_price, df["ema"], "EMA")
+        if "SMA" in overlays and "sma" in df:   line(ax_price, df["sma"], "SMA")
+        if "WMA" in overlays and "wma" in df:   line(ax_price, df["wma"], "WMA")
+        if "SMMA" in overlays and "smma" in df: line(ax_price, df["smma"], "SMMA")
+        if "TMA" in overlays and "tma" in df:   line(ax_price, df["tma"], "TMA")
+        if "MA"  in overlays and "ma"  in df:   line(ax_price, df["ma"],  "MA")
 
-    # trades overlay
+    # Bands / Channels
+    if "BB" in overlays and {"bb_low","bb_mid","bb_high"}.issubset(df.columns):
+        line(ax_price, df["bb_mid"], "BB mid", lw=1.0)
+        ax_price.fill_between(ts, df["bb_low"], df["bb_high"], alpha=.08, label="BB")
+    if "KC" in overlays and {"kc_low","kc_mid","kc_high"}.issubset(df.columns):
+        line(ax_price, df["kc_mid"], "KC mid", lw=1.0)
+        ax_price.fill_between(ts, df["kc_low"], df["kc_high"], alpha=.06, label="KC")
+    if "DON" in overlays and {"don_low","don_mid","don_high"}.issubset(df.columns):
+        line(ax_price, df["don_mid"], "Donchian mid", lw=1.0)
+        ax_price.fill_between(ts, df["don_low"], df["don_high"], alpha=.05, label="Don")
+    if "ENV" in overlays and {"env_low","env_mid","env_high"}.issubset(df.columns):
+        line(ax_price, df["env_mid"], "Envelopes mid", lw=1.0)
+        ax_price.fill_between(ts, df["env_low"], df["env_high"], alpha=.05, label="Env")
+
+    # Signals / special overlays
+    if "PSAR" in overlays and "psar" in df:
+        ax_price.scatter(ts, df["psar"], s=6, label="PSAR")
+    if "ICHI" in overlays:
+        if "ichi_tenkan" in df: line(ax_price, df["ichi_tenkan"], "Tenkan", lw=.9)
+        if "ichi_kijun" in df:  line(ax_price, df["ichi_kijun"], "Kijun",  lw=.9)
+        if "ichi_senkou_a" in df and "ichi_senkou_b" in df:
+            ax_price.fill_between(ts, df["ichi_senkou_a"], df["ichi_senkou_b"], alpha=.05, label="Kumo")
+    if "FRACTAL" in overlays:
+        if "fractal_high" in df: ax_price.scatter(ts, df["fractal_high"], s=8, label="FractalH")
+        if "fractal_low" in df:  ax_price.scatter(ts, df["fractal_low"],  s=8, label="FractalL")
+    if "FCB" in overlays and {"fcb_low","fcb_high"}.issubset(df.columns):
+        ax_price.fill_between(ts, df["fcb_low"], df["fcb_high"], alpha=.04, label="FCB")
+    if "ALLIGATOR" in overlays:
+        for nm in ("jaw","teeth","lips"):
+            if nm in df: line(ax_price, df[nm], nm.capitalize(), lw=.9)
+    if "ZIGZAG" in overlays and "zigzag" in df:
+        ax_price.plot(ts, df["zigzag"], linewidth=1.0, alpha=.7, label="ZigZag", linestyle="--")
+
+    if ax_price.get_legend_handles_labels()[0]:
+        ax_price.legend(loc="upper left", fontsize=8, ncols=3)
+    ax_price.set_title(f"{sym} • TF={tf} • Expiry={expiry}")
+
+    # panels
+    row = 1
+    for key in panels:
+        ax = axes[row]; row += 1
+        ax.grid(True, alpha=.15); ax.set_ylabel(key)
+
+        if key=="RSI" and "rsi" in df:
+            ax.plot(ts, df["rsi"], linewidth=1.0, label="RSI")
+            ax.axhline(70, color="#aa4444", linewidth=.7); ax.axhline(30, color="#44aa44", linewidth=.7)
+            ax.axhline(50, color="#888888", linewidth=.7); ax.set_ylim(0,100)
+        elif key=="STOCH" and {"stoch_k","stoch_d"}.issubset(df.columns):
+            ax.plot(ts, df["stoch_k"], linewidth=1.0, label="%K")
+            ax.plot(ts, df["stoch_d"], linewidth=1.0, linestyle="--", label="%D")
+            ax.axhline(80, color="#aa4444", linewidth=.7); ax.axhline(20, color="#44aa44", linewidth=.7)
+            ax.set_ylim(0,100)
+        elif key=="MACD" and {"macd","macd_signal","macd_hist"}.issubset(df.columns):
+            ax.plot(ts, df["macd"], label="MACD", linewidth=1.0)
+            ax.plot(ts, df["macd_signal"], label="Signal", linewidth=1.0, linestyle="--")
+            ax.bar(ts, df["macd_hist"], width=0.002, alpha=.3, label="Hist")
+        elif key=="OSMA" and "osma" in df:
+            ax.plot(ts, df["osma"], label="OsMA", linewidth=1.0)
+        elif key=="ADX" and "adx" in df:
+            ax.plot(ts, df["adx"], label="ADX", linewidth=1.0)
+        elif key=="ATR" and "atr" in df:
+            ax.plot(ts, df["atr"], label="ATR", linewidth=1.0)
+        elif key=="AROON" and {"aroon_up","aroon_down"}.issubset(df.columns):
+            ax.plot(ts, df["aroon_up"], label="Up", linewidth=1.0)
+            ax.plot(ts, df["aroon_down"], label="Down", linewidth=1.0)
+            if "aroon_osc" in df: ax.plot(ts, df["aroon_osc"], label="Osc", linewidth=.9, linestyle=":")
+        elif key=="VORTEX" and {"vortex_pos","vortex_neg"}.issubset(df.columns):
+            ax.plot(ts, df["vortex_pos"], label="+VI", linewidth=1.0)
+            ax.plot(ts, df["vortex_neg"], label="-VI", linewidth=1.0)
+        elif key=="CCI" and "cci" in df:
+            ax.plot(ts, df["cci"], label="CCI", linewidth=1.0)
+        elif key=="MOM" and "mom" in df:
+            ax.plot(ts, df["mom"], label="Momentum", linewidth=1.0)
+        elif key=="ROC" and "roc" in df:
+            ax.plot(ts, df["roc"], label="ROC", linewidth=1.0)
+        elif key=="WILLR" and "willr" in df:
+            ax.plot(ts, df["willr"], label="%R", linewidth=1.0)
+            ax.axhline(-20, color="#aa4444", linewidth=.7); ax.axhline(-80, color="#44aa44", linewidth=.7)
+        elif key=="AO" and "ao" in df:
+            ax.plot(ts, df["ao"], label="AO", linewidth=1.0)
+        elif key=="AC" and "ac" in df:
+            ax.plot(ts, df["ac"], label="AC", linewidth=1.0)
+        elif key=="STC" and "stc" in df:
+            ax.plot(ts, df["stc"], label="STC", linewidth=1.0)
+        elif key=="BBW" and "bb_width" in df:
+            ax.plot(ts, df["bb_width"], label="BB Width", linewidth=1.0)
+        elif key=="BULL_POWER" and "bull_power" in df:
+            ax.plot(ts, df["bull_power"], label="Bulls Power", linewidth=1.0)
+        elif key=="BEAR_POWER" and "bear_power" in df:
+            ax.plot(ts, df["bear_power"], label="Bears Power", linewidth=1.0)
+
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="upper left", fontsize=8)
+
+    # trades on price
+    trades = _extract_trades(bt, df, expiry) if bt is not None else []
     if trades:
         for tr in trades:
             t=pd.to_datetime(tr["t"]); te=pd.to_datetime(tr["expiry"])
             side=tr["side"].upper(); marker="▲" if side=="BUY" else "▼"
             color="#17c964" if side=="BUY" else "#f31260"
             try:
-                idx=ds["timestamp"].searchsorted(t)
-                y=float(ds["close"].iloc[max(0,min(idx,len(ds)-1))])
+                idx=df["timestamp"].searchsorted(t)
+                y=float(df["close"].iloc[max(0,min(idx,len(df)-1))])
             except Exception:
-                y=float(ds["close"].iloc[-1])
-            axp.annotate(marker, (t,y), color=color, fontsize=11,
-                         ha="center", va="bottom" if side=="BUY" else "top")
-            axp.axvspan(t, te, color=color, alpha=.10)
-    else:
-        axp.text(0.01, 0.02, "No trades in window", transform=axp.transAxes,
-                 fontsize=9, color="#999")
-
-    i=1
-    if has_rsi:
-        ax=axes[i]; i+=1
-        for name, s in lines.items():
-            if name.startswith("RSI("): ax.plot(ts, s, label=name, linewidth=1.0)
-        ax.axhline(50, color="#888", linewidth=.9)
-        ax.axhline(70, color="#aa4444", linewidth=.7)
-        ax.axhline(30, color="#44aa44", linewidth=.7)
-        ax.set_ylim(0,100); ax.set_ylabel("RSI"); ax.grid(True, alpha=.15)
-        if ax.get_legend_handles_labels()[0]: ax.legend(loc="upper left", fontsize=8)
-
-    if has_sto:
-        ax=axes[i]
-        for name, s in lines.items():
-            if name.startswith("StochK("): ax.plot(ts, s, label=name, linewidth=1.0)
-        for name, s in lines.items():
-            if name.startswith("StochD("): ax.plot(ts, s, label=name, linewidth=1.0, linestyle="--")
-        ax.axhline(80, color="#aa4444", linewidth=.7); ax.axhline(20, color="#44aa44", linewidth=.7)
-        ax.set_ylim(0,100); ax.set_ylabel("Stoch"); ax.grid(True, alpha=.15)
-        if ax.get_legend_handles_labels()[0]: ax.legend(loc="upper left", fontsize=8)
+                y=float(df["close"].iloc[-1])
+            ax_price.annotate(marker, (t,y), color=color, fontsize=11,
+                              ha="center", va="bottom" if side=="BUY" else "top")
+            ax_price.axvspan(t, te, color=color, alpha=.10)
 
     fig.autofmt_xdate(); fig.tight_layout()
-    stamp=datetime.utcnow().strftime("%Y%m%d%H%M%S"); name=f"{sym.replace('/','_')}_{tf}_{expiry}_{stamp}_{uuid.uuid4().hex[:6]}.png"
+    stamp=datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    name=f"{sym.replace('/','_')}_{tf}_{expiry}_{stamp}_{uuid.uuid4().hex[:6]}.png"
     path=os.path.join(outdir, name)
     plt.savefig(path, dpi=140); plt.close(fig)
     return name
@@ -392,7 +419,12 @@ def update_strategies():
     for i in (1,2,3):
         box=bool(request.form.get(f"s_CUSTOM{i}")); key=f"custom{i}"
         cfg.setdefault(key, {}); cfg[key]["enabled"]=box; cfg["strategies"][f"CUSTOM{i}"]={"enabled":box}
-    set_config(cfg); flash("Strategies (including CUSTOM) updated."); return redirect(url_for("dashboard.dashboard"))
+    # live/backtest defaults
+    if request.form.get("bt_tf"): cfg["bt_tf"]=request.form.get("bt_tf").upper()
+    if request.form.get("bt_expiry"): cfg["bt_expiry"]=request.form.get("bt_expiry")
+    if request.form.get("live_tf"): cfg["live_tf"]=request.form.get("live_tf").upper()
+    if request.form.get("live_expiry"): cfg["live_expiry"]=request.form.get("live_expiry")
+    set_config(cfg); flash("Strategies & defaults updated."); return redirect(url_for("dashboard.dashboard"))
 
 @bp.route("/update_symbols", methods=["POST"])
 @require_login
@@ -412,6 +444,7 @@ def update_symbols():
 @require_login
 def update_indicators():
     cfg=_cfg_dict(get_config()); inds=_cfg_dict(cfg.get("indicators"))
+    # Loop catalog and capture enabled + params
     for key, spec in INDICATOR_SPECS.items():
         enabled=bool(request.form.get(f"ind_{key}_enabled"))
         inds.setdefault(key, {}); inds[key]["enabled"]=enabled
@@ -421,8 +454,9 @@ def update_indicators():
                 val=request.form.get(fk)
                 try: inds[key][p]=int(val) if re.fullmatch(r"-?\d+", val) else float(val)
                 except Exception: inds[key][p]=val
-        if key=="sma" and "period" not in inds[key]:
-            inds[key]["period"]=spec["params"]["period"]
+        # ensure a sensible default exists
+        for p, dv in spec.get("params", {}).items():
+            inds[key].setdefault(p, dv)
     cfg["indicators"]=inds; set_config(cfg); flash("Indicators updated.")
     return redirect(url_for("dashboard.dashboard"))
 
@@ -499,8 +533,8 @@ def deriv_fetch():
 @require_login
 def backtest():
     cfg=_cfg_dict(get_config())
-    tf=(request.form.get("bt_tf") or "M5").upper()
-    expiry=request.form.get("bt_expiry") or "5m"
+    tf=(request.form.get("bt_tf") or cfg.get("bt_tf","M5")).upper()
+    expiry=request.form.get("bt_expiry") or cfg.get("bt_expiry","5m")
     strategy=(request.form.get("bt_strategy") or "BASE").upper()
 
     use_server=bool(request.form.get("use_server"))
@@ -538,12 +572,7 @@ def backtest():
            "winrate": round((getattr(bt,"winrate",0.0) or 0.0)*100,2) if isinstance(getattr(bt,"winrate",0.0),(int,float)) else 0.0}
         results.append(r)
         for k in ("trades","wins","losses","draws"): summary[k]+=r[k]
-        ind_cfg=_cfg_dict(cfg.get("indicators") or {})
-        if not _any_on(ind_cfg):
-            ind_cfg={"sma":{"enabled":True,"period":50},"rsi":{"enabled":True,"period":14},
-                     "stoch":{"enabled":True,"k":14,"d":3,"smooth_k":3}}
-        trades=_extract_trades(bt, df, expiry)
-        name=_save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars=200)
+        name=_save_plot(sym, tf, expiry, df, cfg, bt=bt, outdir="static/plots", bars=200)
         if first_plot_name is None: first_plot_name=name
 
     try:
@@ -651,3 +680,8 @@ def telegram_diag():
     ok, info = _send_telegram("🧪 Telegram DIAG: test message.")
     masked = token[:9]+"..."+token[-6:] if len(token)>18 else "***"
     return jsonify({"ok":ok,"token_masked":masked,"getMe":getme,"configured_chats":configured,"send_result":info})
+
+# -------------------------------- HEAD root for UptimeRobot -------------------
+@bp.route("/", methods=["HEAD"])
+def head_root():
+    return ("", 200)
