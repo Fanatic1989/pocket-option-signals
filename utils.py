@@ -1,8 +1,9 @@
-# utils.py — config store, TZ, sqlite, Deriv fetch, symbols, backtest helpers, plotting
+# utils.py — config store, TZ, sqlite, Deriv fetch, symbols, backtest helpers, plotting, Telegram helpers
 import os, json, sqlite3, math
 from datetime import datetime, time as dtime, timedelta, timezone
+from typing import Dict, Any, Optional, Tuple
 
-# Timezone exports expected by routes.py
+# ------------------------------- Timezone ------------------------------------
 TIMEZONE = os.getenv("APP_TZ", "America/Port_of_Spain")
 
 try:
@@ -23,9 +24,9 @@ except Exception:
     HAVE_MPLFIN = False
 import matplotlib.pyplot as plt
 
+# ------------------------------- SQLite --------------------------------------
 DB_PATH = os.getenv("SQLITE_PATH", "members.db")
 
-# ------------------------------- SQLite helpers ------------------------------
 def exec_sql(sql, params=(), fetch=False):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     try:
@@ -47,8 +48,11 @@ def get_config() -> dict:
     except: return {}
 
 def set_config(cfg: dict):
-    exec_sql("INSERT INTO app_config(k,v) VALUES('config',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-             (json.dumps(cfg),))
+    exec_sql(
+        "INSERT INTO app_config(k,v) VALUES('config',?) "
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (json.dumps(cfg),)
+    )
 
 # ------------------------------ Trading window -------------------------------
 def within_window(cfg: dict) -> bool:
@@ -282,11 +286,9 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         return out_name
 
     # Fallback: simple matplotlib version (no mplfinance)
-    # Build a minimal OHLC DataFrame for custom candle render
     ds = df.reset_index().rename(columns={"index":"timestamp","Open":"open","High":"high","Low":"low","Close":"close"})
     ds["timestamp"] = pd.to_datetime(ds["time"] if "time" in ds else ds["timestamp"])
     fig, ax = plt.subplots(1,1,figsize=(13,6))
-    # draw simple candles
     import matplotlib.dates as mdates
     ts = mdates.date2num(pd.to_datetime(ds["timestamp"]).dt.to_pydatetime())
     for i,(t,o,h,l,c) in enumerate(zip(ts, ds["open"], ds["high"], ds["low"], ds["close"])):
@@ -294,7 +296,6 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         ax.vlines(t, l, h, color=color, linewidth=1.0, alpha=.9)
         ax.add_patch(plt.Rectangle((t-0.0008, min(o,c)), 0.0016, max(abs(c-o),1e-6),
                                    facecolor=color, edgecolor=color, linewidth=.8, alpha=.95))
-    # markers
     for s in signals:
         i = s["index"]
         if i in df.index:
@@ -318,4 +319,50 @@ def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str)
         s["expiry_idx"] = df.index[exp_pos]
         fixed.append(s)
     stats = evaluate_signals_outcomes(df, fixed)
-    return fixed, stats
+    return fixed, stats  # (bugfix) ensure this returns a tuple
+
+# ============================== Telegram helpers =============================
+import requests
+
+BOT_API_BASE = "https://api.telegram.org/bot"
+
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    return v if (v is not None and v != "") else default
+
+def get_token() -> str:
+    token = _env("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    return token
+
+def bot_url(method: str) -> str:
+    return f"{BOT_API_BASE}{get_token()}/{method}"
+
+def get_chat_id_for_tier(tier: str) -> Optional[str]:
+    t = (tier or "").lower()
+    if t == "free":  return _env("FREE_CHAT_ID")
+    if t == "basic": return _env("BASIC_CHAT_ID")
+    if t == "pro":   return _env("PRO_CHAT_ID")
+    if t == "vip":   return _env("VIP_CHAT_ID")
+    return None
+
+def telegram_get_me() -> Dict[str, Any]:
+    try:
+        r = requests.get(bot_url("getMe"), timeout=12)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def telegram_send_message(chat_id: str, text: str, parse_mode: Optional[str] = None) -> Dict[str, Any]:
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        r = requests.post(bot_url("sendMessage"), json=payload, timeout=15)
+        data = r.json()
+        data["_http_status"] = r.status_code
+        data["_sent_at"] = int(datetime.now(timezone.utc).timestamp())
+        return data
+    except Exception as e:
+        return {"ok": False, "error": str(e), "_sent_at": int(datetime.now(timezone.utc).timestamp())}
