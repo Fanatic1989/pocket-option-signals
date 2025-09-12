@@ -1,9 +1,11 @@
 # utils.py — config store, TZ, sqlite, Deriv fetch (REST + WebSocket fallback),
-# symbols, backtest helpers, plotting
+# symbols, backtest helpers, plotting (clear markers + shaded expiry)
+
 import os, json, sqlite3
 from datetime import datetime, time as dtime, timezone
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------------
 # Timezone
@@ -24,7 +26,6 @@ try:
     HAVE_MPLFIN = True
 except Exception:
     HAVE_MPLFIN = False
-import matplotlib.pyplot as plt
 
 # -----------------------------------------------------------------------------
 # App / DB
@@ -264,7 +265,7 @@ def _fetch_deriv_ws(symbol: str, granularity_sec, days, attempts_log: list) -> p
     if not sym.lower().startswith("frx"):
         attempts_log.append(("ws_symbol_invalid", symbol))
         return None
-    sym = ("frx" + sym[-6:].upper()).upper()  # FRXPAIR
+    sym = ("FRX" + sym[-6:].upper())  # FRXPAIR
 
     gran = safe_int(granularity_sec, 300)
     allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
@@ -331,10 +332,7 @@ EXPIRY_TO_BARS = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
     """
     Robust indicator builder.
-    Accepts period inputs as:
-      - single number or numeric string (e.g. 14, "14")
-      - list/tuple of numbers (e.g. [9, 21, 50])
-      - dict of named numbers (e.g. {"fast":9, "slow":21}) -> uses dict values
+    Accepts period inputs as numbers/strings/lists/tuples/dicts.
     """
     out = {}
     close = df["Close"]
@@ -476,90 +474,128 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
             "win_rate": (wins*100.0/max(1,wins+loss))}
 
 # -----------------------------------------------------------------------------
-# Plotting
+# Plotting — clean, high-contrast (last 180 candles, markers + shaded expiry)
 # -----------------------------------------------------------------------------
-def _limit_df(df: pd.DataFrame, last_n: int = 250) -> pd.DataFrame:
+def _limit_df(df: pd.DataFrame, last_n: int = 180) -> pd.DataFrame:
     if df is None or df.empty: return df
     if len(df) <= last_n: return df
     return df.iloc[-last_n:].copy()
 
 def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
+    """
+    Clean plot:
+      • last 180 candles
+      • BUY(▲)/SELL(▼) markers (large, white edge)
+      • shaded entry→expiry region
+      • RSI/Stochastic lower panel (only if enabled)
+    """
+    import matplotlib.dates as mdates
     os.makedirs("static/plots", exist_ok=True)
+
     if df is None or df.empty:
         out = "empty.png"
-        plt.figure(figsize=(8,2)); plt.text(0.5,0.5,"No data", ha="center"); plt.savefig("static/plots/"+out); plt.close()
+        plt.figure(figsize=(8,2), dpi=160)
+        plt.text(0.5,0.5,"No data", ha="center")
+        plt.savefig(os.path.join("static","plots",out)); plt.close()
         return out
 
-    df = _limit_df(df, 250)
+    df = _limit_df(df, 180)
     ind = compute_indicators(df, indicators or {})
+
     out_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{strategy}_{tf}.png"
     path = os.path.join("static","plots", out_name)
 
+    # ---------- Prefer mplfinance ----------
     if HAVE_MPLFIN:
         addplots = []
-        for name in list(ind.keys()):
+        for name, series in ind.items():
             if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
-                addplots.append(mpf.make_addplot(ind[name], panel=0, width=1.2, alpha=0.9))
-        osc_used = False
-        if "RSI" in ind:
-            addplots.append(mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100), width=1.2)); osc_used = True
-        if "STOCH_K" in ind and "STOCH_D" in ind:
-            addplots.append(mpf.make_addplot(ind["STOCH_K"], panel=1, width=1.0))
-            addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=1, width=1.0)); osc_used = True
+                addplots.append(mpf.make_addplot(series, panel=0, width=1.15, alpha=0.95))
 
-        panels = 2 if osc_used else 1
+        use_osc = ("RSI" in ind) or ("STOCH_K" in ind and "STOCH_D" in ind)
+
+        if "RSI" in ind:
+            addplots.append(
+                mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100),
+                                 width=1.1, secondary_y=False, color="#60a5fa")
+            )
+        if "STOCH_K" in ind and "STOCH_D" in ind:
+            addplots.append(mpf.make_addplot(ind["STOCH_K"], panel=1, width=1.0, color="#22c55e"))
+            addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=1, width=1.0, color="#f59e0b"))
+
+        style = mpf.make_mpf_style(
+            base_mpf_style="yahoo",
+            facecolor="#0b0f17",
+            gridstyle="-",
+            gridcolor="#192132",
+            marketcolors=mpf.make_marketcolors(up="#16a34a", down="#ef4444", wick="inherit", edge="inherit")
+        )
+
         fig, axlist = mpf.plot(
-            df, type="candle",
-            style=mpf.make_mpf_style(
-                base_mpf_style="yahoo",
-                marketcolors=mpf.make_marketcolors(up="#16a34a", down="#dc2626", wick="inherit", edge="inherit")
-            ),
-            addplot=addplots, returnfig=True, volume=False,
-            figsize=(14, 8 if panels==2 else 6),
-            title=f"{strategy} • TF={tf} • Exp={expiry}",
-            panel_ratios=(3,1) if panels==2 else None
+            df, type="candle", style=style, addplot=addplots, returnfig=True,
+            volume=False, figsize=(15, 9 if use_osc else 7),
+            panel_ratios=(3,1) if use_osc else None,
+            tight_layout=True, title=f"{strategy} • TF={tf} • Exp={expiry}"
         )
         ax_price = axlist[0]
 
+        # BUY/SELL markers + shaded expiry
         if signals:
-            buys_x, buys_y, sells_x, sells_y = [], [], [], []
+            buy_x, buy_y, sell_x, sell_y = [], [], [], []
             for s in signals:
-                if s["index"] not in df.index: continue
-                y = float(df.loc[s["index"],"Close"])
-                (buys_x if s["direction"]=="BUY" else sells_x).append(s["index"])
-                (buys_y if s["direction"]=="BUY" else sells_y).append(y)
-                if s.get("expiry_idx") in df.index:
-                    ax_price.axvspan(s["index"], s["expiry_idx"], alpha=.12,
+                idx = s["index"]
+                if idx not in df.index: continue
+                y = float(df.loc[idx,"Close"])
+                if s["direction"] == "BUY":
+                    buy_x.append(idx); buy_y.append(y)
+                else:
+                    sell_x.append(idx); sell_y.append(y)
+                ex = s.get("expiry_idx")
+                if ex in df.index:
+                    ax_price.axvspan(idx, ex, alpha=.15,
                                      color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
-            if buys_x: ax_price.scatter(buys_x, buys_y, marker="^", s=90, zorder=5)
-            if sells_x: ax_price.scatter(sells_x, sells_y, marker="v", s=90, zorder=5)
+            if buy_x:
+                ax_price.scatter(buy_x, buy_y, marker="^", s=120, color="#22c55e",
+                                 edgecolors="white", linewidths=0.6, label="BUY")
+            if sell_x:
+                ax_price.scatter(sell_x, sell_y, marker="v", s=120, color="#ef4444",
+                                 edgecolors="white", linewidths=0.6, label="SELL")
 
-        fig.tight_layout(); fig.savefig(path, dpi=160, bbox_inches="tight"); plt.close(fig)
+        ax_price.grid(True, alpha=.25)
+        ax_price.legend(loc="upper left", frameon=False)
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
         return out_name
 
-    # Fallback matplotlib if mplfinance missing
-    ds = df.reset_index()
-    import matplotlib.dates as mdates
-    ts = mdates.date2num(pd.to_datetime(ds["time"]).dt.to_pydatetime())
-    fig, ax = plt.subplots(1,1,figsize=(14,6))
-    for t,o,h,l,c in zip(ts, ds["Open"], ds["High"], ds["Low"], ds["Close"]):
-        color = "#16a34a" if c>=o else "#dc2626"
-        ax.vlines(t, l, h, color=color, linewidth=1.0, alpha=.9)
-        ax.add_patch(plt.Rectangle((t-0.0018, min(o,c)), 0.0036, max(abs(c-o),1e-6),
-                                   facecolor=color, edgecolor=color, linewidth=.8, alpha=.95))
+    # ---------- Fallback: plain matplotlib ----------
+    fig, ax = plt.subplots(1,1,figsize=(15,7), dpi=200)
+    ts = mdates.date2num(df.index.to_pydatetime())
+    for t,(o,h,l,c) in enumerate(zip(df["Open"], df["High"], df["Low"], df["Close"])):
+        x = ts[t]
+        color = "#16a34a" if c>=o else "#ef4444"
+        ax.vlines(x, l, h, color=color, linewidth=1.0, alpha=.95)
+        ax.add_patch(plt.Rectangle((x-0.0022, min(o,c)), 0.0044, max(abs(c-o),1e-6),
+                                   facecolor=color, edgecolor=color, linewidth=.9, alpha=.95))
     for name, series in ind.items():
         if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
-            ax.plot(series.index, series.values, linewidth=1.2, alpha=.9)
+            ax.plot(series.index, series.values, linewidth=1.25, alpha=.95)
     if signals:
         for s in signals:
-            i = s["index"]
-            if i in df.index:
-                y = float(df.loc[i,"Close"])
-                ax.scatter([mdates.date2num(i)],[y], marker="^" if s["direction"]=="BUY" else "v", s=90, zorder=5)
-                if s.get("expiry_idx") in df.index:
-                    ax.axvspan(i, s["expiry_idx"], alpha=.12, color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
-    ax.set_title(f"{strategy} • TF={tf} • Exp={expiry}"); ax.set_ylabel("Price"); ax.grid(alpha=.25)
-    fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(path, dpi=160, bbox_inches="tight"); plt.close(fig)
+            idx = s["index"]
+            if idx in df.index:
+                y = float(df.loc[idx,"Close"])
+                ax.scatter([mdates.date2num(idx)], [y],
+                           marker="^" if s["direction"]=="BUY" else "v",
+                           s=140, color="#22c55e" if s["direction"]=="BUY" else "#ef4444",
+                           edgecolors="white", linewidths=.6, zorder=5)
+                ex = s.get("expiry_idx")
+                if ex in df.index:
+                    ax.axvspan(mdates.date2num(idx), mdates.date2num(ex),
+                               alpha=.15, color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
+    ax.set_title(f"{strategy} • TF={tf} • Exp={expiry}")
+    ax.set_ylabel("Price"); ax.grid(alpha=.25)
+    fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
     return out_name
 
 # -----------------------------------------------------------------------------
