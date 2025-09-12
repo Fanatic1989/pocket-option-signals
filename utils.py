@@ -1,4 +1,4 @@
-# utils.py — config store, TZ, sqlite, Deriv+Yahoo fetch, symbols, backtest helpers, plotting
+# utils.py — config store, TZ, sqlite, Deriv fetch (REST + WebSocket fallback), symbols, backtest helpers, plotting
 import os, json, sqlite3
 from datetime import datetime, time as dtime, timezone
 import pandas as pd
@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 # App / DB
 # -----------------------------------------------------------------------------
 DB_PATH = os.getenv("SQLITE_PATH", "members.db")
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "99185").strip()  # set your Deriv app id
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "99185").strip()  # your app_id
 
 def exec_sql(sql, params=(), fetch=False):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -108,7 +108,7 @@ def load_csv(csv_file) -> pd.DataFrame:
     return df
 
 # -----------------------------------------------------------------------------
-# Deriv + Yahoo fetch
+# Deriv REST + WebSocket fallback
 # -----------------------------------------------------------------------------
 def _series_from_maybe_dict_col(col):
     s = pd.Series(col)
@@ -154,9 +154,10 @@ def _normalize_ohlc_frame(js: dict) -> pd.DataFrame:
     if out.empty: raise RuntimeError("parsed empty candles")
     return out.set_index("time").sort_index()
 
-def _fetch_deriv_history(symbol: str, granularity_sec: int, days: int, attempts_log: list) -> pd.DataFrame | None:
+def _fetch_deriv_rest(symbol: str, granularity_sec: int, days: int, attempts_log: list) -> pd.DataFrame | None:
+    """Try Deriv REST endpoints. Returns DataFrame or None."""
     import requests
-    # Normalize symbol → frxPAIR and FRXPAIR
+    # Normalize symbol → frxPAIR/FRXPAIR
     sym = (symbol or "").strip()
     if not sym.lower().startswith("frx"):
         sym = PO2DERIV.get(sym.upper(), sym)
@@ -171,7 +172,6 @@ def _fetch_deriv_history(symbol: str, granularity_sec: int, days: int, attempts_
     try: g_in = int(granularity_sec)
     except Exception: g_in = 300
     gran = min(allowed, key=lambda g: abs(g - g_in))
-
     approx = min(2000, max(300, int(days * 86400 // gran)))
 
     def try_request(url, params):
@@ -192,7 +192,7 @@ def _fetch_deriv_history(symbol: str, granularity_sec: int, days: int, attempts_
             df = try_request(base, {"symbol": s, "granularity": gran, "count": approx})
             if df is not None and not df.empty: return df
 
-    # explore/candles (count then range)
+    # api-explorer candles with count then start/end
     for s in candidates:
         df = try_request("https://api.deriv.com/api/explore/candles",
                          {"symbol": s, "granularity": gran, "count": approx})
@@ -204,81 +204,81 @@ def _fetch_deriv_history(symbol: str, granularity_sec: int, days: int, attempts_
         if df is not None and not df.empty: return df
     return None
 
-# ---- Yahoo Finance fallback (no key) ----------------------------------------
-YAHOO_ALLOWED = [
-    ("1m", 60, 7),   # max 7 days
-    ("2m", 120, 60),
-    ("5m", 300, 60),
-    ("15m", 900, 60),
-    ("30m", 1800, 60),
-    ("60m", 3600, 730),
-]
-
-def _nearest_yahoo_interval(gran_s: int):
-    # pick nearest by absolute seconds distance
-    best = min(YAHOO_ALLOWED, key=lambda x: abs(x[1] - int(gran_s)))
-    return best  # (label, seconds, max_days)
-
-def _po_to_yahoo_fx(symbol: str) -> str | None:
-    # Map frxEURUSD -> EURUSD=X
-    base = symbol
-    if symbol.lower().startswith("frx"):
-        base = symbol[-6:]
-    base = base.upper()
-    if len(base) != 6: return None
-    return f"{base}=X"
-
-def _fetch_yahoo_history(symbol: str, granularity_sec: int, days: int, attempts_log: list) -> pd.DataFrame | None:
-    import requests
-    ysym = _po_to_yahoo_fx(symbol)
-    if not ysym:
-        attempts_log.append(("yahoo_symbol_map", "invalid"))
+def _fetch_deriv_ws(symbol: str, granularity_sec: int, days: int, attempts_log: list) -> pd.DataFrame | None:
+    """Use Deriv WebSocket ticks_history(style=candles)."""
+    # Lazy import; if lib missing, we return None and let caller raise a clear error.
+    try:
+        from websocket import create_connection  # websocket-client
+    except Exception as e:
+        attempts_log.append(("websocket-client-missing", str(e)))
         return None
 
-    interval, sec, max_days = _nearest_yahoo_interval(granularity_sec)
-    req_days = max(1, min(days, max_days))
-    range_str = f"{req_days}d"
+    # Normalize symbol to frxPAIR uppercase (what WS examples use)
+    sym = (symbol or "").strip()
+    if not sym.lower().startswith("frx"):
+        sym = PO2DERIV.get(sym.upper(), sym)
+    if not sym.lower().startswith("frx"):
+        attempts_log.append(("ws_symbol_invalid", symbol))
+        return None
+    sym = ("frx" + sym[-6:].upper()).upper()  # FRXPAIR
 
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}"
-    params = {"interval": interval, "range": range_str}
+    # Clamp TF and count
+    allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
+    try: g_in = int(granularity_sec)
+    except Exception: g_in = 300
+    gran = min(allowed, key=lambda g: abs(g - g_in))
+    count = min(2000, max(300, int(days * 86400 // gran)))
+
+    # WS URL
+    appid = int(DERIV_APP_ID) if DERIV_APP_ID.isdigit() else 99185
+    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={appid}"
+
+    # Request payload per Deriv docs:
+    req = {
+        "ticks_history": sym,
+        "adjust_start_time": 1,
+        "count": count,
+        "end": "latest",
+        "granularity": gran,
+        "style": "candles"
+    }
+
     try:
-        r = requests.get(url, params=params, timeout=15)
-        attempts_log.append((url, r.status_code))
-        if not r.ok: return None
-        j = r.json()
-        result = (j.get("chart") or {}).get("result")
-        if not result: return None
-        r0 = result[0]
-        ts = r0.get("timestamp") or []
-        ind = (r0.get("indicators") or {}).get("quote") or []
-        if not ts or not ind: return None
-        q = ind[0]
-        df = pd.DataFrame({
-            "time": pd.to_datetime(pd.Series(ts, dtype="Int64"), unit="s", utc=True),
-            "Open": pd.to_numeric(pd.Series(q.get("open"), dtype="float"), errors="coerce"),
-            "High": pd.to_numeric(pd.Series(q.get("high"), dtype="float"), errors="coerce"),
-            "Low" : pd.to_numeric(pd.Series(q.get("low"),  dtype="float"), errors="coerce"),
-            "Close":pd.to_numeric(pd.Series(q.get("close"),dtype="float"), errors="coerce")
-        }).dropna()
-        if df.empty: return None
-        return df.set_index("time").sort_index()
+        ws = create_connection(ws_url, timeout=15)
+        ws.send(json.dumps(req))
+        raw = ws.recv()
+        ws.close()
     except Exception as e:
-        attempts_log.append(("yahoo_exc", str(e)))
+        attempts_log.append(("ws_connect_error", str(e)))
+        return None
+
+    try:
+        js = json.loads(raw)
+        # Deriv returns {'candles':[...]} or an error {'error':{...}}
+        if js.get("error"):
+            attempts_log.append(("ws_error", js["error"]))
+            return None
+        df = _normalize_ohlc_frame(js)
+        return df
+    except Exception as e:
+        attempts_log.append(("ws_parse_error", str(e)))
         return None
 
 def fetch_deriv_history(symbol: str, granularity_sec: int, days: int = 5) -> pd.DataFrame:
     """
-    Try Deriv first (with DERIV_APP_ID). If it fails (404/region), automatically
-    fall back to Yahoo Finance FX (EURUSD=X, etc.) for intraday candles.
+    Deriv-only fetch:
+      1) Try REST endpoints (with DERIV_APP_ID)
+      2) If 404/blocked, fall back to WebSocket ticks_history(style='candles')
     """
     attempts = []
-    df = _fetch_deriv_history(symbol, granularity_sec, days, attempts)
+    df = _fetch_deriv_rest(symbol, granularity_sec, days, attempts)
     if df is None or df.empty:
-        df = _fetch_yahoo_history(symbol, granularity_sec, days, attempts)
+        df = _fetch_deriv_ws(symbol, granularity_sec, days, attempts)
     if df is None or df.empty:
         raise RuntimeError(
-            f"Deriv/Yahoo fetch failed for symbol={symbol}, granularity={granularity_sec}. "
-            f"Attempts: {attempts}. Tip: upload CSV if the pair is exotic."
+            f"Deriv fetch failed for symbol={symbol}, tf={granularity_sec}. Attempts: {attempts}. "
+            f"Tip: ensure DERIV_APP_ID is valid and symbol exists (e.g. frxEURUSD). "
+            f"You can also uncheck 'Use Deriv server fetch' and upload a CSV."
         )
     return df
 
@@ -380,7 +380,7 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
             "win_rate": (wins*100.0/max(1,wins+loss))}
 
 # -----------------------------------------------------------------------------
-# Plotting (clear)
+# Plotting
 # -----------------------------------------------------------------------------
 def _limit_df(df: pd.DataFrame, last_n: int = 250) -> pd.DataFrame:
     if df is None or df.empty: return df
@@ -441,7 +441,7 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         fig.tight_layout(); fig.savefig(path, dpi=160, bbox_inches="tight"); plt.close(fig)
         return out_name
 
-    # Fallback matplotlib
+    # Fallback matplotlib if mplfinance missing
     ds = df.reset_index()
     import matplotlib.dates as mdates
     ts = mdates.date2num(pd.to_datetime(ds["time"]).dt.to_pydatetime())
