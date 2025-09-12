@@ -1,83 +1,78 @@
-# routes.py — compatibility endpoints for your GitHub dashboard
-from flask import Blueprint, request, jsonify
-from datetime import datetime, timezone
+# app.py — WSGI entrypoint for gunicorn: exports `app`
+import os
+from flask import Flask, jsonify, request
+from routes import bp as dashboard_bp
 from live_engine import ENGINE, tg_test_all, TIER_TO_CHAT, DAILY_CAPS
 
-bp = Blueprint("dashboard", __name__)  # <-- name matches your template url_for(...)
+def create_app() -> Flask:
+    app = Flask(__name__, static_folder="static", template_folder="templates")
+    # Secret key for sessions / flashing
+    app.secret_key = os.getenv("SECRET_KEY", "dev-secret-change-me")
 
-@bp.route("/")
-def home():
-    # Your GitHub dashboard renders its own template; keep the file you already have.
-    # If your app factory renders a different template, point it there.
-    return jsonify({"ok": True, "msg": "Dashboard HTML is served by your existing app template."})
+    # Register dashboard (all UI, backtest, users, /live/* and /telegram/* routes)
+    app.register_blueprint(dashboard_bp, url_prefix="")
 
-# -------- live controls (your JS calls these) --------
-@bp.route("/live/start")
-def live_start():
-    ok, msg = ENGINE.start()
-    return jsonify({"ok": ok, "message": msg, "status": {"state": "RUNNING" if ok else "STOPPED"}})
+    # ---- Minimal JSON API (handy for alt UIs / probes) ----------------------
+    @app.get("/api/status")
+    def api_status():
+        return jsonify(ENGINE.status())
 
-@bp.route("/live/stop")
-def live_stop():
-    ok, msg = ENGINE.stop()
-    return jsonify({"ok": ok, "message": msg, "status": {"state": "STOPPED"}})
+    @app.post("/api/send")
+    def api_send():
+        data = request.get_json(silent=True) or {}
+        tier = (data.get("tier") or "vip").lower()
+        text = data.get("text") or ""
+        res = ENGINE.send_to_tier(tier, text)
+        return jsonify({"result": res, "status": ENGINE.status()})
 
-@bp.route("/live/debug/on")
-def live_dbg_on():
-    ENGINE.set_debug(True)
-    return jsonify({"ok": True, "status": {"debug": True}})
+    @app.post("/api/test/vip")
+    def api_test_vip():
+        data = request.get_json(silent=True) or {}
+        text = data.get("text") or "🧪 VIP test from API"
+        res = ENGINE.send_to_tier("vip", text)
+        return jsonify({"result": res, "status": ENGINE.status()})
 
-@bp.route("/live/debug/off")
-def live_dbg_off():
-    ENGINE.set_debug(False)
-    return jsonify({"ok": True, "status": {"debug": False}})
+    @app.get("/api/check_bot")
+    def api_check_bot():
+        # Quick /getMe plus the configured chat flags
+        import requests
+        token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+        out = {"ok": False, "configured_chats": {k: bool(v) for k, v in TIER_TO_CHAT.items()}}
+        if token:
+            try:
+                r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+                out["getMe"] = r.json()
+                out["ok"] = bool(out["getMe"].get("ok"))
+            except Exception as e:
+                out["getMe"] = {"ok": False, "error": str(e)}
+        return jsonify(out)
 
-@bp.route("/live/status")
-def live_status():
-    st = ENGINE.status()
-    return jsonify({
-        "ok": True,
-        "status": {"state": "RUNNING" if st["running"] else "STOPPED", "debug": st["debug"], "day": st["tally"]["date"]},
-        "detail": st
-    })
+    @app.post("/api/start")
+    def api_start():
+        ok, msg = ENGINE.start()
+        return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
 
-@bp.route("/live/tally")
-def live_tally():
-    t = ENGINE.tally()
-    by = t["by_tier"]
-    return jsonify({"ok": True, "tally": {"free": by["free"], "basic": by["basic"], "pro": by["pro"], "vip": by["vip"], "all": t["total"]}})
+    @app.post("/api/stop")
+    def api_stop():
+        ok, msg = ENGINE.stop()
+        return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
 
-# -------- telegram diagnostics + test (your dashboard buttons) --------
-@bp.route("/telegram/diag")
-def telegram_diag():
-    st = ENGINE.status()
-    return jsonify({
-        "ok": True,
-        "configured_tiers": {k: bool(v) for k, v in TIER_TO_CHAT.items()},
-        "caps": DAILY_CAPS,
-        "last_send_result": st.get("last_send_result"),
-    })
+    @app.post("/api/debug_on")
+    def api_dbg_on():
+        ENGINE.set_debug(True)
+        return jsonify({"ok": True, "status": ENGINE.status()})
 
-@bp.route("/telegram/test", methods=["POST", "GET"])
-def telegram_test():
-    # Sends 1 short test message to each configured tier WITHOUT using caps
-    ok, info_json = tg_test_all()
-    return jsonify({"ok": ok, "result": info_json})
+    @app.post("/api/debug_off")
+    def api_dbg_off():
+        ENGINE.set_debug(False)
+        return jsonify({"ok": True, "status": ENGINE.status()})
 
-# -------- generic send endpoint you can call from forms/tools ---------------
-@bp.route("/telegram/send", methods=["POST"])
-def telegram_send():
-    data = request.get_json(silent=True) or request.form or {}
-    tier = (data.get("tier") or "").lower().strip()
-    text = data.get("text") or ""
-    if tier not in ("free", "basic", "pro", "vip"):
-        return jsonify({"ok": False, "error": "tier must be free/basic/pro/vip"}), 400
-    if not text:
-        return jsonify({"ok": False, "error": "text required"}), 400
-    ok, msg = ENGINE.send_signal(tier, text)
-    return jsonify({"ok": ok, "message": msg, "status": ENGINE.status()})
+    # Health
+    @app.get("/healthz")
+    def healthz():
+        return jsonify({"ok": True, "caps": DAILY_CAPS})
 
-# -------- health --------
-@bp.route("/_up")
-def up():
-    return jsonify({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
+    return app
+
+# Gunicorn entrypoint
+app = create_app()
