@@ -47,8 +47,11 @@ def get_config() -> dict:
     except: return {}
 
 def set_config(cfg: dict):
-    exec_sql("INSERT INTO app_config(k,v) VALUES('config',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-             (json.dumps(cfg),))
+    exec_sql(
+        "INSERT INTO app_config(k,v) VALUES('config',?) "
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        (json.dumps(cfg),)
+    )
 
 # ------------------------------ Trading window -------------------------------
 def within_window(cfg: dict) -> bool:
@@ -97,30 +100,93 @@ def load_csv(csv_file) -> pd.DataFrame:
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
     return df
 
-def fetch_deriv_history(symbol: str, granularity_sec: int, days: int=5) -> pd.DataFrame:
+def fetch_deriv_history(symbol: str, granularity_sec: int, days: int = 5) -> pd.DataFrame:
+    """
+    Fetch OHLC candles for a Deriv (frx*) symbol.
+    - Clamps granularity to what Deriv accepts.
+    - Tries multiple public endpoints with sensible fallbacks.
+    Raises RuntimeError with a helpful message if all attempts fail.
+    """
     import requests
-    end = int(datetime.now(timezone.utc).timestamp())
-    start = end - days*86400
-    # Deriv public candles endpoint (docs: app/explore). 404s → caller handles.
-    url = "https://api.deriv.com/api/explore/candles"
-    params = {"symbol": symbol, "granularity": granularity_sec, "start": start, "end": end}
-    r = requests.get(url, params=params, timeout=15)
-    if not r.ok:
-        raise RuntimeError(f"Deriv HTTP {r.status_code}")
-    js = r.json()
-    rows = js.get("candles") or js.get("history") or []
-    if not rows: raise RuntimeError("empty candles")
-    df = pd.DataFrame(rows)
-    # Normalize common fields
-    epoch = df.get("epoch") if "epoch" in df else df.get("time")
-    out = pd.DataFrame({
-        "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
-        "Open": pd.to_numeric(df.get("open"), errors="coerce"),
-        "High": pd.to_numeric(df.get("high"), errors="coerce"),
-        "Low" : pd.to_numeric(df.get("low"), errors="coerce"),
-        "Close": pd.to_numeric(df.get("close"), errors="coerce"),
-    }).dropna()
-    return out.set_index("time").sort_index()
+
+    # Ensure frx*; convert PO majors if passed
+    sym = (symbol or "").strip()
+    if not sym.startswith("frx"):
+        sym = PO2DERIV.get(sym.upper(), sym)
+
+    # Deriv-accepted granularities (seconds)
+    allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
+    try:
+        g_in = int(granularity_sec)
+    except Exception:
+        g_in = 300
+    if g_in not in allowed:
+        granularity_sec = min(allowed, key=lambda g: abs(g - g_in))
+    else:
+        granularity_sec = g_in
+
+    # number of candles to request when endpoint supports "count"
+    approx = min(2000, max(200, int(days * 86400 // granularity_sec)))
+
+    attempts = []
+
+    def _to_df(js: dict) -> pd.DataFrame:
+        rows = js.get("candles") or js.get("history") or js.get("prices") or js.get("data") or []
+        if not rows:
+            raise RuntimeError("empty candles")
+        df = pd.DataFrame(rows)
+        epoch = df.get("epoch") if "epoch" in df else (df.get("time") or df.get("t"))
+        out = pd.DataFrame({
+            "time": pd.to_datetime(pd.to_numeric(epoch, errors="coerce").astype("Int64"), unit="s", utc=True),
+            "Open": pd.to_numeric(df.get("open")  or df.get("o"), errors="coerce"),
+            "High": pd.to_numeric(df.get("high")  or df.get("h"), errors="coerce"),
+            "Low" : pd.to_numeric(df.get("low")   or df.get("l"), errors="coerce"),
+            "Close":pd.to_numeric(df.get("close") or df.get("c"), errors="coerce"),
+        }).dropna()
+        if out.empty:
+            raise RuntimeError("parsed empty candles")
+        return out.set_index("time").sort_index()
+
+    # Attempt 1: v4 price_history with count
+    try:
+        url = "https://api.deriv.com/api/v4/price_history"
+        params = {"symbol": sym, "granularity": granularity_sec, "count": approx}
+        r = requests.get(url, params=params, timeout=15)
+        attempts.append((url, r.status_code))
+        if r.ok:
+            return _to_df(r.json())
+    except Exception as e:
+        attempts.append(("v4_exc", str(e)))
+
+    # Attempt 2: v3 price_history with count
+    try:
+        url = "https://api.deriv.com/api/v3/price_history"
+        params = {"symbol": sym, "granularity": granularity_sec, "count": approx}
+        r = requests.get(url, params=params, timeout=15)
+        attempts.append((url, r.status_code))
+        if r.ok:
+            return _to_df(r.json())
+    except Exception as e:
+        attempts.append(("v3_exc", str(e)))
+
+    # Attempt 3: older explore/candles with start/end
+    try:
+        end = int(datetime.now(timezone.utc).timestamp())
+        start = end - days * 86400
+        url = "https://api.deriv.com/api/explore/candles"
+        params = {"symbol": sym, "granularity": granularity_sec, "start": start, "end": end}
+        r = requests.get(url, params=params, timeout=15)
+        attempts.append((url, r.status_code))
+        if r.ok:
+            return _to_df(r.json())
+    except Exception as e:
+        attempts.append(("explore_exc", str(e)))
+
+    raise RuntimeError(
+        f"Deriv fetch failed for symbol={sym}, granularity={granularity_sec}. "
+        f"Attempts: {attempts}. Tip: ensure symbol exists (e.g. frxEURUSD) and TF is one of "
+        f"{allowed}. You can also uncheck 'Use Deriv server fetch' and upload a CSV."
+    )
 
 # ----------------------------- Backtest helpers ------------------------------
 EXPIRY_TO_BARS = {
@@ -183,9 +249,9 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         above = close > sma50
         cross_up = (above & (~above.shift(1).fillna(False)))
         cross_dn = ((~above) & (above.shift(1).fillna(False)))
-        for ts, v in cross_up[cross_up].items():
+        for ts, _ in cross_up[cross_up].items():
             add(ts, "BUY", 5)
-        for ts, v in cross_dn[cross_dn].items():
+        for ts, _ in cross_dn[cross_dn].items():
             add(ts, "SELL", 5)
         return signals
 
@@ -254,7 +320,6 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         plt.figure(figsize=(8,2)); plt.text(0.5,0.5,"No data", ha="center"); plt.savefig("static/plots/"+out); plt.close()
         return out
 
-    # keep last N bars for readability
     df = _limit_df(df, 250)
     ind = compute_indicators(df, indicators or {})
 
@@ -263,13 +328,12 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
 
     # ---------- mplfinance version ----------
     if HAVE_MPLFIN:
-        # Prepare overlays
         addplots = []
-        # MAs / overlays
+        # overlays
         for name in list(ind.keys()):
             if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
                 addplots.append(mpf.make_addplot(ind[name], panel=0, width=1.2, alpha=0.9))
-        # Oscillators on panel 1
+        # oscillators
         osc_used = False
         if "RSI" in ind:
             addplots.append(mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100), width=1.2))
@@ -282,7 +346,12 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         panels = 2 if osc_used else 1
         fig, axlist = mpf.plot(
             df, type="candle",
-            style=mpf.make_mpf_style(base_mpf_style="yahoo", marketcolors=mpf.make_marketcolors(up="#16a34a", down="#dc2626", wick="inherit", edge="inherit")),
+            style=mpf.make_mpf_style(
+                base_mpf_style="yahoo",
+                marketcolors=mpf.make_marketcolors(
+                    up="#16a34a", down="#dc2626", wick="inherit", edge="inherit"
+                )
+            ),
             addplot=addplots,
             returnfig=True, volume=False,
             figsize=(14, 8 if panels==2 else 6),
@@ -292,7 +361,7 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         ax_price = axlist[0]
         ax_osc = axlist[2] if panels==2 else None
 
-        # Arrows at entry
+        # entries + shaded expiry
         buy_x=[]; buy_y=[]; sell_x=[]; sell_y=[]
         for s in signals or []:
             if s["index"] not in df.index: continue
@@ -301,14 +370,13 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
                 buy_x.append(s["index"]); buy_y.append(px)
             else:
                 sell_x.append(s["index"]); sell_y.append(px)
-            # shade expiry window
             if s.get("expiry_idx") in df.index:
-                ax_price.axvspan(s["index"], s["expiry_idx"], alpha=0.12, color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
+                ax_price.axvspan(s["index"], s["expiry_idx"], alpha=0.12,
+                                 color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
 
         if buy_x: ax_price.scatter(buy_x, buy_y, marker="^", s=90, zorder=5)
         if sell_x: ax_price.scatter(sell_x, sell_y, marker="v", s=90, zorder=5)
 
-        # Guide lines on RSI/Stoch panel (if present)
         if ax_osc is not None:
             ax_osc.axhline(70, color="#ef4444", lw=1, ls="--", alpha=.4)
             ax_osc.axhline(30, color="#22c55e", lw=1, ls="--", alpha=.4)
@@ -319,32 +387,27 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         plt.close(fig)
         return out_name
 
-    # ---------- Fallback matplotlib (no mplfinance) ----------
-    # Minimal but clear price+osc setup
+    # ---------- Fallback matplotlib ----------
     ds = df.reset_index().rename(columns={"index":"timestamp","Open":"open","High":"high","Low":"low","Close":"close"})
     ds["timestamp"] = pd.to_datetime(ds["time"] if "time" in ds else ds["timestamp"])
     import matplotlib.dates as mdates
     ts = mdates.date2num(pd.to_datetime(ds["timestamp"]).dt.to_pydatetime())
 
-    # Decide rows: 2 if we have RSI/Stoch
     osc_used = ("RSI" in ind) or ("STOCH_K" in ind and "STOCH_D" in ind)
     fig_h = 8 if osc_used else 6
     fig, ax = plt.subplots(2 if osc_used else 1, 1, figsize=(14, fig_h), sharex=True,
                            gridspec_kw={"height_ratios":[3,1]} if osc_used else None)
     ax_price = ax[0] if osc_used else ax
 
-    # draw candles
     for i,(t,o,h,l,c) in enumerate(zip(ts, ds["open"], ds["high"], ds["low"], ds["close"])):
         color = "#16a34a" if c>=o else "#dc2626"
         ax_price.vlines(t, l, h, color=color, linewidth=1.0, alpha=.9)
         ax_price.add_patch(plt.Rectangle((t-0.0018, min(o,c)), 0.0036, max(abs(c-o),1e-6),
                                    facecolor=color, edgecolor=color, linewidth=.8, alpha=.95))
-    # overlays
     for name, series in ind.items():
         if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
             ax_price.plot(series.index, series.values, linewidth=1.2, alpha=.9)
 
-    # entries + shaded expiry
     for s in signals or []:
         i = s["index"]
         if i in df.index:
