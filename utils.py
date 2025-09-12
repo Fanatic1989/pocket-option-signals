@@ -4,7 +4,9 @@ from datetime import datetime, time as dtime, timezone
 import pandas as pd
 import numpy as np
 
-# Timezone exports expected by routes.py
+# -----------------------------------------------------------------------------
+# Timezone
+# -----------------------------------------------------------------------------
 TIMEZONE = os.getenv("APP_TZ", "America/Port_of_Spain")
 try:
     import pytz
@@ -13,7 +15,9 @@ except Exception:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo(TIMEZONE)
 
+# -----------------------------------------------------------------------------
 # Optional mplfinance
+# -----------------------------------------------------------------------------
 try:
     import mplfinance as mpf
     HAVE_MPLFIN = True
@@ -21,9 +25,12 @@ except Exception:
     HAVE_MPLFIN = False
 import matplotlib.pyplot as plt
 
+# -----------------------------------------------------------------------------
+# App / DB
+# -----------------------------------------------------------------------------
 DB_PATH = os.getenv("SQLITE_PATH", "members.db")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "99185").strip()  # <- your app id
 
-# ------------------------------- SQLite helpers ------------------------------
 def exec_sql(sql, params=(), fetch=False):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     try:
@@ -51,7 +58,9 @@ def set_config(cfg: dict):
         (json.dumps(cfg),)
     )
 
-# ------------------------------ Trading window -------------------------------
+# -----------------------------------------------------------------------------
+# Trading window
+# -----------------------------------------------------------------------------
 def within_window(cfg: dict) -> bool:
     w = cfg.get("window") or {}
     start = w.get("start") or cfg.get("window_start","08:00")
@@ -61,7 +70,9 @@ def within_window(cfg: dict) -> bool:
     e_h,e_m = [int(x) for x in (end   or "17:00").split(":")[:2]]
     return dtime(s_h,s_m) <= now_tt <= dtime(e_h,e_m)
 
-# ----------------------------- Symbols & mapping -----------------------------
+# -----------------------------------------------------------------------------
+# Symbols & mapping
+# -----------------------------------------------------------------------------
 PO_PAIRS = [
   "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD",
   "EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"
@@ -77,11 +88,13 @@ def convert_po_to_deriv(symbols):
     out = []
     for s in symbols:
         s = (s or "").strip().upper()
-        if s.startswith("FRX") or s.startswith("frx"): out.append("frx"+s[-6:])
+        if s.startswith(("FRX","frx")): out.append("frx"+s[-6:])
         else: out.append(PO2DERIV.get(s, s))
     return out
 
-# ----------------------------- Data loading/fetch ----------------------------
+# -----------------------------------------------------------------------------
+# CSV loader
+# -----------------------------------------------------------------------------
 def load_csv(csv_file) -> pd.DataFrame:
     df = pd.read_csv(csv_file)
     cols = {c.lower(): c for c in df.columns}
@@ -94,15 +107,12 @@ def load_csv(csv_file) -> pd.DataFrame:
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
     return df
 
-# ---------- Robust Deriv fetch ----------
+# -----------------------------------------------------------------------------
+# Deriv fetch (robust, adds app_id to every request)
+# -----------------------------------------------------------------------------
 def _series_from_maybe_dict_col(col):
-    """
-    Deriv sometimes returns nested dicts for epoch/time or ohlc values.
-    This function extracts number-like fields robustly.
-    """
     s = pd.Series(col)
     if s.dtype == "O":
-        # dict rows? pull 'epoch' or 'time' for time-like; or numeric at 'open'/'high'/...
         def pick(v):
             if isinstance(v, (int, float, np.integer, np.floating, str)): return v
             if isinstance(v, dict):
@@ -114,26 +124,20 @@ def _series_from_maybe_dict_col(col):
 
 def _normalize_ohlc_frame(js: dict) -> pd.DataFrame:
     rows = js.get("candles") or js.get("history") or js.get("prices") or js.get("data") or []
-    if not rows:
-        raise RuntimeError("empty candles")
+    if not rows: raise RuntimeError("empty candles")
     df = pd.DataFrame(rows)
 
-    # epoch/time column
     epoch = None
     for k in ("epoch","time","t"):
         if k in df:
             epoch = _series_from_maybe_dict_col(df[k]); break
-    if epoch is None:
-        # single nested column list?
-        if len(df.columns)==1 and isinstance(df.iloc[0,0], dict):
-            sub = pd.DataFrame(df.iloc[:,0].tolist())
-            for k in ("epoch","time","t"):
-                if k in sub:
-                    epoch = _series_from_maybe_dict_col(sub[k]); df = sub; break
-    if epoch is None:
-        raise RuntimeError("no epoch/time column")
+    if epoch is None and len(df.columns)==1 and isinstance(df.iloc[0,0], dict):
+        sub = pd.DataFrame(df.iloc[:,0].tolist())
+        for k in ("epoch","time","t"):
+            if k in sub:
+                epoch = _series_from_maybe_dict_col(sub[k]); df = sub; break
+    if epoch is None: raise RuntimeError("no epoch/time column")
 
-    # OHLC columns (support both named and short)
     def grab(name_list):
         for n in name_list:
             if n in df: return _series_from_maybe_dict_col(df[n])
@@ -156,71 +160,68 @@ def fetch_deriv_history(symbol: str, granularity_sec: int, days: int = 5) -> pd.
       - clamps granularity to allowed set
       - tries symbol casings: frxPAIR and FRXPAIR
       - tries v4/v3 price_history (count) then explore/candles (count or start/end)
+      - adds DERIV_APP_ID to every request (fixes 404 in many regions)
     """
     import requests
 
-    # Normalize symbol → frxPAIR and FRXPAIR
+    # Normalize symbol
     sym = (symbol or "").strip()
-    if not sym:
-        raise RuntimeError("missing symbol")
+    if not sym: raise RuntimeError("missing symbol")
     if not sym.lower().startswith("frx"):
         sym = PO2DERIV.get(sym.upper(), sym)
     if not sym.lower().startswith("frx"):
         raise RuntimeError(f"unsupported symbol '{symbol}' (expect frx* or PO major)")
     sym_lc = "frx" + sym[-6:].upper()
-    sym_uc = sym_lc.upper()  # FRXPAIR, some routes accept uppercase only
+    sym_uc = sym_lc.upper()
     candidates = [sym_lc, sym_uc] if sym_lc != sym_uc else [sym_lc]
 
-    # Allowed granularities (sec) — clamp
+    # Clamp TF
     allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
-    try:
-        g_in = int(granularity_sec)
-    except Exception:
-        g_in = 300
+    try: g_in = int(granularity_sec)
+    except Exception: g_in = 300
     gran = min(allowed, key=lambda g: abs(g - g_in))
 
-    # Count approximation
     approx = min(2000, max(300, int(days * 86400 // gran)))
-
     attempts = []
 
     def try_request(url, params):
+        params = dict(params or {})
+        if DERIV_APP_ID: params["app_id"] = DERIV_APP_ID  # <-- important
         r = requests.get(url, params=params, timeout=15)
         attempts.append((url, r.status_code))
-        if not r.ok:
-            return None
+        if not r.ok: return None
         try:
             return _normalize_ohlc_frame(r.json())
         except Exception:
             return None
 
-    # v4/v3 count attempts
+    # v4/v3 with count
     for s in candidates:
         for base in ("https://api.deriv.com/api/v4/price_history",
                      "https://api.deriv.com/api/v3/price_history"):
             df = try_request(base, {"symbol": s, "granularity": gran, "count": approx})
-            if df is not None and not df.empty:
-                return df
+            if df is not None and not df.empty: return df
 
-    # explore/candles (try count first, then range)
+    # explore/candles (count then range)
     for s in candidates:
         df = try_request("https://api.deriv.com/api/explore/candles",
                          {"symbol": s, "granularity": gran, "count": approx})
-        if df is not None and not df.empty:
-            return df
+        if df is not None and not df.empty: return df
         end = int(datetime.now(timezone.utc).timestamp())
         start = end - days*86400
         df = try_request("https://api.deriv.com/api/explore/candles",
                          {"symbol": s, "granularity": gran, "start": start, "end": end})
-        if df is not None and not df.empty:
-            return df
+        if df is not None and not df.empty: return df
 
     raise RuntimeError(
         f"Deriv fetch failed for symbol={symbol}→{candidates}, granularity={gran}. "
-        f"Attempts: {attempts}. Tip: use majors like frxEURUSD or upload CSV."
+        f"Attempts: {attempts}. Tip: ensure DERIV_APP_ID is set and pair exists; "
+        f"or upload CSV."
     )
 
-# ----------------------------- Backtest helpers ------------------------------
+# -----------------------------------------------------------------------------
+# Backtest helpers
+# -----------------------------------------------------------------------------
 EXPIRY_TO_BARS = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
 
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
@@ -315,7 +316,9 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
     return {"wins": wins, "loss": loss, "draw": draw, "total": wins+loss+draw,
             "win_rate": (wins*100.0/max(1,wins+loss))}
 
-# ----------------------------- Plotting (clear) ------------------------------
+# -----------------------------------------------------------------------------
+# Plotting (clear)
+# -----------------------------------------------------------------------------
 def _limit_df(df: pd.DataFrame, last_n: int = 250) -> pd.DataFrame:
     if df is None or df.empty: return df
     if len(df) <= last_n: return df
@@ -340,12 +343,10 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
                 addplots.append(mpf.make_addplot(ind[name], panel=0, width=1.2, alpha=0.9))
         osc_used = False
         if "RSI" in ind:
-            addplots.append(mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100), width=1.2))
-            osc_used = True
+            addplots.append(mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100), width=1.2)); osc_used = True
         if "STOCH_K" in ind and "STOCH_D" in ind:
             addplots.append(mpf.make_addplot(ind["STOCH_K"], panel=1, width=1.0))
-            addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=1, width=1.0))
-            osc_used = True
+            addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=1, width=1.0)); osc_used = True
 
         panels = 2 if osc_used else 1
         fig, axlist = mpf.plot(
@@ -354,24 +355,26 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
                 base_mpf_style="yahoo",
                 marketcolors=mpf.make_marketcolors(up="#16a34a", down="#dc2626", wick="inherit", edge="inherit")
             ),
-            addplot=addplots,
-            returnfig=True, volume=False,
+            addplot=addplots, returnfig=True, volume=False,
             figsize=(14, 8 if panels==2 else 6),
             title=f"{strategy} • TF={tf} • Exp={expiry}",
             panel_ratios=(3,1) if panels==2 else None
         )
         ax_price = axlist[0]
+
         if signals:
             buys_x, buys_y, sells_x, sells_y = [], [], [], []
             for s in signals:
                 if s["index"] not in df.index: continue
                 y = float(df.loc[s["index"],"Close"])
-                if s["direction"]=="BUY": buys_x.append(s["index"]); buys_y.append(y)
-                else: sells_x.append(s["index"]); sells_y.append(y)
+                (buys_x if s["direction"]=="BUY" else sells_x).append(s["index"])
+                (buys_y if s["direction"]=="BUY" else sells_y).append(y)
                 if s.get("expiry_idx") in df.index:
-                    ax_price.axvspan(s["index"], s["expiry_idx"], alpha=.12, color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
+                    ax_price.axvspan(s["index"], s["expiry_idx"], alpha=.12,
+                                     color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
             if buys_x: ax_price.scatter(buys_x, buys_y, marker="^", s=90, zorder=5)
             if sells_x: ax_price.scatter(sells_x, sells_y, marker="v", s=90, zorder=5)
+
         fig.tight_layout(); fig.savefig(path, dpi=160, bbox_inches="tight"); plt.close(fig)
         return out_name
 
@@ -400,6 +403,9 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
     fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(path, dpi=160, bbox_inches="tight"); plt.close(fig)
     return out_name
 
+# -----------------------------------------------------------------------------
+# Backtest run
+# -----------------------------------------------------------------------------
 def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str):
     ind = compute_indicators(df, indicators or {})
     signals = simple_rule_engine(df, ind, strategy.upper())
