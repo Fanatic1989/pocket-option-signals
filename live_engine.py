@@ -1,4 +1,4 @@
-# live_engine.py — Telegram wiring + live loop + daily caps + exports expected by app/routes
+# live_engine.py — Telegram wiring + live loop + daily caps + exports
 from __future__ import annotations
 
 import os
@@ -21,16 +21,16 @@ def _first_nonempty(*names: str) -> str:
             return v
     return ""
 
-# Supports BOTH legacy TELEGRAM_CHAT_ID_* and new TELEGRAM_CHAT_*.
+# Support BOTH legacy TELEGRAM_CHAT_ID_* and new TELEGRAM_CHAT_* (any may be set).
 CHAT_FREE  = _first_nonempty("TELEGRAM_CHAT_FREE",  "TELEGRAM_CHAT_ID_FREE")
 CHAT_BASIC = _first_nonempty("TELEGRAM_CHAT_BASIC", "TELEGRAM_CHAT_ID_BASIC")
 CHAT_PRO   = _first_nonempty("TELEGRAM_CHAT_PRO",   "TELEGRAM_CHAT_ID_PRO")
 CHAT_VIP   = _first_nonempty("TELEGRAM_CHAT_VIP",   "TELEGRAM_CHAT_ID_VIP")
 
-# Optional single fallback chat if a tier is missing
+# Optional single fallback chat if a tier is unset
 FALLBACK_CHAT = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-# >>> Exported mapping expected by app/routes
+# >>> Exported mapping expected by app/routes/templates
 TIER_TO_CHAT: Dict[str, str] = {
     "free":  CHAT_FREE  or FALLBACK_CHAT,
     "basic": CHAT_BASIC or FALLBACK_CHAT,
@@ -38,12 +38,12 @@ TIER_TO_CHAT: Dict[str, str] = {
     "vip":   CHAT_VIP   or FALLBACK_CHAT,
 }
 
-# >>> Exported caps: VIP is unlimited (None)
+# >>> Exported caps (VIP unlimited)
 DAILY_CAPS: Dict[str, Optional[int]] = {
     "free":  3,
     "basic": 6,
     "pro":   15,
-    "vip":   None,   # unlimited
+    "vip":   None,  # unlimited
 }
 
 # ===================== Low-level Telegram sender =============================
@@ -57,14 +57,17 @@ def _send_message(chat_id: str, text: str) -> Dict[str, Any]:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(
-            url, json={
+            url,
+            json={
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
-            }, timeout=15
+            },
+            timeout=15,
         )
-        js = r.json() if "application/json" in (r.headers.get("content-type") or "") else {"ok": r.ok, "text": r.text}
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") \
+             else {"ok": r.ok, "text": r.text}
         js["_http"] = r.status_code
         return js
     except Exception as e:
@@ -107,7 +110,7 @@ class LiveEngine:
       - per-tier daily tallies with cap enforcement
       - debug flag
       - thread-safe counters
-    Use send_to_tier(tier, text) from your strategy code.
+    Use ENGINE.send_to_tier(tier, text) from your strategy code.
     """
 
     def __init__(self) -> None:
@@ -172,20 +175,22 @@ class LiveEngine:
     def status(self) -> Dict[str, Any]:
         self._maybe_reset_tallies()
         with self._lock:
+            # Back/forward compatible payload:
+            tallies = {
+                "free": self._tally["by_tier"]["free"],
+                "basic": self._tally["by_tier"]["basic"],
+                "pro": self._tally["by_tier"]["pro"],
+                "vip": self._tally["by_tier"]["vip"],
+                "all": self._tally["total"],
+                "total": self._tally["total"],
+            }
             return {
                 "state": "running" if self._running else "stopped",
                 "running": self._running,
                 "debug": self.debug,
                 "loop_sleep": self._sleep_seconds,
                 "tally": json.loads(json.dumps(self._tally)),  # deep copy
-                "tallies": {  # convenience for some dashboards
-                    "free": self._tally["by_tier"]["free"],
-                    "basic": self._tally["by_tier"]["basic"],
-                    "pro": self._tally["by_tier"]["pro"],
-                    "vip": self._tally["by_tier"]["vip"],
-                    "all": self._tally["total"],
-                    "total": self._tally["total"],
-                },
+                "tallies": tallies,
                 "caps": DAILY_CAPS,
                 "configured_chats": {k: bool(v) for k, v in TIER_TO_CHAT.items()},
                 "last_send_result": self.last_send_result,
@@ -223,10 +228,12 @@ class LiveEngine:
             self.last_send_result = res
             return res
 
+        # Debug prefix includes UTC timestamp; message bodies should fit the channel boxes
+        msg = text
         if self.debug:
-            text = f"[DEBUG]\n{datetime.now(timezone.utc).isoformat(timespec='seconds')}Z\n\n{text}"
+            msg = f"[DEBUG]\n{datetime.now(timezone.utc).isoformat(timespec='seconds')}Z\n\n{text}"
 
-        data = _send_telegram(text, t)
+        data = _send_telegram(msg, t)
         self.last_send_result = data
         if data.get("ok"):
             self._inc_tally(t)
