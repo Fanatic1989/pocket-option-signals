@@ -1,153 +1,192 @@
-# live_engine.py — Telegram routing (4 channels) + daily caps + engine shell
+# live_engine.py — Telegram wiring + live loop + daily caps
+# ---------------------------------------------------------
+# Features:
+# - Reads TELEGRAM_BOT_TOKEN and 4 tier chat IDs (both new and legacy names)
+# - Per-tier daily caps: free=3, basic=6, pro=15, vip=∞
+# - Central ENGINE object with start/stop/status/tally
+# - _send_telegram(text, tier) low-level sender
+# - tg_test() diagnostic helper used by /telegram/test
+# - Automatic daily tally reset
 
 from __future__ import annotations
 import os
-import json
 import time
+import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, date
+from typing import Optional, Dict, Any
 
 import requests
 
-# --------------------- Environment & constants ---------------------
+# ===================== Telegram configuration ================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# 4 channel IDs (can be supergroup/channel IDs like -1001234567890)
-CHAT_FREE  = os.getenv("TELEGRAM_CHAT_ID_FREE",  "").strip()
-CHAT_BASIC = os.getenv("TELEGRAM_CHAT_ID_BASIC", "").strip()
-CHAT_PRO   = os.getenv("TELEGRAM_CHAT_ID_PRO",   "").strip()
-CHAT_VIP   = os.getenv("TELEGRAM_CHAT_ID_VIP",   "").strip()
+def _first_nonempty(*names: str) -> str:
+    """Return the first non-empty environment variable value among names."""
+    for n in names:
+        v = os.getenv(n, "").strip()
+        if v:
+            return v
+    return ""
 
-# expose the keys so routes.py /telegram/diag can show what’s set
+# Support BOTH legacy TELEGRAM_CHAT_ID_* and new TELEGRAM_CHAT_* variable names
+CHAT_FREE  = _first_nonempty("TELEGRAM_CHAT_ID_FREE",  "TELEGRAM_CHAT_FREE")
+CHAT_BASIC = _first_nonempty("TELEGRAM_CHAT_ID_BASIC", "TELEGRAM_CHAT_BASIC")
+CHAT_PRO   = _first_nonempty("TELEGRAM_CHAT_ID_PRO",   "TELEGRAM_CHAT_PRO")
+CHAT_VIP   = _first_nonempty("TELEGRAM_CHAT_ID_VIP",   "TELEGRAM_CHAT_VIP")
+
+# Optional single fallback (used if a tier’s chat isn’t set)
+FALLBACK_CHAT = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+TIER_TO_CHAT: Dict[str, str] = {
+    "free":  CHAT_FREE  or FALLBACK_CHAT,
+    "basic": CHAT_BASIC or FALLBACK_CHAT,
+    "pro":   CHAT_PRO   or FALLBACK_CHAT,
+    "vip":   CHAT_VIP   or FALLBACK_CHAT,
+}
+
+# For /telegram/diag visibility
 TELEGRAM_CHAT_KEYS = [
-    "TELEGRAM_CHAT_ID_FREE",
-    "TELEGRAM_CHAT_ID_BASIC",
-    "TELEGRAM_CHAT_ID_PRO",
-    "TELEGRAM_CHAT_ID_VIP",
+    "TELEGRAM_CHAT_ID_FREE","TELEGRAM_CHAT_FREE",
+    "TELEGRAM_CHAT_ID_BASIC","TELEGRAM_CHAT_BASIC",
+    "TELEGRAM_CHAT_ID_PRO","TELEGRAM_CHAT_PRO",
+    "TELEGRAM_CHAT_ID_VIP","TELEGRAM_CHAT_VIP",
+    "TELEGRAM_CHAT_ID",
 ]
 
-# Per-tier daily caps (per channel per UTC day)
-DAILY_CAPS: dict[str, int | None] = {
+# Per-tier daily caps (None => unlimited)
+DAILY_CAPS: Dict[str, Optional[int]] = {
     "free":  3,
     "basic": 6,
     "pro":   15,
-    "vip":   None,   # unlimited
+    "vip":   None,
 }
 
-# Map tier -> chat id (missing values are ignored at send time)
-TIER_TO_CHAT = {
-    "free":  CHAT_FREE,
-    "basic": CHAT_BASIC,
-    "pro":   CHAT_PRO,
-    "vip":   CHAT_VIP,
-}
+# ===================== Low-level Telegram sender =============================
 
-# --------------------- Telegram low-level helpers ---------------------
-
-def _tg_api(method: str) -> str:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-    return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-
-def _tg_send_message(chat_id: str, text: str, disable_web_page_preview=True) -> tuple[bool, str]:
-    """Returns (ok, info). Never raises."""
-    if not TELEGRAM_BOT_TOKEN:
+def _send_telegram(text: str, tier: str = "vip") -> tuple[bool, str]:
+    """
+    Send a message to the Telegram channel for the given tier.
+    Returns (ok, info_or_error_text).
+    """
+    if not BOT_TOKEN:
         return False, "Missing TELEGRAM_BOT_TOKEN"
+
+    tier = (tier or "vip").lower()
+    chat_id = TIER_TO_CHAT.get(tier)
     if not chat_id:
-        return False, "Missing chat_id"
+        return False, "No Telegram channels configured"
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
-        r = requests.post(
-            _tg_api("sendMessage"),
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": disable_web_page_preview,
-            },
-            timeout=15,
-        )
-        ok = r.ok and r.json().get("ok", False)
-        return (ok, r.text if not ok else "ok")
+        r = requests.post(url, json=payload, timeout=12)
+        ok = r.ok and (r.json().get("ok") is True)
+        return (True, "sent") if ok else (False, r.text)
     except Exception as e:
         return False, str(e)
 
-def _send_telegram(text: str, tier: str | None = None) -> tuple[bool, str]:
+def tg_test() -> tuple[bool, str]:
     """
-    Public helper used by routes.telegram_diag().
-    If tier is None, broadcasts to all configured channels (FREE/BASIC/PRO/VIP).
-    Applies caps when ENGINE is running; for diag/test we still apply caps to avoid overflow.
+    Sends one short test message to each configured tier (free/basic/pro/vip).
+    Returns (ok, info_json).
     """
-    targets = []
-    if tier:
-        t = tier.lower()
-        cid = TIER_TO_CHAT.get(t, "")
-        if cid:
-            targets.append((t, cid))
-    else:
-        for t, cid in TIER_TO_CHAT.items():
-            if cid:
-                targets.append((t, cid))
+    results = {}
+    tiers = ("free","basic","pro","vip")
+    if not BOT_TOKEN:
+        return False, "Missing TELEGRAM_BOT_TOKEN"
 
-    if not targets:
+    if not any(TIER_TO_CHAT.values()):
         return False, "No Telegram channels configured"
 
-    results = []
-    all_ok = True
-    for t, chat in targets:
-        ok, info = ENGINE._send_with_caps(tier=t, chat_id=chat, text=text)
-        results.append(f"{t}:{'ok' if ok else 'fail'}")
-        if not ok:
-            all_ok = False
+    for t in tiers:
+        if TIER_TO_CHAT.get(t):
+            ok, info = _send_telegram(f"🧪 Test from bot ({t.upper()})", t)
+            results[t] = {"ok": ok, "info": info}
+        else:
+            results[t] = {"ok": False, "info": "not configured"}
 
-    return all_ok, ", ".join(results)
+    try:
+        info_json = json.dumps(results)
+    except Exception:
+        info_json = str(results)
+    overall_ok = any(v["ok"] for v in results.values())
+    return overall_ok, info_json
 
-# --------------------- Live engine (shell) ---------------------
+# ===================== Live Engine ===========================================
 
 class LiveEngine:
     """
-    Lightweight engine wrapper:
-    - start/stop: flips running flag
-    - debug: when True, still sends; when debug_only_send_to is set to a tier, only that tier is used
-    - per-tier per-day caps enforced in _send_with_caps()
-    - tally: totals per tier & overall, reset at UTC day boundary
+    Minimal live loop with:
+      - start/stop
+      - per-tier daily tallies with cap enforcement
+      - debug flag
+      - thread-safe counters
+    NOTE: Actual signal generation should call .send_signal(tier, text).
     """
+
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._thread: Optional[threading.Thread] = None
         self._running = False
         self.debug = False
-        self.debug_only_send_to: str | None = None  # e.g. "vip" to test only VIP
 
-        # per-UTC-day counters
-        self._day_key = self._utc_day_key()
-        self._tally = {
-            "free": 0, "basic": 0, "pro": 0, "vip": 0,
-            "total": 0,
-            # optional: deliver per-channel logs last 50
-            "last": [],   # list of dicts {ts, tier, ok, info}
-        }
+        # tallies: {"date": YYYY-MM-DD, "by_tier": {"free": n, "basic": n, ...}, "total": n}
+        today = date.today().isoformat()
+        self._tally = {"date": today, "by_tier": {"free": 0, "basic": 0, "pro": 0, "vip": 0}, "total": 0}
 
-        # worker placeholder (if you later add loops)
-        self._thread: threading.Thread | None = None
+        # loop timing
+        self._sleep_seconds = int(os.getenv("ENGINE_LOOP_SLEEP", "4"))
 
-    # ---------- internals ----------
-    def _utc_day_key(self) -> str:
-        now = datetime.now(timezone.utc)
-        return now.strftime("%Y-%m-%d")
+    # ---------- Internal helpers ----------
+    def _maybe_reset_tallies(self) -> None:
+        with self._lock:
+            today = date.today().isoformat()
+            if self._tally.get("date") != today:
+                self._tally = {"date": today, "by_tier": {"free": 0, "basic": 0, "pro": 0, "vip": 0}, "total": 0}
 
-    def _rollover_if_needed(self) -> None:
-        day = self._utc_day_key()
-        if day != self._day_key:
-            self._day_key = day
-            self._tally = {"free":0,"basic":0,"pro":0,"vip":0,"total":0,"last":[]}
+    def _inc_tally(self, tier: str) -> None:
+        with self._lock:
+            self._tally["by_tier"][tier] += 1
+            self._tally["total"] += 1
 
-    # ---------- public controls ----------
+    def _cap_reached(self, tier: str) -> bool:
+        cap = DAILY_CAPS.get(tier)
+        if cap is None:
+            return False
+        with self._lock:
+            return self._tally["by_tier"].get(tier, 0) >= cap
+
+    # ---------- Public API ----------
+    def tally(self) -> Dict[str, Any]:
+        self._maybe_reset_tallies()
+        with self._lock:
+            return json.loads(json.dumps(self._tally))  # deep copy
+
+    def status(self) -> Dict[str, Any]:
+        self._maybe_reset_tallies()
+        with self._lock:
+            return {
+                "running": self._running,
+                "loop_sleep": self._sleep_seconds,
+                "tally": self._tally,
+                "debug": self.debug,
+                "configured_tiers": {k: bool(v) for k, v in TIER_TO_CHAT.items()},
+            }
+
     def start(self) -> tuple[bool, str]:
         with self._lock:
             if self._running:
                 return True, "already running"
             self._running = True
-            # (optional) spin worker if you later implement loops
+            self._thread = threading.Thread(target=self._loop, name="live-engine", daemon=True)
+            self._thread.start()
             return True, "started"
 
     def stop(self) -> tuple[bool, str]:
@@ -155,94 +194,53 @@ class LiveEngine:
             if not self._running:
                 return True, "already stopped"
             self._running = False
-            return True, "stopped"
+        # wait a tiny bit for thread to exit
+        for _ in range(20):
+            t = self._thread
+            if not t or not t.is_alive():
+                break
+            time.sleep(0.05)
+        return True, "stopped"
 
-    def status(self) -> dict:
-        with self._lock:
-            self._rollover_if_needed()
-            return {
-                "running": self._running,
-                "debug": self.debug,
-                "day": self._day_key,
-                "tally": {k:self._tally[k] for k in ("free","basic","pro","vip","total")},
-                "last": list(self._tally["last"]),
-            }
+    def send_signal(self, tier: str, text: str) -> tuple[bool, str]:
+        """
+        Safely send a message respecting daily caps.
+        Return (ok, 'sent' | reason).
+        """
+        self._maybe_reset_tallies()
+        tier = (tier or "vip").lower()
+        if tier not in ("free","basic","pro","vip"):
+            return False, f"unknown tier: {tier}"
+        if not TIER_TO_CHAT.get(tier):
+            return False, f"tier {tier} not configured"
 
-    def tally(self) -> dict:
-        with self._lock:
-            self._rollover_if_needed()
-            return {
-                "day": self._day_key,
-                "per_tier": {k:self._tally[k] for k in ("free","basic","pro","vip")},
-                "total": self._tally["total"],
-            }
+        if self._cap_reached(tier):
+            return False, f"daily cap reached for {tier} ({DAILY_CAPS.get(tier)})"
 
-    # ---------- sending with caps ----------
-    def _cap_for_tier(self, tier: str) -> int | None:
-        return DAILY_CAPS.get(tier.lower())
-
-    def _send_with_caps(self, tier: str, chat_id: str, text: str) -> tuple[bool, str]:
-        tier = (tier or "").lower().strip()
-        with self._lock:
-            self._rollover_if_needed()
-
-            # Debug: restrict to a single tier if set
-            if self.debug_only_send_to and tier != self.debug_only_send_to.lower():
-                # pretend success but skip actual send to avoid confusion
-                info = f"debug_only_send_to={self.debug_only_send_to}, skipped {tier}"
-                self._tally["last"].append({"ts": int(time.time()), "tier": tier, "ok": True, "info": info})
-                self._trim_log()
-                return True, info
-
-            cap = self._cap_for_tier(tier)
-            used = self._tally.get(tier, 0)
-            if cap is not None and used >= cap:
-                info = f"cap reached ({used}/{cap})"
-                self._tally["last"].append({"ts": int(time.time()), "tier": tier, "ok": False, "info": info})
-                self._trim_log()
-                return False, info
-
-        # send outside the lock
-        ok, info = _tg_send_message(chat_id, text)
-
-        with self._lock:
-            self._rollover_if_needed()
-            self._tally["last"].append({"ts": int(time.time()), "tier": tier, "ok": ok, "info": info})
-            self._trim_log()
-            if ok:
-                self._tally[tier] = self._tally.get(tier, 0) + 1
-                self._tally["total"] += 1
+        ok, info = _send_telegram(text, tier)
+        if ok:
+            self._inc_tally(tier)
         return ok, info
 
-    def _trim_log(self):
-        if len(self._tally["last"]) > 50:
-            self._tally["last"] = self._tally["last"][-50:]
-
-    # ---------- high-level helper you can call from signal logic ----------
-    def send_signal(self, text: str, tiers: list[str] | None = None) -> dict:
+    # ---------- Loop ----------
+    def _loop(self) -> None:
         """
-        Send the same signal text to one or more tiers with cap enforcement.
-        tiers=None => send to all configured tiers.
-        Returns per-tier results.
+        Very light loop: you can wire your strategy here later.
+        Currently just idles and resets tallies each day, optionally emits a debug heartbeat.
         """
-        if tiers is None:
-            tiers = ["free","basic","pro","vip"]
+        while True:
+            with self._lock:
+                running = self._running
+            if not running:
+                break
 
-        out = {}
-        for t in tiers:
-            chat = TIER_TO_CHAT.get(t.lower())
-            if not chat:
-                out[t] = {"ok": False, "info": "no chat configured"}
-                continue
-            ok, info = self._send_with_caps(t, chat, text)
-            out[t] = {"ok": ok, "info": info}
-        return out
+            self._maybe_reset_tallies()
 
+            if self.debug:
+                # Heartbeat (not sent to Telegram, just prints to stdout)
+                print(f"[ENGINE] tick {datetime.utcnow().isoformat()}Z | tally={self._tally}")
 
-# Singleton instance used by routes.py
+            time.sleep(max(1, self._sleep_seconds))
+
+# Singleton the routes import
 ENGINE = LiveEngine()
-
-# Simple test used by routes.telegram_test()
-def tg_test() -> tuple[bool, str]:
-    msg = "🧪 Test from server — if this appears, routing & caps are wired."
-    return _send_telegram(msg)
