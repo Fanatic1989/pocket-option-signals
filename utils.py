@@ -1,11 +1,10 @@
 # utils.py — config store, TZ, sqlite, Deriv fetch, symbols, backtest helpers, plotting, Telegram helpers
-import os, json, sqlite3, math
+import os, json, sqlite3
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Dict, Any, Optional, Tuple
 
 # ------------------------------- Timezone ------------------------------------
 TIMEZONE = os.getenv("APP_TZ", "America/Port_of_Spain")
-
 try:
     import pytz
     TZ = pytz.timezone(TIMEZONE)
@@ -23,6 +22,7 @@ try:
 except Exception:
     HAVE_MPLFIN = False
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # ------------------------------- SQLite --------------------------------------
 DB_PATH = os.getenv("SQLITE_PATH", "members.db")
@@ -90,7 +90,6 @@ def convert_po_to_deriv(symbols):
 # ----------------------------- Data loading/fetch ----------------------------
 def load_csv(csv_file) -> pd.DataFrame:
     df = pd.read_csv(csv_file)
-    # Expected columns: time/timestamp/date, open, high, low, close
     cols = {c.lower(): c for c in df.columns}
     o = cols.get("open"); h = cols.get("high"); l = cols.get("low"); c = cols.get("close")
     t = cols.get("time") or cols.get("timestamp") or cols.get("date")
@@ -114,7 +113,6 @@ def fetch_deriv_history(symbol: str, granularity_sec: int, days: int=5) -> pd.Da
     rows = js.get("candles") or js.get("history") or []
     if not rows: raise RuntimeError("empty candles")
     df = pd.DataFrame(rows)
-    # Normalize common fields
     epoch = df.get("epoch") if "epoch" in df else df.get("time")
     out = pd.DataFrame({
         "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
@@ -125,51 +123,327 @@ def fetch_deriv_history(symbol: str, granularity_sec: int, days: int=5) -> pd.Da
     }).dropna()
     return out.set_index("time").sort_index()
 
-# ----------------------------- Backtest helpers ------------------------------
-EXPIRY_TO_BARS = {
-    "1m":1,"3m":3,"5m":5,"10m":10,"30m":30,
-    "1h":60,"4h":240
-}
+# ----------------------------- Indicator utils -------------------------------
+def _ema(s: pd.Series, n: int) -> pd.Series: return s.ewm(span=int(n), adjust=False).mean()
+def _sma(s: pd.Series, n: int) -> pd.Series: return s.rolling(int(n)).mean()
+def _true_range(h,l,c): 
+    prev_c = c.shift(1)
+    tr = pd.concat([(h-l).abs(), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
+    return tr
 
-def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
-    out = {}
-    close = df["Close"]
-    if "SMA" in ind_cfg:
-        vals = ind_cfg["SMA"] if isinstance(ind_cfg["SMA"], (list,tuple)) else [ind_cfg["SMA"]]
-        for p in vals:
-            out[f"SMA({p})"] = close.rolling(int(p)).mean()
-    if "EMA" in ind_cfg:
-        vals = ind_cfg["EMA"] if isinstance(ind_cfg["EMA"], (list,tuple)) else [ind_cfg["EMA"]]
-        for p in vals:
-            out[f"EMA({p})"] = close.ewm(span=int(p), adjust=False).mean()
-    if "WMA" in ind_cfg:
-        vals = ind_cfg["WMA"] if isinstance(ind_cfg["WMA"], (list,tuple)) else [ind_cfg["WMA"]]
-        for p in vals:
-            w = np.arange(1, int(p)+1)
-            out[f"WMA({p})"] = close.rolling(int(p)).apply(lambda x: (x*w).sum()/w.sum(), raw=True)
-    if "SMMA" in ind_cfg:
-        vals = ind_cfg["SMMA"] if isinstance(ind_cfg["SMMA"], (list,tuple)) else [ind_cfg["SMMA"]]
-        for p in vals:
-            out[f"SMMA({p})"] = close.ewm(alpha=1/int(p), adjust=False).mean()
-    if "TMA" in ind_cfg:
-        vals = ind_cfg["TMA"] if isinstance(ind_cfg["TMA"], (list,tuple)) else [ind_cfg["TMA"]]
-        for p in vals:
-            out[f"TMA({p})"] = close.rolling(int(p)).mean().rolling(int(p)).mean()
-    if "RSI" in ind_cfg and isinstance(ind_cfg["RSI"], dict) and ind_cfg["RSI"].get("show", True):
-        pr = int(ind_cfg["RSI"].get("period", 14))
-        delta = close.diff()
-        up = delta.clip(lower=0).ewm(alpha=1/pr, adjust=False).mean()
-        down = (-delta.clip(upper=0)).ewm(alpha=1/pr, adjust=False).mean()
-        rs = up / down.replace(0, np.nan)
+# ----------------------------- Indicator computation -------------------------
+def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> Dict[str, pd.Series | pd.DataFrame]:
+    """
+    Returns a dict: name -> Series OR DataFrame (for multi-line indicators).
+    Names are canonical so plotter can decide overlay vs oscillator panel.
+    """
+    out: Dict[str, Any] = {}
+    o, h, l, c = df["Open"], df["High"], df["Low"], df["Close"]
+
+    def enabled(key: str) -> Tuple[bool, dict]:
+        cfg = (ind_cfg or {}).get(key, {})
+        return bool(cfg.get("enabled")), cfg
+
+    # --- Moving averages family (already present)
+    on,cfg = enabled("SMA")
+    if on:
+        p = int(cfg.get("period", 20))
+        out[f"SMA({p})"] = _sma(c, p)
+
+    on,cfg = enabled("EMA")
+    if on:
+        p = int(cfg.get("period", 20))
+        out[f"EMA({p})"] = _ema(c, p)
+
+    on,cfg = enabled("WMA")
+    if on:
+        p = int(cfg.get("period", 20))
+        w = np.arange(1, p+1)
+        out[f"WMA({p})"] = c.rolling(p).apply(lambda x: (x*w).sum()/w.sum(), raw=True)
+
+    on,cfg = enabled("SMMA")
+    if on:
+        p = int(cfg.get("period", 20))
+        out[f"SMMA({p})"] = c.ewm(alpha=1/p, adjust=False).mean()
+
+    on,cfg = enabled("TMA")
+    if on:
+        p = int(cfg.get("period", 20))
+        out[f"TMA({p})"] = _sma(_sma(c, p), p)
+
+    # --- RSI
+    on,cfg = enabled("RSI")
+    if on:
+        pr = int(cfg.get("period", 14))
+        d = c.diff()
+        up = d.clip(lower=0).ewm(alpha=1/pr, adjust=False).mean()
+        dn = (-d.clip(upper=0)).ewm(alpha=1/pr, adjust=False).mean()
+        rs = up / dn.replace(0, np.nan)
         out["RSI"] = (100 - (100/(1+rs))).fillna(method="bfill")
-    if "STOCH" in ind_cfg and isinstance(ind_cfg["STOCH"], dict) and ind_cfg["STOCH"].get("show", True):
-        k = int(ind_cfg["STOCH"].get("k", 14)); d = int(ind_cfg["STOCH"].get("d",3))
-        lowk = df["Low"].rolling(k).min(); highk = df["High"].rolling(k).max()
-        kline = (close - lowk) / (highk - lowk).replace(0, np.nan) * 100.0
-        dline = kline.rolling(d).mean()
-        out["STOCH_K"] = kline; out["STOCH_D"] = dline
+
+    # --- Stochastic
+    on,cfg = enabled("STOCH")
+    if on:
+        k = int(cfg.get("k", 14)); d_ = int(cfg.get("d", 3))
+        lowk = l.rolling(k).min(); highk = h.rolling(k).max()
+        kline = (c - lowk) / (highk - lowk).replace(0, np.nan) * 100.0
+        dline = kline.rolling(d_).mean()
+        out["STOCH"] = pd.DataFrame({"%K": kline, "%D": dline})
+
+    # --- ATR
+    on,cfg = enabled("ATR")
+    if on:
+        n = int(cfg.get("period", 14))
+        atr = _true_range(h,l,c).rolling(n).mean()
+        out["ATR"] = atr
+
+    # --- ADX (+DI/-DI)
+    on,cfg = enabled("ADX")
+    if on:
+        n = int(cfg.get("period", 14))
+        up_move = h.diff()
+        down_move = -l.diff()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        tr = _true_range(h,l,c)
+        atr = tr.rolling(n).mean()
+        plus_di = 100 * pd.Series(plus_dm, index=c.index).ewm(alpha=1/n, adjust=False).mean() / atr
+        minus_di = 100 * pd.Series(minus_dm, index=c.index).ewm(alpha=1/n, adjust=False).mean() / atr
+        dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0,np.nan) ) * 100
+        adx = dx.ewm(alpha=1/n, adjust=False).mean()
+        out["ADX"] = pd.DataFrame({"+DI": plus_di, "-DI": minus_di, "ADX": adx})
+
+    # --- Bollinger Bands + Width
+    on,cfg = enabled("BBANDS")
+    if on:
+        n = int(cfg.get("period", 20)); k = float(cfg.get("mult", 2.0))
+        ma = _sma(c, n); sd = c.rolling(n).std()
+        upper = ma + k*sd; lower = ma - k*sd
+        out["BBANDS"] = pd.DataFrame({"Upper": upper, "Middle": ma, "Lower": lower})
+        out["BBWIDTH"] = (upper - lower) / ma.replace(0, np.nan)
+
+    # --- Keltner Channel
+    on,cfg = enabled("KELTNER")
+    if on:
+        n = int(cfg.get("period", 20)); m = float(cfg.get("mult", 2.0))
+        ema = _ema(c, n); atr = _true_range(h,l,c).rolling(n).mean()
+        upper = ema + m*atr; lower = ema - m*atr
+        out["KELTNER"] = pd.DataFrame({"Upper": upper, "EMA": ema, "Lower": lower})
+
+    # --- Donchian Channels
+    on,cfg = enabled("DONCHIAN")
+    if on:
+        n = int(cfg.get("period", 20))
+        upper = h.rolling(n).max(); lower = l.rolling(n).min(); mid = (upper+lower)/2
+        out["DONCHIAN"] = pd.DataFrame({"Upper": upper, "Mid": mid, "Lower": lower})
+
+    # --- Envelopes (pct around SMA)
+    on,cfg = enabled("ENVELOPES")
+    if on:
+        n = int(cfg.get("period", 20)); pct = float(cfg.get("pct", 0.02))
+        ma = _sma(c, n)
+        up = ma * (1+pct); lo = ma * (1-pct)
+        out["ENVELOPES"] = pd.DataFrame({"Upper": up, "MA": ma, "Lower": lo})
+
+    # --- MACD (also OSMA=hist)
+    on,cfg = enabled("MACD")
+    if on:
+        f = int(cfg.get("fast", 12)); s = int(cfg.get("slow", 26)); sig = int(cfg.get("signal", 9))
+        macd = _ema(c, f) - _ema(c, s)
+        signal = _ema(macd, sig)
+        hist = macd - signal
+        out["MACD"] = pd.DataFrame({"MACD": macd, "Signal": signal, "Hist": hist})
+        out["OSMA"] = hist
+
+    # --- Momentum
+    on,cfg = enabled("MOMENTUM")
+    if on:
+        n = int(cfg.get("period", 10))
+        out["MOMENTUM"] = c.diff(n)
+
+    # --- ROC
+    on,cfg = enabled("ROC")
+    if on:
+        n = int(cfg.get("period", 10))
+        out["ROC"] = (c / c.shift(n) - 1.0) * 100.0
+
+    # --- Williams %R
+    on,cfg = enabled("WILLR")
+    if on:
+        n = int(cfg.get("period", 14))
+        hh = h.rolling(n).max(); ll = l.rolling(n).min()
+        out["WILLR"] = -100 * (hh - c) / (hh - ll).replace(0,np.nan)
+
+    # --- CCI
+    on,cfg = enabled("CCI")
+    if on:
+        n = int(cfg.get("period", 20))
+        tp = (h + l + c) / 3.0
+        sma = tp.rolling(n).mean()
+        md = (tp - sma).abs().rolling(n).mean()
+        out["CCI"] = (tp - sma) / (0.015 * md).replace(0,np.nan)
+
+    # --- Aroon
+    on,cfg = enabled("AROON")
+    if on:
+        n = int(cfg.get("period", 14))
+        def aroon_up(x): return (x.argmax()+1)/len(x)*100
+        def aroon_dn(x): return (x[::-1].argmax()+1)/len(x)*100
+        up = h.rolling(n).apply(aroon_up, raw=True)
+        dn = l.rolling(n).apply(aroon_dn, raw=True)
+        out["AROON"] = pd.DataFrame({"Up": up, "Down": dn})
+
+    # --- Vortex
+    on,cfg = enabled("VORTEX")
+    if on:
+        n = int(cfg.get("period", 14))
+        vm_plus = (h - l.shift(1)).abs()
+        vm_minus = (l - h.shift(1)).abs()
+        tr = _true_range(h,l,c)
+        vi_plus = vm_plus.rolling(n).sum() / tr.rolling(n).sum()
+        vi_minus = vm_minus.rolling(n).sum() / tr.rolling(n).sum()
+        out["VORTEX"] = pd.DataFrame({"+VI": vi_plus, "-VI": vi_minus})
+
+    # --- Awesome Oscillator (median price 5-34 SMA)
+    on,cfg = enabled("AO")
+    if on:
+        mp = (h + l) / 2.0
+        ao = _sma(mp, 5) - _sma(mp, 34)
+        out["AO"] = ao
+
+    # --- Accelerator Oscillator (AO - SMA(5) of AO)
+    on,cfg = enabled("AC")
+    if on:
+        mp = (h + l) / 2.0
+        ao = _sma(mp, 5) - _sma(mp, 34)
+        ac = ao - _sma(ao, 5)
+        out["AC"] = ac
+
+    # --- Ichimoku (basic: Tenkan, Kijun, SpanA/B; no forward shift)
+    on,cfg = enabled("ICHIMOKU")
+    if on:
+        conv = int(cfg.get("conversion", 9))
+        base = int(cfg.get("base", 26))
+        spanb = int(cfg.get("spanb", 52))
+        tenkan = (h.rolling(conv).max() + l.rolling(conv).min())/2
+        kijun  = (h.rolling(base).max() + l.rolling(base).min())/2
+        span_a = (tenkan + kijun) / 2
+        span_b = (h.rolling(spanb).max() + l.rolling(spanb).min())/2
+        out["ICHIMOKU"] = pd.DataFrame({"Tenkan":tenkan,"Kijun":kijun,"SpanA":span_a,"SpanB":span_b})
+
+    # --- Parabolic SAR (simple implementation)
+    on,cfg = enabled("PSAR")
+    if on:
+        af_start = float(cfg.get("af", 0.02))
+        af_max = float(cfg.get("af_max", 0.2))
+        psar = []
+        uptrend = True
+        af = af_start
+        ep = l.iloc[0]
+        sar = l.iloc[0]
+        for i in range(len(c)):
+            if i < 2:
+                psar.append(np.nan)
+                continue
+            prev_sar = sar
+            if uptrend:
+                sar = prev_sar + af * (ep - prev_sar)
+                sar = min(sar, l.iloc[i-1], l.iloc[i-2])
+                if h.iloc[i] > ep:
+                    ep = h.iloc[i]; af = min(af + af_start, af_max)
+                if l.iloc[i] < sar:
+                    uptrend = False; sar = ep; ep = l.iloc[i]; af = af_start
+            else:
+                sar = prev_sar + af * (ep - prev_sar)
+                sar = max(sar, h.iloc[i-1], h.iloc[i-2])
+                if l.iloc[i] < ep:
+                    ep = l.iloc[i]; af = min(af + af_start, af_max)
+                if h.iloc[i] > sar:
+                    uptrend = True; sar = ep; ep = h.iloc[i]; af = af_start
+            psar.append(sar)
+        out["PSAR"] = pd.Series(psar, index=c.index)
+
+    # --- SuperTrend
+    on,cfg = enabled("SUPERtrend")
+    if on:
+        n = int(cfg.get("period", 10)); m = float(cfg.get("mult", 3.0))
+        atr = _true_range(h,l,c).rolling(n).mean()
+        hl2 = (h + l) / 2.0
+        upper = hl2 + m*atr
+        lower = hl2 - m*atr
+        trend = pd.Series(index=c.index, dtype=float)
+        dir_up = True
+        last = c.index[0]
+        for i, idx in enumerate(c.index):
+            if i == 0:
+                trend.iloc[i] = upper.iloc[i]
+                continue
+            prev = trend.iloc[i-1]
+            if c.iloc[i] > prev:
+                trend.iloc[i] = max(lower.iloc[i], prev)
+                dir_up = True
+            else:
+                trend.iloc[i] = min(upper.iloc[i], prev)
+                dir_up = False
+        out["SUPER"] = pd.DataFrame({"Upper": upper, "Lower": lower, "Trend": trend})
+
+    # --- Fractal (Bill Williams) markers
+    on,cfg = enabled("FRACTAL")
+    if on:
+        def fractals(high, low):
+            up = (high.shift(2) < high.shift(1)) & (high.shift(2) < high) & \
+                 (high.shift(-2) < high.shift(-1)) & (high.shift(-2) < high)
+            dn = (low.shift(2) > low.shift(1)) & (low.shift(2) > low) & \
+                 (low.shift(-2) > low.shift(-1)) & (low.shift(-2) > low)
+            up_px = c.where(up); dn_px = c.where(dn)
+            return up_px, dn_px
+        up_px, dn_px = fractals(h, l)
+        out["FRACTAL_UP"] = up_px
+        out["FRACTAL_DN"] = dn_px
+
+    # --- Fractal Chaos Bands (approx as HH/LL envelopes with period)
+    on,cfg = enabled("FRACTAL_BANDS")
+    if on:
+        n = int(cfg.get("period", 20))
+        out["FRACTAL_BANDS"] = pd.DataFrame({"Upper": h.rolling(n).max(), "Lower": l.rolling(n).min()})
+
+    # --- Bears/Bulls Power
+    on,cfg = enabled("BEARS")
+    if on:
+        n = int(cfg.get("period", 13))
+        out["BEARS"] = l - _ema(c, n)
+    on,cfg = enabled("BULLS")
+    if on:
+        n = int(cfg.get("period", 13))
+        out["BULLS"] = h - _ema(c, n)
+
+    # --- Schaff Trend Cycle (simplified)
+    on,cfg = enabled("SCHAFF")
+    if on:
+        fast = int(cfg.get("fast", 23)); slow = int(cfg.get("slow", 50)); cycle = int(cfg.get("cycle", 10))
+        macd = _ema(c, fast) - _ema(c, slow)
+        minm = macd.rolling(cycle).min(); maxm = macd.rolling(cycle).max()
+        stc = 100 * (macd - minm) / (maxm - minm).replace(0,np.nan)
+        out["SCHAFF"] = stc
+
+    # --- ZigZag (percentage)
+    on,cfg = enabled("ZIGZAG")
+    if on:
+        pct = float(cfg.get("pct", 5.0)) / 100.0
+        zz = pd.Series(index=c.index, dtype=float)
+        last_pivot = c.iloc[0]; last_idx = c.index[0]; direction = 0
+        zz.iloc[0] = last_pivot
+        for i, (idx, px) in enumerate(c.items()):
+            chg = (px - last_pivot) / last_pivot if last_pivot != 0 else 0
+            if direction >= 0 and chg >= pct:
+                direction = 1; last_pivot = px; last_idx = idx; zz.loc[idx] = px
+            elif direction <= 0 and chg <= -pct:
+                direction = -1; last_pivot = px; last_idx = idx; zz.loc[idx] = px
+        out["ZIGZAG"] = zz
+
     return out
 
+# ----------------------------- Rule engine & backtest ------------------------
 def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
     signals = []
     close = df["Close"]
@@ -181,15 +455,13 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         signals.append({"index": sig_idx, "direction": direction, "expiry_idx": all_idx[exp_pos]})
 
     if rule_name == "TREND":
-        sma50 = ind.get("SMA(50)")
+        sma50 = ind.get("SMA(50)") or ind.get("EMA(50)")
         if sma50 is None: return signals
         above = close > sma50
         cross_up = (above & (~above.shift(1).fillna(False)))
         cross_dn = ((~above) & (above.shift(1).fillna(False)))
-        for ts, v in cross_up[cross_up].items():
-            add(ts, "BUY", 5)
-        for ts, v in cross_dn[cross_dn].items():
-            add(ts, "SELL", 5)
+        for ts in close.index[cross_up.fillna(False)]: add(ts, "BUY", 5)
+        for ts in close.index[cross_dn.fillna(False)]: add(ts, "SELL", 5)
         return signals
 
     if rule_name == "CHOP":
@@ -197,21 +469,18 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         if rsi is None: return signals
         bounce_up = (rsi.shift(1) < 50) & (rsi >= 50)
         bounce_dn = (rsi.shift(1) > 50) & (rsi <= 50)
-        for ts in rsi.index[bounce_up.fillna(False)]:
-            add(ts, "BUY", 3)
-        for ts in rsi.index[bounce_dn.fillna(False)]:
-            add(ts, "SELL", 3)
+        for ts in rsi.index[bounce_up.fillna(False)]: add(ts, "BUY", 3)
+        for ts in rsi.index[bounce_dn.fillna(False)]: add(ts, "SELL", 3)
         return signals
 
-    # BASE: Stoch cross
-    k = ind.get("STOCH_K"); d = ind.get("STOCH_D")
-    if k is not None and d is not None:
+    # BASE: Stochastic cross
+    st = ind.get("STOCH")
+    if isinstance(st, pd.DataFrame):
+        k, d = st["%K"], st["%D"]
         cross_up = (k.shift(1) < d.shift(1)) & (k >= d)
         cross_dn = (k.shift(1) > d.shift(1)) & (k <= d)
-        for ts in k.index[cross_up.fillna(False)]:
-            add(ts, "BUY", 5)
-        for ts in k.index[cross_dn.fillna(False)]:
-            add(ts, "SELL", 5)
+        for ts in k.index[cross_up.fillna(False)]: add(ts, "BUY", 5)
+        for ts in k.index[cross_dn.fillna(False)]: add(ts, "SELL", 5)
     return signals
 
 def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
@@ -233,42 +502,43 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
     return {"wins": wins, "loss": loss, "draw": draw, "total": wins+loss+draw,
             "win_rate": (wins*100.0/max(1,wins+loss))}
 
-def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
-    # If mplfinance unavailable, fallback to simple matplotlib candles
-    os.makedirs("static/plots", exist_ok=True)
+# ----------------------------- Plotting --------------------------------------
+def _panel_of(name: str) -> int:
+    """0=price overlay, 1=oscillator panel 1, 2=oscillator panel 2 (we multiplex)."""
+    overlay = ("BBANDS","KELTNER","DONCHIAN","ENVELOPES","PSAR","SUPER","ICHIMOKU","FRACTAL_BANDS","ZIGZAG",
+               "SMA","EMA","WMA","SMMA","TMA")
+    if name.startswith(overlay) or name.startswith("SMA(") or name.startswith("EMA(") or name.startswith("WMA(") or name.startswith("SMMA(") or name.startswith("TMA("):
+        return 0
+    # heavy oscillators to panel 1
+    panel1 = ("MACD","OSMA","RSI","STOCH","ADX","CCI","WILLR","MOMENTUM","ROC","VORTEX","AO","AC","AROON","BEARS","BULLS","SCHAFF")
+    return 1 if any(name.startswith(p) for p in panel1) else 1
 
+def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
+    os.makedirs("static/plots", exist_ok=True)
     if df.empty:
         out = "empty.png"
         plt.figure(figsize=(8,2)); plt.text(0.5,0.5,"No data", ha="center"); plt.savefig("static/plots/"+out); plt.close()
         return out
-
     out_name = f"{df.index[-1].strftime('%Y%m%d_%H%M%S')}_{strategy}_{tf}.png"
     path = os.path.join("static","plots", out_name)
 
+    # compute indicators
+    ind = compute_indicators(df, indicators or {})
+
+    # ---- mplfinance path
     if HAVE_MPLFIN:
         addplots = []
-        # overlay a few MAs if present in indicators (optional)
-        for name, val in (indicators or {}).items():
-            upper = name.upper()
-            if upper in ("SMA","EMA","WMA","SMMA","TMA"):
-                periods = val if isinstance(val, (list,tuple)) else [val]
-                for p in periods:
-                    p = int(p)
-                    if upper=="SMA":
-                        ser = df["Close"].rolling(p).mean()
-                    elif upper=="EMA":
-                        ser = df["Close"].ewm(span=p, adjust=False).mean()
-                    elif upper=="WMA":
-                        w = np.arange(1,p+1)
-                        ser = df["Close"].rolling(p).apply(lambda x: (x*w).sum()/w.sum(), raw=True)
-                    elif upper=="SMMA":
-                        ser = df["Close"].ewm(alpha=1/p, adjust=False).mean()
-                    else: # TMA
-                        ser = df["Close"].rolling(p).mean().rolling(p).mean()
-                    addplots.append(mpf.make_addplot(ser, panel=0, width=1))
+        # BUY/SELL markers will be scattered later via mpf's 'scatter' on returned axes.
+        for name, val in ind.items():
+            panel = _panel_of(name)
+            if isinstance(val, pd.DataFrame):
+                for col in val.columns:
+                    addplots.append(mpf.make_addplot(val[col], panel=panel, width=1))
+            else:
+                addplots.append(mpf.make_addplot(val, panel=panel, width=1))
 
         fig, axlist = mpf.plot(df, type="candle", style="yahoo", addplot=addplots,
-                               returnfig=True, volume=False, figsize=(13,8),
+                               returnfig=True, volume=False, figsize=(13,9),
                                title=f"{strategy} • TF={tf} • Exp={expiry}")
         ax = axlist[0]
         # markers
@@ -282,32 +552,65 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
                 sell_x.append(s["index"]); sell_y.append(px)
         if buy_x: ax.scatter(buy_x, buy_y, marker="^", s=80)
         if sell_x: ax.scatter(sell_x, sell_y, marker="v", s=80)
+
+        # fractal markers
+        if "FRACTAL_UP" in ind:
+            fu = ind["FRACTAL_UP"].dropna()
+            if not fu.empty: ax.scatter(fu.index, fu.values, marker="^", s=50)
+        if "FRACTAL_DN" in ind:
+            fd = ind["FRACTAL_DN"].dropna()
+            if not fd.empty: ax.scatter(fd.index, fd.values, marker="v", s=50)
+
         fig.savefig(path, dpi=120, bbox_inches="tight"); plt.close(fig)
         return out_name
 
-    # Fallback: simple matplotlib version (no mplfinance)
+    # ---- fallback simple matplotlib
     ds = df.reset_index().rename(columns={"index":"timestamp","Open":"open","High":"high","Low":"low","Close":"close"})
     ds["timestamp"] = pd.to_datetime(ds["time"] if "time" in ds else ds["timestamp"])
-    fig, ax = plt.subplots(1,1,figsize=(13,6))
-    import matplotlib.dates as mdates
     ts = mdates.date2num(pd.to_datetime(ds["timestamp"]).dt.to_pydatetime())
-    for i,(t,o,h,l,c) in enumerate(zip(ts, ds["open"], ds["high"], ds["low"], ds["close"])):
-        color = "#17c964" if c>=o else "#f31260"
-        ax.vlines(t, l, h, color=color, linewidth=1.0, alpha=.9)
-        ax.add_patch(plt.Rectangle((t-0.0008, min(o,c)), 0.0016, max(abs(c-o),1e-6),
+
+    fig = plt.figure(figsize=(13,9))
+    ax = fig.add_subplot(2,1,1)
+    for i,(t,o,h,lw,cl) in enumerate(zip(ts, ds["open"], ds["high"], ds["low"], ds["close"])):
+        color = "#17c964" if cl>=o else "#f31260"
+        ax.vlines(t, lw, h, color=color, linewidth=1.0, alpha=.9)
+        ax.add_patch(plt.Rectangle((t-0.0008, min(o,cl)), 0.0016, max(abs(cl-o),1e-6),
                                    facecolor=color, edgecolor=color, linewidth=.8, alpha=.95))
+
+    # overlay indicators
+    for name,val in ind.items():
+        if _panel_of(name) != 0: continue
+        if isinstance(val, pd.DataFrame):
+            for col in val.columns: ax.plot(df.index, val[col], linewidth=1)
+        else:
+            ax.plot(df.index, val, linewidth=1)
+
+    # markers
     for s in signals:
         i = s["index"]
         if i in df.index:
             px = float(df.loc[i,"Close"])
             ax.scatter([mdates.date2num(i)],[px], marker="^" if s["direction"]=="BUY" else "v", s=60)
+
     ax.set_title(f"{strategy} • TF={tf} • Exp={expiry}")
+    ax.grid(True, alpha=.2)
+
+    # oscillator panel
+    ax2 = fig.add_subplot(2,1,2, sharex=ax)
+    for name,val in ind.items():
+        if _panel_of(name) == 0: continue
+        if isinstance(val, pd.DataFrame):
+            for col in val.columns: ax2.plot(df.index, val[col], linewidth=1)
+        else:
+            ax2.plot(df.index, val, linewidth=1)
+    ax2.set_title("Oscillators")
+    ax2.grid(True, alpha=.2)
+
     fig.autofmt_xdate(); fig.tight_layout()
     fig.savefig(path, dpi=120, bbox_inches="tight"); plt.close(fig)
     return out_name
 
 def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str):
-    from utils import simple_rule_engine  # self-import ok
     ind = compute_indicators(df, indicators or {})
     signals = simple_rule_engine(df, ind, strategy.upper())
     bars = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}.get((expiry or "5m").lower(), 5)
@@ -319,50 +622,36 @@ def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str)
         s["expiry_idx"] = df.index[exp_pos]
         fixed.append(s)
     stats = evaluate_signals_outcomes(df, fixed)
-    return fixed, stats  # (bugfix) ensure this returns a tuple
+    return fixed, stats
 
-# ============================== Telegram helpers =============================
-import requests
-
-BOT_API_BASE = "https://api.telegram.org/bot"
-
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    return v if (v is not None and v != "") else default
-
-def get_token() -> str:
-    token = _env("TELEGRAM_BOT_TOKEN", "")
-    if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-    return token
-
-def bot_url(method: str) -> str:
-    return f"{BOT_API_BASE}{get_token()}/{method}"
-
+# ----------------------------- Telegram helpers ------------------------------
 def get_chat_id_for_tier(tier: str) -> Optional[str]:
     t = (tier or "").lower()
-    if t == "free":  return _env("FREE_CHAT_ID")
-    if t == "basic": return _env("BASIC_CHAT_ID")
-    if t == "pro":   return _env("PRO_CHAT_ID")
-    if t == "vip":   return _env("VIP_CHAT_ID")
-    return None
+    table = {
+        "free":  os.getenv("TELEGRAM_CHAT_FREE")  or os.getenv("TELEGRAM_CHAT_ID_FREE")  or os.getenv("TELEGRAM_CHAT_ID"),
+        "basic": os.getenv("TELEGRAM_CHAT_BASIC") or os.getenv("TELEGRAM_CHAT_ID_BASIC") or os.getenv("TELEGRAM_CHAT_ID"),
+        "pro":   os.getenv("TELEGRAM_CHAT_PRO")   or os.getenv("TELEGRAM_CHAT_ID_PRO")   or os.getenv("TELEGRAM_CHAT_ID"),
+        "vip":   os.getenv("TELEGRAM_CHAT_VIP")   or os.getenv("TELEGRAM_CHAT_ID_VIP")   or os.getenv("TELEGRAM_CHAT_ID"),
+    }
+    return (table.get(t) or "").strip() or None
 
-def telegram_get_me() -> Dict[str, Any]:
+def telegram_send_message(chat_id: str, text: str) -> Dict[str, Any]:
+    import requests
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}
+    if not chat_id:
+        return {"ok": False, "error": "Missing chat_id"}
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        r = requests.get(bot_url("getMe"), timeout=12)
-        return r.json()
+        r = requests.post(url, json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }, timeout=15)
+        js = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": r.ok, "text": r.text}
+        js["_http"] = r.status_code
+        return js
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
-def telegram_send_message(chat_id: str, text: str, parse_mode: Optional[str] = None) -> Dict[str, Any]:
-    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    try:
-        r = requests.post(bot_url("sendMessage"), json=payload, timeout=15)
-        data = r.json()
-        data["_http_status"] = r.status_code
-        data["_sent_at"] = int(datetime.now(timezone.utc).timestamp())
-        return data
-    except Exception as e:
-        return {"ok": False, "error": str(e), "_sent_at": int(datetime.now(timezone.utc).timestamp())}
