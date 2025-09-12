@@ -9,3 +9,4 @@ tzdata==2025.2
 websocket-client==1.8.0
 matplotlib==3.8.4
 mplfinance>=0.12.10b0
+websocket-client>=1.7.0
