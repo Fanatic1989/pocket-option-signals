@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 # App / DB
 # -----------------------------------------------------------------------------
 DB_PATH = os.getenv("SQLITE_PATH", "members.db")
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "99185").strip()  # your app_id
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "99185")
 
 def exec_sql(sql, params=(), fetch=False):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -59,6 +59,56 @@ def set_config(cfg: dict):
     )
 
 # -----------------------------------------------------------------------------
+# Safe coercion helpers (prevents int(dict) crash)
+# -----------------------------------------------------------------------------
+def safe_int(x, default=0):
+    """Coerce possibly-dict/str/float to int; supports {'sec':60}, {'granularity':300} etc."""
+    if x is None:
+        return int(default)
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+    if isinstance(x, (float, np.floating)):
+        return int(x)
+    if isinstance(x, str):
+        try:
+            return int(x.strip())
+        except Exception:
+            return int(default)
+    if isinstance(x, dict):
+        for k in ("sec","secs","seconds","granularity","value","v"):
+            if k in x:
+                try:
+                    return safe_int(x[k], default)
+                except Exception:
+                    pass
+        # sometimes TF dicts look like {'M1':60} — pick first numeric
+        for v in x.values():
+            if isinstance(v, (int,float,np.integer,np.floating, str)):
+                try:
+                    return safe_int(v, default)
+                except Exception:
+                    pass
+        return int(default)
+    # last resort
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+def safe_app_id(s):
+    """Return a digit-only app_id string or default '99185'."""
+    if not s:
+        return "99185"
+    if isinstance(s, (int, np.integer)):
+        return str(int(s))
+    if isinstance(s, str):
+        digits = "".join(ch for ch in s if ch.isdigit())
+        return digits or "99185"
+    return "99185"
+
+DERIV_APP_ID = safe_app_id(DERIV_APP_ID)
+
+# -----------------------------------------------------------------------------
 # Trading window
 # -----------------------------------------------------------------------------
 def within_window(cfg: dict) -> bool:
@@ -66,8 +116,13 @@ def within_window(cfg: dict) -> bool:
     start = w.get("start") or cfg.get("window_start","08:00")
     end   = w.get("end")   or cfg.get("window_end","17:00")
     now_tt = datetime.now(TZ).time()
-    s_h,s_m = [int(x) for x in (start or "08:00").split(":")[:2]]
-    e_h,e_m = [int(x) for x in (end   or "17:00").split(":")[:2]]
+    def hhmm(v, fallback):
+        try:
+            h,m = [int(x) for x in (v or fallback).split(":")[:2]]
+            return h,m
+        except Exception:
+            return (8,0) if fallback=="08:00" else (17,0)
+    s_h,s_m = hhmm(start,"08:00"); e_h,e_m = hhmm(end,"17:00")
     return dtime(s_h,s_m) <= now_tt <= dtime(e_h,e_m)
 
 # -----------------------------------------------------------------------------
@@ -108,7 +163,7 @@ def load_csv(csv_file) -> pd.DataFrame:
     return df
 
 # -----------------------------------------------------------------------------
-# Deriv REST + WebSocket fallback
+# Deriv REST + WebSocket fallback (Deriv-only)
 # -----------------------------------------------------------------------------
 def _series_from_maybe_dict_col(col):
     s = pd.Series(col)
@@ -131,7 +186,7 @@ def _normalize_ohlc_frame(js: dict) -> pd.DataFrame:
     for k in ("epoch","time","t"):
         if k in df:
             epoch = _series_from_maybe_dict_col(df[k]); break
-    if epoch is None and len(df.columns)==1 and isinstance(df.iloc[0,0], dict):
+    if epoch is None and len(df.columns)==1 and df.shape[0] and isinstance(df.iloc[0,0], dict):
         sub = pd.DataFrame(df.iloc[:,0].tolist())
         for k in ("epoch","time","t"):
             if k in sub:
@@ -154,8 +209,7 @@ def _normalize_ohlc_frame(js: dict) -> pd.DataFrame:
     if out.empty: raise RuntimeError("parsed empty candles")
     return out.set_index("time").sort_index()
 
-def _fetch_deriv_rest(symbol: str, granularity_sec: int, days: int, attempts_log: list) -> pd.DataFrame | None:
-    """Try Deriv REST endpoints. Returns DataFrame or None."""
+def _fetch_deriv_rest(symbol: str, granularity_sec, days, attempts_log: list) -> pd.DataFrame | None:
     import requests
     # Normalize symbol → frxPAIR/FRXPAIR
     sym = (symbol or "").strip()
@@ -167,12 +221,11 @@ def _fetch_deriv_rest(symbol: str, granularity_sec: int, days: int, attempts_log
     sym_uc = sym_lc.upper()
     candidates = [sym_lc, sym_uc] if sym_lc != sym_uc else [sym_lc]
 
-    # Clamp TF
+    gran = safe_int(granularity_sec, 300)
     allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
-    try: g_in = int(granularity_sec)
-    except Exception: g_in = 300
-    gran = min(allowed, key=lambda g: abs(g - g_in))
-    approx = min(2000, max(300, int(days * 86400 // gran)))
+    gran = min(allowed, key=lambda g: abs(g - gran))
+    d = safe_int(days, 5)
+    approx = min(2000, max(300, int(d * 86400 // gran)))
 
     def try_request(url, params):
         params = dict(params or {})
@@ -198,22 +251,19 @@ def _fetch_deriv_rest(symbol: str, granularity_sec: int, days: int, attempts_log
                          {"symbol": s, "granularity": gran, "count": approx})
         if df is not None and not df.empty: return df
         end = int(datetime.now(timezone.utc).timestamp())
-        start = end - days*86400
+        start = end - d*86400
         df = try_request("https://api.deriv.com/api/explore/candles",
                          {"symbol": s, "granularity": gran, "start": start, "end": end})
         if df is not None and not df.empty: return df
     return None
 
-def _fetch_deriv_ws(symbol: str, granularity_sec: int, days: int, attempts_log: list) -> pd.DataFrame | None:
-    """Use Deriv WebSocket ticks_history(style=candles)."""
-    # Lazy import; if lib missing, we return None and let caller raise a clear error.
+def _fetch_deriv_ws(symbol: str, granularity_sec, days, attempts_log: list) -> pd.DataFrame | None:
     try:
-        from websocket import create_connection  # websocket-client
+        from websocket import create_connection
     except Exception as e:
         attempts_log.append(("websocket-client-missing", str(e)))
         return None
 
-    # Normalize symbol to frxPAIR uppercase (what WS examples use)
     sym = (symbol or "").strip()
     if not sym.lower().startswith("frx"):
         sym = PO2DERIV.get(sym.upper(), sym)
@@ -222,24 +272,21 @@ def _fetch_deriv_ws(symbol: str, granularity_sec: int, days: int, attempts_log: 
         return None
     sym = ("frx" + sym[-6:].upper()).upper()  # FRXPAIR
 
-    # Clamp TF and count
+    gran = safe_int(granularity_sec, 300)
     allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
-    try: g_in = int(granularity_sec)
-    except Exception: g_in = 300
-    gran = min(allowed, key=lambda g: abs(g - g_in))
-    count = min(2000, max(300, int(days * 86400 // gran)))
+    gran = min(allowed, key=lambda g: abs(g - gran))
+    d = safe_int(days, 5)
+    count = min(2000, max(300, int(d * 86400 // gran)))
 
-    # WS URL
-    appid = int(DERIV_APP_ID) if DERIV_APP_ID.isdigit() else 99185
+    appid = safe_app_id(DERIV_APP_ID)
     ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={appid}"
 
-    # Request payload per Deriv docs:
     req = {
         "ticks_history": sym,
         "adjust_start_time": 1,
-        "count": count,
+        "count": int(count),
         "end": "latest",
-        "granularity": gran,
+        "granularity": int(gran),
         "style": "candles"
     }
 
@@ -254,7 +301,6 @@ def _fetch_deriv_ws(symbol: str, granularity_sec: int, days: int, attempts_log: 
 
     try:
         js = json.loads(raw)
-        # Deriv returns {'candles':[...]} or an error {'error':{...}}
         if js.get("error"):
             attempts_log.append(("ws_error", js["error"]))
             return None
@@ -264,11 +310,12 @@ def _fetch_deriv_ws(symbol: str, granularity_sec: int, days: int, attempts_log: 
         attempts_log.append(("ws_parse_error", str(e)))
         return None
 
-def fetch_deriv_history(symbol: str, granularity_sec: int, days: int = 5) -> pd.DataFrame:
+def fetch_deriv_history(symbol: str, granularity_sec, days=5) -> pd.DataFrame:
     """
     Deriv-only fetch:
-      1) Try REST endpoints (with DERIV_APP_ID)
-      2) If 404/blocked, fall back to WebSocket ticks_history(style='candles')
+      1) Try REST (with DERIV_APP_ID)
+      2) On fail/404, use WebSocket ticks_history(style='candles')
+    All numeric inputs are safely coerced (prevents int(dict) crashes).
     """
     attempts = []
     df = _fetch_deriv_rest(symbol, granularity_sec, days, attempts)
@@ -276,8 +323,8 @@ def fetch_deriv_history(symbol: str, granularity_sec: int, days: int = 5) -> pd.
         df = _fetch_deriv_ws(symbol, granularity_sec, days, attempts)
     if df is None or df.empty:
         raise RuntimeError(
-            f"Deriv fetch failed for symbol={symbol}, tf={granularity_sec}. Attempts: {attempts}. "
-            f"Tip: ensure DERIV_APP_ID is valid and symbol exists (e.g. frxEURUSD). "
+            f"Deriv fetch failed for symbol={symbol}, tf={safe_int(granularity_sec,300)}. "
+            f"Attempts: {attempts}. Tip: set DERIV_APP_ID and ensure pair exists (e.g. frxEURUSD). "
             f"You can also uncheck 'Use Deriv server fetch' and upload a CSV."
         )
     return df
