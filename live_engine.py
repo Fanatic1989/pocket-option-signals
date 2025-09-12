@@ -1,13 +1,9 @@
-# live_engine.py — Telegram wiring + live loop + daily caps (GitHub-fixed)
+# live_engine.py — Telegram wiring + live loop + daily caps (compatible with GitHub dashboard)
 from __future__ import annotations
 
-import os
-import json
-import time
-import threading
+import os, json, time, threading
 from datetime import datetime, date, timezone
 from typing import Optional, Dict, Any, Tuple
-
 import requests
 
 # ===================== Telegram configuration ================================
@@ -15,20 +11,19 @@ import requests
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 def _first_nonempty(*names: str) -> str:
-    """Return the first non-empty environment variable value among names."""
     for n in names:
         v = os.getenv(n, "").strip()
         if v:
             return v
     return ""
 
-# Support ALL common naming styles (new + legacy)
-CHAT_FREE  = _first_nonempty("FREE_CHAT_ID",  "TELEGRAM_CHAT_ID_FREE",  "TELEGRAM_CHAT_FREE")
-CHAT_BASIC = _first_nonempty("BASIC_CHAT_ID", "TELEGRAM_CHAT_ID_BASIC", "TELEGRAM_CHAT_BASIC")
-CHAT_PRO   = _first_nonempty("PRO_CHAT_ID",   "TELEGRAM_CHAT_ID_PRO",   "TELEGRAM_CHAT_PRO")
-CHAT_VIP   = _first_nonempty("VIP_CHAT_ID",   "TELEGRAM_CHAT_ID_VIP",   "TELEGRAM_CHAT_VIP")
+# Support ALL common naming styles (yours from screenshot included)
+CHAT_FREE  = _first_nonempty("TELEGRAM_CHAT_FREE",  "TELEGRAM_CHAT_ID_FREE",  "FREE_CHAT_ID")
+CHAT_BASIC = _first_nonempty("TELEGRAM_CHAT_BASIC", "TELEGRAM_CHAT_ID_BASIC", "BASIC_CHAT_ID")
+CHAT_PRO   = _first_nonempty("TELEGRAM_CHAT_PRO",   "TELEGRAM_CHAT_ID_PRO",   "PRO_CHAT_ID")
+CHAT_VIP   = _first_nonempty("TELEGRAM_CHAT_VIP",   "TELEGRAM_CHAT_ID_VIP",   "VIP_CHAT_ID")
 
-# Optional single fallback (used if a tier’s chat isn’t set)
+# Optional fallback if you keep one global channel
 FALLBACK_CHAT = _first_nonempty("TELEGRAM_CHAT_ID", "CHAT_ID_FALLBACK")
 
 TIER_TO_CHAT: Dict[str, str] = {
@@ -38,21 +33,12 @@ TIER_TO_CHAT: Dict[str, str] = {
     "vip":   CHAT_VIP   or FALLBACK_CHAT,
 }
 
-# For /telegram/diag visibility
-TELEGRAM_CHAT_KEYS = [
-    "FREE_CHAT_ID","TELEGRAM_CHAT_ID_FREE","TELEGRAM_CHAT_FREE",
-    "BASIC_CHAT_ID","TELEGRAM_CHAT_ID_BASIC","TELEGRAM_CHAT_BASIC",
-    "PRO_CHAT_ID","TELEGRAM_CHAT_ID_PRO","TELEGRAM_CHAT_PRO",
-    "VIP_CHAT_ID","TELEGRAM_CHAT_ID_VIP","TELEGRAM_CHAT_VIP",
-    "TELEGRAM_CHAT_ID","CHAT_ID_FALLBACK",
-]
-
 # Per-tier daily caps (None => unlimited)
 DAILY_CAPS: Dict[str, Optional[int]] = {
     "free":  3,
-    "basic": 6,   # GitHub spec
+    "basic": 6,     # your GitHub spec
     "pro":   15,
-    "vip":   None,
+    "vip":   None,  # unlimited
 }
 
 # ===================== Low-level Telegram sender =============================
@@ -60,8 +46,8 @@ DAILY_CAPS: Dict[str, Optional[int]] = {
 def _send_telegram(text: str, tier: str = "vip") -> Tuple[bool, Dict[str, Any]]:
     """
     Send a message to the Telegram channel for the given tier.
-    Returns (ok, raw_result_dict). raw_result_dict always contains either Telegram JSON
-    or an {"ok": False, "error": "..."} shape for clarity in the dashboard.
+    Returns (ok, raw_result_dict). raw_result_dict mirrors Telegram JSON, or
+    {"ok": False, "error": "..."} on failure.
     """
     if not BOT_TOKEN:
         return False, {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}
@@ -80,54 +66,42 @@ def _send_telegram(text: str, tier: str = "vip") -> Tuple[bool, Dict[str, Any]]:
     }
     try:
         r = requests.post(url, json=payload, timeout=15)
-        js = {}
         try:
             js = r.json()
         except Exception:
             js = {"ok": False, "error": f"Non-JSON response: {r.text[:400]}..."}
         js["_http_status"] = r.status_code
         js["_sent_at"] = int(datetime.now(timezone.utc).timestamp())
-        ok = bool(js.get("ok") is True)
-        return ok, js
+        return bool(js.get("ok")), js
     except Exception as e:
         return False, {"ok": False, "error": str(e), "_sent_at": int(datetime.now(timezone.utc).timestamp())}
 
-def tg_test() -> Tuple[bool, str]:
-    """
-    Sends one short test message to each configured tier (free/basic/pro/vip).
-    Returns (ok, info_json_string).
-    """
+def tg_test_all() -> Tuple[bool, str]:
+    """Send a small test to every configured tier. Returns (ok, json_string)."""
     results: Dict[str, Any] = {}
-    tiers = ("free","basic","pro","vip")
-
     if not BOT_TOKEN:
         return False, json.dumps({"error": "Missing TELEGRAM_BOT_TOKEN"})
-
     if not any(TIER_TO_CHAT.values()):
         return False, json.dumps({"error": "No Telegram channels configured"})
 
-    for t in tiers:
+    for t in ("free","basic","pro","vip"):
         if TIER_TO_CHAT.get(t):
-            ok, info = _send_telegram(f"🧪 Test from bot ({t.upper()})", t)
+            ok, info = _send_telegram(f"🧪 Bot test ({t.upper()})", t)
             results[t] = {"ok": ok, "info": info}
         else:
             results[t] = {"ok": False, "info": "not configured"}
-
-    overall_ok = any(v["ok"] for v in results.values())
-    return overall_ok, json.dumps(results, ensure_ascii=False)
+    return any(v["ok"] for v in results.values()), json.dumps(results, ensure_ascii=False)
 
 # ===================== Live Engine ===========================================
 
 class LiveEngine:
     """
-    Minimal live loop with:
-      - start/stop
-      - per-tier daily tallies with cap enforcement
-      - debug flag
-      - thread-safe counters
-      - last_send_result (raw Telegram JSON) for dashboard display
+    - start/stop loop (lightweight heartbeat)
+    - per-tier daily tallies with cap enforcement
+    - debug flag
+    - thread-safe counters
+    - last_send_result exposed for dashboards
     """
-
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
@@ -141,7 +115,7 @@ class LiveEngine:
         self.last_send_result: Dict[str, Any] = {}
         self.last_error: Optional[str] = None
 
-    # ---------- Internal helpers ----------
+    # ---------- helpers ----------
     def _maybe_reset_tallies(self) -> None:
         with self._lock:
             today = date.today().isoformat()
@@ -160,11 +134,10 @@ class LiveEngine:
         with self._lock:
             return self._tally["by_tier"].get(tier, 0) >= cap
 
-    # ---------- Public API ----------
+    # ---------- public ----------
     def tally(self) -> Dict[str, Any]:
         self._maybe_reset_tallies()
         with self._lock:
-            # deep copy for safety
             return json.loads(json.dumps(self._tally))
 
     def status(self) -> Dict[str, Any]:
@@ -194,7 +167,6 @@ class LiveEngine:
             if not self._running:
                 return True, "already stopped"
             self._running = False
-        # allow the thread to exit
         for _ in range(40):
             t = self._thread
             if not t or not t.is_alive():
@@ -207,10 +179,7 @@ class LiveEngine:
             self.debug = bool(value)
 
     def send_signal(self, tier: str, text: str) -> Tuple[bool, str]:
-        """
-        Safely send a message respecting daily caps.
-        Return (ok, 'sent' | reason).
-        """
+        """Cap-aware send used by normal flows."""
         self._maybe_reset_tallies()
         tier = (tier or "vip").lower()
         if tier not in ("free","basic","pro","vip"):
@@ -220,12 +189,8 @@ class LiveEngine:
         if self._cap_reached(tier):
             return False, f"daily cap reached for {tier} ({DAILY_CAPS.get(tier)})"
 
-        msg = text
-        if self.debug:
-            msg = f"[DEBUG]\n{datetime.now(timezone.utc).isoformat(timespec='seconds')}Z\n\n{text}"
-
+        msg = text if not self.debug else f"[DEBUG]\n{datetime.now(timezone.utc).isoformat(timespec='seconds')}Z\n\n{text}"
         ok, info = _send_telegram(msg, tier)
-        # keep last result for dashboards
         with self._lock:
             self.last_send_result = info
         if ok:
@@ -233,14 +198,20 @@ class LiveEngine:
             return True, "sent"
         return False, info.get("description") or info.get("error") or "send failed"
 
-    # -------- Compatibility alias (dict result like telegram API) -------------
+    def send_raw(self, tier: str, text: str) -> Dict[str, Any]:
+        """
+        Non-cap test sender for /telegram/test — does NOT increment tallies.
+        Returns raw Telegram JSON.
+        """
+        ok, info = _send_telegram(text, tier)
+        with self._lock:
+            self.last_send_result = info
+        return info
+
+    # Compat alias for older routes (expects Telegram-like dict)
     def send_to_tier(self, tier: str, text: str) -> Dict[str, Any]:
-        """
-        Compatibility for routes expecting a Telegram-like dict.
-        """
         ok, reason = self.send_signal(tier, text)
         if ok:
-            # last_send_result already has raw API JSON; surface that
             with self._lock:
                 data = dict(self.last_send_result) if isinstance(self.last_send_result, dict) else {}
             if not data:
@@ -249,24 +220,17 @@ class LiveEngine:
             return data
         return {"ok": False, "error": reason}
 
-    # ---------- Loop ----------
+    # ---------- loop ----------
     def _loop(self) -> None:
-        """
-        Very light loop: ready for future strategy wiring. Currently just idles,
-        resets tallies each day, and prints a debug heartbeat if enabled.
-        """
         while True:
             with self._lock:
                 running = self._running
             if not running:
                 break
-
             self._maybe_reset_tallies()
-
             if self.debug:
                 print(f"[ENGINE] tick {datetime.utcnow().isoformat()}Z | tally={self._tally}")
-
             time.sleep(max(1, self._sleep_seconds))
 
-# Singleton instance (imported by routes)
+# Singleton importable by routes
 ENGINE = LiveEngine()
