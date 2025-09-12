@@ -1,6 +1,5 @@
 # utils.py — config store, TZ, sqlite, Deriv fetch (REST + WebSocket fallback),
 # symbols, backtest helpers, plotting (clear markers + shaded expiry)
-
 import os, json, sqlite3
 from datetime import datetime, time as dtime, timezone
 import pandas as pd
@@ -206,7 +205,6 @@ def _normalize_ohlc_frame(js: dict) -> pd.DataFrame:
 
 def _fetch_deriv_rest(symbol: str, granularity_sec, days, attempts_log: list) -> pd.DataFrame | None:
     import requests
-    # Normalize symbol → frxPAIR/FRXPAIR
     sym = (symbol or "").strip()
     if not sym.lower().startswith("frx"):
         sym = PO2DERIV.get(sym.upper(), sym)
@@ -233,14 +231,12 @@ def _fetch_deriv_rest(symbol: str, granularity_sec, days, attempts_log: list) ->
         except Exception:
             return None
 
-    # v4/v3 with count
     for s in candidates:
         for base in ("https://api.deriv.com/api/v4/price_history",
                      "https://api.deriv.com/api/v3/price_history"):
             df = try_request(base, {"symbol": s, "granularity": gran, "count": approx})
             if df is not None and not df.empty: return df
 
-    # api-explorer candles with count then start/end
     for s in candidates:
         df = try_request("https://api.deriv.com/api/explore/candles",
                          {"symbol": s, "granularity": gran, "count": approx})
@@ -265,7 +261,7 @@ def _fetch_deriv_ws(symbol: str, granularity_sec, days, attempts_log: list) -> p
     if not sym.lower().startswith("frx"):
         attempts_log.append(("ws_symbol_invalid", symbol))
         return None
-    sym = ("FRX" + sym[-6:].upper())  # FRXPAIR
+    sym = ("FRX" + sym[-6:].upper())
 
     gran = safe_int(granularity_sec, 300)
     allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
@@ -306,12 +302,7 @@ def _fetch_deriv_ws(symbol: str, granularity_sec, days, attempts_log: list) -> p
         return None
 
 def fetch_deriv_history(symbol: str, granularity_sec, days=5) -> pd.DataFrame:
-    """
-    Deriv-only fetch:
-      1) Try REST (with DERIV_APP_ID)
-      2) On fail/404, use WebSocket ticks_history(style='candles')
-    All numeric inputs are safely coerced (prevents int(dict) crashes).
-    """
+    """Deriv-only fetch: REST first, then WebSocket fallback."""
     attempts = []
     df = _fetch_deriv_rest(symbol, granularity_sec, days, attempts)
     if df is None or df.empty:
@@ -330,10 +321,7 @@ def fetch_deriv_history(symbol: str, granularity_sec, days=5) -> pd.DataFrame:
 EXPIRY_TO_BARS = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
 
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
-    """
-    Robust indicator builder.
-    Accepts period inputs as numbers/strings/lists/tuples/dicts.
-    """
+    """Robust indicator builder (numbers/strings/lists/tuples/dicts)."""
     out = {}
     close = df["Close"]
 
@@ -366,17 +354,15 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
         except Exception:
             return []
 
-    # ----------------- Moving Averages -----------------
+    # MAs
     if "SMA" in ind_cfg:
         for p in _to_period_list(ind_cfg["SMA"]):
             if p > 0:
                 out[f"SMA({p})"] = close.rolling(p).mean()
-
     if "EMA" in ind_cfg:
         for p in _to_period_list(ind_cfg["EMA"]):
             if p > 0:
                 out[f"EMA({p})"] = close.ewm(span=p, adjust=False).mean()
-
     if "WMA" in ind_cfg:
         for p in _to_period_list(ind_cfg["WMA"]):
             if p > 0:
@@ -384,21 +370,23 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
                 out[f"WMA({p})"] = close.rolling(p).apply(
                     lambda x: (x * w).sum() / w.sum(), raw=True
                 )
-
     if "SMMA" in ind_cfg:
         for p in _to_period_list(ind_cfg["SMMA"]):
             if p > 0:
                 out[f"SMMA({p})"] = close.ewm(alpha=1 / p, adjust=False).mean()
-
     if "TMA" in ind_cfg:
         for p in _to_period_list(ind_cfg["TMA"]):
             if p > 0:
                 out[f"TMA({p})"] = close.rolling(p).mean().rolling(p).mean()
 
-    # ----------------- Oscillators -----------------
+    # Oscillators
     if "RSI" in ind_cfg and isinstance(ind_cfg["RSI"], dict) and ind_cfg["RSI"].get("show", True):
-        pr_list = _to_period_list(ind_cfg["RSI"].get("period", 14)) or [14]
-        pr = max(1, pr_list[0])
+        pr = 14
+        try:
+            pr_list = _to_period_list(ind_cfg["RSI"].get("period", 14))
+            pr = max(1, pr_list[0]) if pr_list else 14
+        except Exception:
+            pr = 14
         delta = close.diff()
         up = delta.clip(lower=0).ewm(alpha=1 / pr, adjust=False).mean()
         down = (-delta.clip(upper=0)).ewm(alpha=1 / pr, adjust=False).mean()
@@ -426,7 +414,9 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         exp_pos = min(pos + max(1,bars), len(all_idx)-1)
         signals.append({"index": sig_idx, "direction": direction, "expiry_idx": all_idx[exp_pos]})
 
-    if rule_name == "TREND":
+    rule = (rule_name or "").upper()
+
+    if rule == "TREND":
         sma50 = ind.get("SMA(50)")
         if sma50 is None: return signals
         above = close > sma50
@@ -436,7 +426,7 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         for ts, _ in cross_dn[cross_dn].items(): add(ts, "SELL", 5)
         return signals
 
-    if rule_name == "CHOP":
+    if rule == "CHOP":
         rsi = ind.get("RSI")
         if rsi is None: return signals
         bounce_up = (rsi.shift(1) < 50) & (rsi >= 50)
@@ -445,7 +435,7 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         for ts in rsi.index[bounce_dn.fillna(False)]: add(ts, "SELL", 3)
         return signals
 
-    # BASE: Stoch cross
+    # BASE / CUSTOM: Stochastic cross
     k = ind.get("STOCH_K"); d = ind.get("STOCH_D")
     if k is not None and d is not None:
         cross_up = (k.shift(1) < d.shift(1)) & (k >= d)
@@ -474,7 +464,7 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
             "win_rate": (wins*100.0/max(1,wins+loss))}
 
 # -----------------------------------------------------------------------------
-# Plotting — clean, high-contrast (last 180 candles, markers + shaded expiry)
+# Plotting — clear, high-contrast (last 180 candles, markers + shaded expiry)
 # -----------------------------------------------------------------------------
 def _limit_df(df: pd.DataFrame, last_n: int = 180) -> pd.DataFrame:
     if df is None or df.empty: return df
@@ -505,7 +495,7 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
     out_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{strategy}_{tf}.png"
     path = os.path.join("static","plots", out_name)
 
-    # ---------- Prefer mplfinance ----------
+    # Prefer mplfinance
     if HAVE_MPLFIN:
         addplots = []
         for name, series in ind.items():
@@ -513,12 +503,9 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
                 addplots.append(mpf.make_addplot(series, panel=0, width=1.15, alpha=0.95))
 
         use_osc = ("RSI" in ind) or ("STOCH_K" in ind and "STOCH_D" in ind)
-
         if "RSI" in ind:
-            addplots.append(
-                mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100),
-                                 width=1.1, secondary_y=False, color="#60a5fa")
-            )
+            addplots.append(mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100),
+                                             width=1.1, secondary_y=False, color="#60a5fa"))
         if "STOCH_K" in ind and "STOCH_D" in ind:
             addplots.append(mpf.make_addplot(ind["STOCH_K"], panel=1, width=1.0, color="#22c55e"))
             addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=1, width=1.0, color="#f59e0b"))
@@ -539,7 +526,6 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         )
         ax_price = axlist[0]
 
-        # BUY/SELL markers + shaded expiry
         if signals:
             buy_x, buy_y, sell_x, sell_y = [], [], [], []
             for s in signals:
@@ -567,8 +553,9 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         plt.close(fig)
         return out_name
 
-    # ---------- Fallback: plain matplotlib ----------
+    # Fallback matplotlib
     fig, ax = plt.subplots(1,1,figsize=(15,7), dpi=200)
+    import matplotlib.dates as mdates
     ts = mdates.date2num(df.index.to_pydatetime())
     for t,(o,h,l,c) in enumerate(zip(df["Open"], df["High"], df["Low"], df["Close"])):
         x = ts[t]
@@ -599,12 +586,64 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
     return out_name
 
 # -----------------------------------------------------------------------------
-# Backtest run
+# Strategy requirements → always generate entries/exits for chosen strategy
+# -----------------------------------------------------------------------------
+def ensure_strategy_requirements(ind_cfg: dict, strategy: str) -> dict:
+    """
+    Ensure the minimal indicators required by a strategy are present
+    for the current run (does not mutate persisted config).
+    """
+    cfg = {k: (v.copy() if isinstance(v, dict) else v) for k, v in (ind_cfg or {}).items()}
+    s = (strategy or "").upper()
+
+    if s in ("BASE", "CUSTOM1", "CUSTOM2", "CUSTOM3"):
+        st = cfg.get("STOCH")
+        if not isinstance(st, dict):
+            st = {"show": True, "k": 14, "d": 3}
+        else:
+            st.setdefault("show", True)
+            st.setdefault("k", 14)
+            st.setdefault("d", 3)
+        cfg["STOCH"] = st
+
+    if s == "TREND":
+        sma = cfg.get("SMA")
+        if sma is None:
+            cfg["SMA"] = [50]
+        elif isinstance(sma, (int, float, str)):
+            p = int(float(str(sma)))
+            cfg["SMA"] = sorted({p, 50})
+        elif isinstance(sma, (list, tuple, set)):
+            cfg["SMA"] = sorted({int(float(str(x))) for x in sma} | {50})
+        elif isinstance(sma, dict):
+            vals = {50}
+            for v in sma.values():
+                try: vals.add(int(float(str(v))))
+                except: pass
+            cfg["SMA"] = sorted(vals)
+
+    if s == "CHOP":
+        rsi = cfg.get("RSI")
+        if not isinstance(rsi, dict):
+            rsi = {"show": True, "period": 14}
+        else:
+            rsi.setdefault("show", True)
+            rsi.setdefault("period", 14)
+        cfg["RSI"] = rsi
+
+    return cfg
+
+# -----------------------------------------------------------------------------
+# Backtest run (uses ensure_strategy_requirements)
 # -----------------------------------------------------------------------------
 def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str):
-    ind = compute_indicators(df, indicators or {})
-    signals = simple_rule_engine(df, ind, strategy.upper())
-    bars = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}.get((expiry or "5m").lower(), 5)
+    ind_cfg = ensure_strategy_requirements(indicators or {}, strategy)
+    ind = compute_indicators(df, ind_cfg)
+    signals = simple_rule_engine(df, ind, (strategy or "").upper())
+
+    bars_map = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
+    bars = bars_map.get((expiry or "5m").lower(), 5)
+
     fixed = []
     for s in signals:
         i = s["index"]
@@ -612,5 +651,6 @@ def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str)
         exp_pos = min(pos + max(1,bars), len(df.index)-1)
         s["expiry_idx"] = df.index[exp_pos]
         fixed.append(s)
+
     stats = evaluate_signals_outcomes(df, fixed)
     return fixed, stats
