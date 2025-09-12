@@ -1,9 +1,9 @@
 # routes.py — FULL BUILD (fixed)
-# Features kept:
+# Features:
 # - Dashboard: window (08:00–17:00 TT), TF/expiry, strategies (BASE/TREND/CHOP + CUSTOM1..3),
-#   indicators (full catalog via indicators.py), multi-symbol selectors (PO majors + Deriv frx*)
-#   + free text + PO→Deriv auto-convert.
-# - Backtest: multi-symbol, server CSV or uploaded CSV, price candles + overlays, RSI/Stoch/MACD/etc panels,
+#   indicators (SMA/EMA/WMA/SMMA/TMA/RSI/Stoch with periods & toggles),
+#   multi-symbol selectors (PO majors + Deriv frx*) + free text + PO→Deriv auto-convert.
+# - Backtest: multi-symbol, server CSV or uploaded CSV, price candles + MA/RSI/Stoch overlays,
 #   BUY/SELL markers + shaded expiry, JSON/CSV export, plot served with no-cache.
 # - Live engine: start/stop/debug/status, tally endpoint.
 # - Telegram: test & diag.
@@ -36,7 +36,7 @@ import matplotlib.dates as mdates
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
 # --- Project modules (avoid circular imports by importing here) ---------------
-from utils import exec_sql, get_config, set_config, within_window, TZ, TIMEZONE
+from utils import exec_sql, get_config, set_config, within_window, TZ
 from indicators import INDICATOR_SPECS
 from strategies import run_backtest_core_binary
 from rules import parse_natural_rule
@@ -60,11 +60,9 @@ DERIV_FRX = [
     "frxEURNZD","frxEURCAD","frxGBPCAD","frxGBPCHF","frxNZDCHF","frxNZDCAD"
 ]
 PO_MAJOR = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY"]
-
-# NOTE: use key "pairs" (NOT "items") to avoid jinja .items() clash in templates
 AVAILABLE_GROUPS = [
-    {"label": "Deriv (frx*)", "pairs": DERIV_FRX},
-    {"label": "Pocket Option majors", "pairs": PO_MAJOR},
+    {"label": "Deriv (frx*)", "items": DERIV_FRX},
+    {"label": "Pocket Option majors", "items": PO_MAJOR},
 ]
 
 # ===== Small helpers ===========================================================
@@ -82,10 +80,11 @@ def _cfg_dict(x):
 def _merge_unique(xs):
     out, seen = [], set()
     for x in xs:
-        if not x:
+        if not x: 
             continue
         if x not in seen:
-            out.append(x); seen.add(x)
+            out.append(x)
+            seen.add(x)
     return out
 
 def _is_po_symbol(sym: str) -> bool:
@@ -113,15 +112,17 @@ def _expand_all_symbols(tokens):
             out.append(t)
     return _merge_unique(out)
 
-# ===== Minimal plotting helpers (overlays + a few panels) =====================
+# ===== Minimal indicators for plotting (overlays only) ========================
 def _sma(s, p):   return s.rolling(int(p), min_periods=1).mean()
 def _ema(s, p):   return s.ewm(span=int(p), adjust=False).mean()
 def _wma(s, p):
-    p=int(p); w=pd.Series(range(1, p+1), dtype=float)
+    p=int(p)
+    w=pd.Series(range(1, p+1), dtype=float)
     return s.rolling(p).apply(lambda x: (w.to_numpy()*x).sum()/w.sum(), raw=True)
 def _smma(s, p):  return s.ewm(alpha=1.0/float(p), adjust=False).mean()
 def _tma(s, p):
-    p=int(p); p1=max(1, int(math.ceil(p/2)))
+    p=int(p)
+    p1=max(1, int(math.ceil(p/2)))
     return _sma(_sma(s, p1), p)
 
 def _rsi(close, period=14):
@@ -142,23 +143,30 @@ def _stoch(h, l, c, k=14, d=3, smooth_k=3):
 
 def _any_on(d):
     d=_cfg_dict(d)
-    return any(_cfg_dict(d.get(k)).get("enabled") for k in INDICATOR_SPECS.keys())
+    for k in ("sma","ema","wma","smma","tma","rsi","stoch"):
+        if _cfg_dict(d.get(k)).get("enabled"):
+            return True
+    return False
 
 def _compute_lines(df, ind_cfg):
     ind_cfg=_cfg_dict(ind_cfg)
+    if not _any_on(ind_cfg):
+        ind_cfg={"sma":{"enabled":True,"period":50},"rsi":{"enabled":True,"period":14},
+                 "stoch":{"enabled":True,"k":14,"d":3,"smooth_k":3}}
     o,h,l,c = df["open"], df["high"], df["low"], df["close"]
     out={}
-    # overlays (MAs)
-    for k,label in (("sma","SMA"),("ema","EMA"),("wma","WMA"),("smma","SMMA"),("tma","TMA")):
-        spec = ind_cfg.get(k,{})
-        if spec.get("enabled"):
-            p=int(spec.get("period", INDICATOR_SPECS[k]["params"]["period"]))
-            f = {"sma":_sma,"ema":_ema,"wma":_wma,"smma":_smma,"tma":_tma}[k]
-            out[f"{label}({p})"] = f(c,p)
-    # panels
+    if ind_cfg.get("sma",{}).get("enabled"):
+        p=int(ind_cfg["sma"].get("period",50)); out[f"SMA({p})"]=_sma(c,p)
+    if ind_cfg.get("ema",{}).get("enabled"):
+        p=int(ind_cfg["ema"].get("period",50)); out[f"EMA({p})"]=_ema(c,p)
+    if ind_cfg.get("wma",{}).get("enabled"):
+        p=int(ind_cfg["wma"].get("period",50)); out[f"WMA({p})"]=_wma(c,p)
+    if ind_cfg.get("smma",{}).get("enabled"):
+        p=int(ind_cfg["smma"].get("period",50)); out[f"SMMA({p})"]=_smma(c,p)
+    if ind_cfg.get("tma",{}).get("enabled"):
+        p=int(ind_cfg["tma"].get("period",50)); out[f"TMA({p})"]=_tma(c,p)
     if ind_cfg.get("rsi",{}).get("enabled"):
-        p=int(ind_cfg["rsi"].get("length", INDICATOR_SPECS["RSI"]["params"]["length"]))
-        out[f"RSI({p})"]=_rsi(c,p)
+        p=int(ind_cfg["rsi"].get("period",14)); out[f"RSI({p})"]=_rsi(c,p)
     if ind_cfg.get("stoch",{}).get("enabled"):
         kp=int(ind_cfg["stoch"].get("k",14)); dp=int(ind_cfg["stoch"].get("d",3)); sp=int(ind_cfg["stoch"].get("smooth_k",3))
         k,d=_stoch(h,l,c,kp,dp,sp); out[f"StochK({kp},{dp},{sp})"]=k; out[f"StochD({kp},{dp},{sp})"]=d
@@ -173,7 +181,8 @@ def _draw_candles(ax, df):
     else:
         step=60.0
     width=(step/(24*3600))*0.9
-    x=mdates.date2num(ts.dt.to_pydatetime())
+    # FIX: avoid to_pydatetime FutureWarning (robust conversion)
+    x = mdates.date2num([d.to_pydatetime() for d in ts])
     for xi, oo, hh, ll, cc in zip(x,o,h,l,c):
         if pd.isna([oo,hh,ll,cc]).any(): continue
         up=cc>=oo; color="#17c964" if up else "#f31260"
@@ -237,7 +246,7 @@ def _save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars
     axp=axes[0]; _draw_candles(axp, ds)
     ts=ds["timestamp"]
 
-    # overlays (MAs)
+    # MA overlays
     if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
         for name, s in lines.items():
             if any(name.startswith(p) for p in ("SMA(", "EMA(", "WMA(", "SMMA(", "TMA(")):
@@ -314,7 +323,7 @@ def login():
             return redirect(request.args.get("next") or url_for("dashboard.dashboard"))
         flash("Invalid password","error")
     cfg=_cfg_dict(get_config())
-    return render_template("dashboard.html", view="login", window=cfg.get("window",{}), tz=TIMEZONE)
+    return render_template("dashboard.html", view="login", window=cfg.get("window",{}), tz=str(TZ))
 
 @bp.route("/logout")
 def logout():
@@ -327,7 +336,7 @@ def index():
     return render_template("dashboard.html", view="index",
                            within=within_window(cfg),
                            now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                           tz=TIMEZONE, window=cfg.get("window", {}))
+                           tz=str(TZ), window=cfg.get("window", {}))
 
 # ===== Dashboard ==============================================================
 @bp.route("/dashboard")
@@ -362,13 +371,13 @@ def dashboard():
                            live_tf=cfg.get("live_tf","M5"),
                            live_expiry=cfg.get("live_expiry","5m"),
                            now=datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                           tz=TIMEZONE)
+                           tz=str(TZ))
 
 # ===== Settings updates =======================================================
 @bp.route("/update_window", methods=["POST"])
 @require_login
 def update_window():
-    cfg=_cfg_dict(get_config()); cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":TIMEZONE})
+    cfg=_cfg_dict(get_config()); cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":str(TZ)})
     for k in ("start","end","timezone"): cfg["window"][k]=request.form.get(k, cfg["window"][k])
     if request.form.get("live_tf"): cfg["live_tf"]=request.form.get("live_tf").upper()
     if request.form.get("live_expiry"): cfg["live_expiry"]=request.form.get("live_expiry")
@@ -383,6 +392,9 @@ def update_strategies():
     for i in (1,2,3):
         box=bool(request.form.get(f"s_CUSTOM{i}")); key=f"custom{i}"
         cfg.setdefault(key, {}); cfg[key]["enabled"]=box; cfg["strategies"][f"CUSTOM{i}"]={"enabled":box}
+    # defaults for TF/expiry used by live/backtest forms
+    cfg["live_tf"] = (request.form.get("live_tf") or cfg.get("live_tf","M5")).upper()
+    cfg["live_expiry"] = request.form.get("live_expiry") or cfg.get("live_expiry","5m")
     set_config(cfg); flash("Strategies (including CUSTOM) updated."); return redirect(url_for("dashboard.dashboard"))
 
 @bp.route("/update_symbols", methods=["POST"])
@@ -403,7 +415,6 @@ def update_symbols():
 @require_login
 def update_indicators():
     cfg=_cfg_dict(get_config()); inds=_cfg_dict(cfg.get("indicators"))
-    # accept all keys in INDICATOR_SPECS
     for key, spec in INDICATOR_SPECS.items():
         enabled=bool(request.form.get(f"ind_{key}_enabled"))
         inds.setdefault(key, {}); inds[key]["enabled"]=enabled
@@ -413,6 +424,8 @@ def update_indicators():
                 val=request.form.get(fk)
                 try: inds[key][p]=int(val) if re.fullmatch(r"-?\d+", val) else float(val)
                 except Exception: inds[key][p]=val
+        if key=="sma" and "period" not in inds[key]:
+            inds[key]["period"]=spec["params"]["period"]
     cfg["indicators"]=inds; set_config(cfg); flash("Indicators updated.")
     return redirect(url_for("dashboard.dashboard"))
 
@@ -519,6 +532,7 @@ def backtest():
         try:
             bt=run_backtest_core_binary(df, core, cfg_run, tf, expiry)
         except Exception:
+            # guard odd cases like "'str' object has no attribute 'get'"
             bt=run_backtest_core_binary(df, core, {}, tf, expiry)
         r={"symbol":sym,
            "trades": getattr(bt,"trades",0) if isinstance(getattr(bt,"trades",0),(int,float)) else (getattr(bt,"trades_count",0) or 0),
@@ -528,43 +542,78 @@ def backtest():
         results.append(r)
         for k in ("trades","wins","losses","draws"): summary[k]+=r[k]
         ind_cfg=_cfg_dict(cfg.get("indicators") or {})
+        if not _any_on(ind_cfg):
+            ind_cfg={"sma":{"enabled":True,"period":50},"rsi":{"enabled":True,"period":14},
+                     "stoch":{"enabled":True,"k":14,"d":3,"smooth_k":3}}
         trades=_extract_trades(bt, df, expiry)
         name=_save_plot(sym, tf, expiry, df, ind_cfg, trades, outdir="static/plots", bars=200)
         if first_plot_name is None: first_plot_name=name
 
+    # ---- hardened data loading and error surfacing ----
     try:
         if uploaded and uploaded.filename:
-            data=uploaded.read().decode("utf-8", errors="ignore")
-            df=pd.read_csv(StringIO(data)); df.columns=[c.strip().lower() for c in df.columns]
-            if "timestamp" in df.columns: df["timestamp"]=pd.to_datetime(df["timestamp"])
-            for c in ("open","high","low","close"): df[c]=pd.to_numeric(df[c], errors="coerce")
-            df=df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+            data = uploaded.read().decode("utf-8", errors="ignore")
+            df = pd.read_csv(StringIO(data))
+            df.columns = [c.strip().lower() for c in df.columns]
+            if "timestamp" in df.columns: df["timestamp"] = pd.to_datetime(df["timestamp"])
+            for c in ("open","high","low","close"): df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+            if df.empty or len(df) < 10:
+                raise RuntimeError("Uploaded CSV has insufficient rows after cleaning")
             run_one(symbols[0] if symbols else "CSV", df)
         else:
+            if not symbols:
+                raise RuntimeError("No symbols selected for backtest")
             for sym in symbols:
                 try:
                     if use_server:
-                        if not _fetch_one_symbol: raise RuntimeError("data_fetch helper not present")
+                        if not _fetch_one_symbol:
+                            raise RuntimeError("data_fetch helper not present; cannot fetch from Deriv")
                         _fetch_one_symbol(app_id, sym, gran, count)
-                    if not _deriv_csv_path: raise RuntimeError("data_fetch helper not present")
-                    path=_deriv_csv_path(sym, gran)
-                    if not os.path.exists(path): warnings.append(f"{sym}: no CSV"); continue
-                    df=pd.read_csv(path); df.columns=[c.strip().lower() for c in df.columns]
-                    if "timestamp" in df.columns: df["timestamp"]=pd.to_datetime(df["timestamp"])
-                    for c in ("open","high","low","close"): df[c]=pd.to_numeric(df[c], errors="coerce")
-                    df=df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
-                    if len(df)<30: warnings.append(f"{sym}: not enough candles ({len(df)})"); continue
+                    if not _deriv_csv_path:
+                        raise RuntimeError("data_fetch helper not present; no CSV path resolver")
+                    path = _deriv_csv_path(sym, gran)
+                    if not os.path.exists(path):
+                        warnings.append(f"{sym}: CSV not found at {path}")
+                        continue
+                    df = pd.read_csv(path)
+                    df.columns = [c.strip().lower() for c in df.columns]
+                    if "timestamp" in df.columns: df["timestamp"] = pd.to_datetime(df["timestamp"])
+                    for c in ("open","high","low","close"): df[c] = pd.to_numeric(df[c], errors="coerce")
+                    df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+                    if len(df) < 30:
+                        warnings.append(f"{sym}: not enough candles ({len(df)})")
+                        continue
                     run_one(sym, df)
                 except Exception as e:
                     warnings.append(f"{sym}: {e}")
-        summary["winrate"]=round((summary["wins"]/summary["trades"])*100,2) if summary["trades"] else 0.0
-        payload={"summary":summary, "results":results, "tf":tf, "expiry":expiry, "strategy":strategy}
-        if first_plot_name: payload["plot_name"]=first_plot_name
-        if warnings: payload["warnings"]=warnings; flash("Backtest completed with warnings.")
-        else: flash("Backtest complete.")
-        session["bt"]=payload
+
+        summary["winrate"] = round((summary["wins"]/summary["trades"])*100,2) if summary["trades"] else 0.0
+        payload = {"summary": summary, "results": results, "tf": tf, "expiry": expiry, "strategy": strategy}
+
+        if first_plot_name:
+            payload["plot_name"] = first_plot_name
+        else:
+            if warnings:
+                payload["error"] = "No plot produced. Warnings: " + "; ".join(warnings)
+            elif not results:
+                payload["error"] = "No results produced. Check symbols/data source."
+            else:
+                payload["error"] = "Plot was not generated due to an unknown reason."
+
+        if warnings:
+            payload["warnings"] = warnings
+            flash("Backtest completed with warnings.")
+        else:
+            flash("Backtest complete.")
+
+        session["bt"] = payload
+
     except Exception as e:
-        session["bt"]={"error": str(e), "warnings": warnings}; flash(f"Backtest error: {e}", "error")
+        msg = f"Backtest error: {e}"
+        session["bt"] = {"error": msg}
+        flash(msg, "error")
+
     return redirect(url_for("dashboard.dashboard"))
 
 @bp.route("/backtest/last.json")
@@ -637,3 +686,4 @@ def telegram_diag():
     ok, info = _send_telegram("🧪 Telegram DIAG: test message.")
     masked = token[:9]+"..."+token[-6:] if len(token)>18 else "***"
     return jsonify({"ok":ok,"token_masked":masked,"getMe":getme,"configured_chats":configured,"send_result":info})
+
