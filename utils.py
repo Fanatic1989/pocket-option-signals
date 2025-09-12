@@ -1,4 +1,5 @@
-# utils.py — config store, TZ, sqlite, Deriv fetch (REST + WebSocket fallback), symbols, backtest helpers, plotting
+# utils.py — config store, TZ, sqlite, Deriv fetch (REST + WebSocket fallback),
+# symbols, backtest helpers, plotting
 import os, json, sqlite3
 from datetime import datetime, time as dtime, timezone
 import pandas as pd
@@ -59,10 +60,10 @@ def set_config(cfg: dict):
     )
 
 # -----------------------------------------------------------------------------
-# Safe coercion helpers (prevents int(dict) crash)
+# Safe coercion helpers (avoid int(dict) crashes)
 # -----------------------------------------------------------------------------
 def safe_int(x, default=0):
-    """Coerce possibly-dict/str/float to int; supports {'sec':60}, {'granularity':300} etc."""
+    """Coerce possibly dict/str/float to int; supports {'sec':60}, {'granularity':300}, etc."""
     if x is None:
         return int(default)
     if isinstance(x, (int, np.integer)):
@@ -71,32 +72,25 @@ def safe_int(x, default=0):
         return int(x)
     if isinstance(x, str):
         try:
-            return int(x.strip())
+            return int(float(x.strip()))
         except Exception:
             return int(default)
     if isinstance(x, dict):
         for k in ("sec","secs","seconds","granularity","value","v"):
             if k in x:
-                try:
-                    return safe_int(x[k], default)
-                except Exception:
-                    pass
-        # sometimes TF dicts look like {'M1':60} — pick first numeric
+                return safe_int(x[k], default)
         for v in x.values():
-            if isinstance(v, (int,float,np.integer,np.floating, str)):
-                try:
-                    return safe_int(v, default)
-                except Exception:
-                    pass
+            try:
+                return safe_int(v, default)
+            except Exception:
+                pass
         return int(default)
-    # last resort
     try:
         return int(x)
     except Exception:
         return int(default)
 
 def safe_app_id(s):
-    """Return a digit-only app_id string or default '99185'."""
     if not s:
         return "99185"
     if isinstance(s, (int, np.integer)):
@@ -335,38 +329,93 @@ def fetch_deriv_history(symbol: str, granularity_sec, days=5) -> pd.DataFrame:
 EXPIRY_TO_BARS = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
 
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
+    """
+    Robust indicator builder.
+    Accepts period inputs as:
+      - single number or numeric string (e.g. 14, "14")
+      - list/tuple of numbers (e.g. [9, 21, 50])
+      - dict of named numbers (e.g. {"fast":9, "slow":21}) -> uses dict values
+    """
     out = {}
     close = df["Close"]
+
+    def _to_period_list(v):
+        if v is None:
+            return []
+        if isinstance(v, (int, float, np.integer, np.floating, str)):
+            try:
+                return [int(float(str(v)))]
+            except Exception:
+                return []
+        if isinstance(v, (list, tuple)):
+            outv = []
+            for x in v:
+                try:
+                    outv.append(int(float(str(x))))
+                except Exception:
+                    pass
+            return outv
+        if isinstance(v, dict):
+            outv = []
+            for x in v.values():
+                try:
+                    outv.append(int(float(str(x))))
+                except Exception:
+                    pass
+            return outv
+        try:
+            return [int(v)]
+        except Exception:
+            return []
+
+    # ----------------- Moving Averages -----------------
     if "SMA" in ind_cfg:
-        vals = ind_cfg["SMA"] if isinstance(ind_cfg["SMA"], (list,tuple)) else [ind_cfg["SMA"]]
-        for p in vals: out[f"SMA({p})"] = close.rolling(int(p)).mean()
+        for p in _to_period_list(ind_cfg["SMA"]):
+            if p > 0:
+                out[f"SMA({p})"] = close.rolling(p).mean()
+
     if "EMA" in ind_cfg:
-        vals = ind_cfg["EMA"] if isinstance(ind_cfg["EMA"], (list,tuple)) else [ind_cfg["EMA"]]
-        for p in vals: out[f"EMA({p})"] = close.ewm(span=int(p), adjust=False).mean()
+        for p in _to_period_list(ind_cfg["EMA"]):
+            if p > 0:
+                out[f"EMA({p})"] = close.ewm(span=p, adjust=False).mean()
+
     if "WMA" in ind_cfg:
-        vals = ind_cfg["WMA"] if isinstance(ind_cfg["WMA"], (list,tuple)) else [ind_cfg["WMA"]]
-        for p in vals:
-            w = np.arange(1, int(p)+1)
-            out[f"WMA({p})"] = close.rolling(int(p)).apply(lambda x: (x*w).sum()/w.sum(), raw=True)
+        for p in _to_period_list(ind_cfg["WMA"]):
+            if p > 0:
+                w = np.arange(1, p + 1)
+                out[f"WMA({p})"] = close.rolling(p).apply(
+                    lambda x: (x * w).sum() / w.sum(), raw=True
+                )
+
     if "SMMA" in ind_cfg:
-        vals = ind_cfg["SMMA"] if isinstance(ind_cfg["SMMA"], (list,tuple)) else [ind_cfg["SMMA"]]
-        for p in vals: out[f"SMMA({p})"] = close.ewm(alpha=1/int(p), adjust=False).mean()
+        for p in _to_period_list(ind_cfg["SMMA"]):
+            if p > 0:
+                out[f"SMMA({p})"] = close.ewm(alpha=1 / p, adjust=False).mean()
+
     if "TMA" in ind_cfg:
-        vals = ind_cfg["TMA"] if isinstance(ind_cfg["TMA"], (list,tuple)) else [ind_cfg["TMA"]]
-        for p in vals: out[f"TMA({p})"] = close.rolling(int(p)).mean().rolling(int(p)).mean()
+        for p in _to_period_list(ind_cfg["TMA"]):
+            if p > 0:
+                out[f"TMA({p})"] = close.rolling(p).mean().rolling(p).mean()
+
+    # ----------------- Oscillators -----------------
     if "RSI" in ind_cfg and isinstance(ind_cfg["RSI"], dict) and ind_cfg["RSI"].get("show", True):
-        pr = int(ind_cfg["RSI"].get("period", 14))
+        pr_list = _to_period_list(ind_cfg["RSI"].get("period", 14)) or [14]
+        pr = max(1, pr_list[0])
         delta = close.diff()
-        up = delta.clip(lower=0).ewm(alpha=1/pr, adjust=False).mean()
-        down = (-delta.clip(upper=0)).ewm(alpha=1/pr, adjust=False).mean()
+        up = delta.clip(lower=0).ewm(alpha=1 / pr, adjust=False).mean()
+        down = (-delta.clip(upper=0)).ewm(alpha=1 / pr, adjust=False).mean()
         rs = up / down.replace(0, np.nan)
-        out["RSI"] = (100 - (100/(1+rs))).fillna(method="bfill")
+        out["RSI"] = (100 - (100 / (1 + rs))).fillna(method="bfill")
+
     if "STOCH" in ind_cfg and isinstance(ind_cfg["STOCH"], dict) and ind_cfg["STOCH"].get("show", True):
-        k = int(ind_cfg["STOCH"].get("k", 14)); d = int(ind_cfg["STOCH"].get("d",3))
+        k_list = _to_period_list(ind_cfg["STOCH"].get("k", 14)) or [14]
+        d_list = _to_period_list(ind_cfg["STOCH"].get("d", 3)) or [3]
+        k = max(1, k_list[0]); d = max(1, d_list[0])
         lowk = df["Low"].rolling(k).min(); highk = df["High"].rolling(k).max()
         kline = (close - lowk) / (highk - lowk).replace(0, np.nan) * 100.0
         dline = kline.rolling(d).mean()
         out["STOCH_K"] = kline; out["STOCH_D"] = dline
+
     return out
 
 def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
