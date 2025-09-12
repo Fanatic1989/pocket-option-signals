@@ -1,586 +1,112 @@
-<!-- templates/dashboard.html -->
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Pocket Option Signals — Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8"/>
+  <title>Pocket Option Signals · Live Engine</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    :root{
-      --bg:#0b0d11; --card:#11141a; --muted:#7b8496; --text:#e8edf7; --acc:#3aa0ff; --warn:#ffcc00; --err:#ff4d4f; --ok:#17c964;
-      --br:14px;
-    }
-    html,body{margin:0;padding:0;background:#0a0c10;color:var(--text);font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;}
-    a{color:var(--acc);text-decoration:none}
-    .wrap{max-width:1200px;margin:0 auto;padding:20px}
-    .grid{display:grid;gap:16px}
-    .g-2{grid-template-columns:1fr 1fr}
-    .g-3{grid-template-columns:repeat(3,1fr)}
-    .card{background:var(--card);border-radius:var(--br);padding:16px;border:1px solid rgba(255,255,255,.06)}
-    .card h3{margin:0 0 10px 0;font-size:16px}
-    label{display:inline-block;margin:6px 0 4px 0;color:#cfd6e7}
-    input[type=text],input[type=number],input[type=datetime-local],input[type=date],
-    select,textarea{
-      width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
-      background:#0d1117;color:var(--text);outline:none
-    }
-    textarea{min-height:80px}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    .row > *{flex:1}
-    .btn{display:inline-block;background:#212838;color:#eaf1ff;border:1px solid rgba(255,255,255,.15);
-      padding:10px 14px;border-radius:10px;cursor:pointer}
-    .btn:hover{background:#2a3246}
-    .btn-acc{background:#1463b8;border-color:#237ad7}
-    .btn-acc:hover{background:#1a6ed0}
-    .btn-warn{background:#3d2d00;border-color:#5c4500;color:#ffd666}
-    .btn-ok{background:#06361a;border-color:#0b5; color:#aef1c7}
-    .btn-err{background:#3a1212;border-color:#6b1c1c;color:#ffb1b1}
-    .muted{color:var(--muted)}
-    .pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.12);font-size:12px;color:#cbd4ea}
-    .flash{padding:10px 12px;border-radius:10px;margin-bottom:10px}
-    .flash-ok{background:#062a17;border:1px solid #0b4; color:#baf7d2}
-    .flash-err{background:#2a0c0c;border:1px solid #b33; color:#ffc9c9}
-    img.plot{max-width:100%;border-radius:12px;border:1px solid rgba(255,255,255,.1)}
-    hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:14px 0}
-    .kvs{display:grid;grid-template-columns:repeat(4, minmax(0,1fr)); gap:8px}
-    .kvs .kv{background:#0f1420;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px}
-    .kv .k{font-size:12px;color:#aab3c7}
-    .kv .v{font-size:16px;margin-top:2px}
-    .split{display:grid;grid-template-columns:2fr 1fr; gap:16px}
-    .right-sticky{position:sticky; top:16px}
-    .small{font-size:12px}
-    .list{display:flex;flex-wrap:wrap;gap:6px}
-    .list .item{padding:6px 8px;border-radius:10px;background:#0f1420;border:1px solid rgba(255,255,255,.08)}
-    .note{font-size:12px;color:#9fb0cc}
-    .legend{font-size:12px;color:#96a1b8}
-    .center{display:flex;align-items:center;justify-content:center}
+    :root { --bg:#0b1220; --panel:#111827; --panel-2:#0f172a; --text:#e5e7eb; --muted:#9ca3af; --green:#10b981; --red:#ef4444; --blue:#3b82f6; --card-radius:16px; }
+    *{box-sizing:border-box}
+    body{margin:0;padding:20px;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#09101d 0%,#0b1220 60%,#0a0f1b 100%);color:var(--text)}
+    h1{margin:0 0 16px;font-size:22px}
+    .grid{display:grid;grid-template-columns:320px 1fr;gap:20px;align-items:start}
+    .card{background:var(--panel);border:1px solid #1f2937;border-radius:var(--card-radius);padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    .controls button{margin:6px 8px 6px 0;padding:10px 14px;border:none;border-radius:10px;background:#1f2937;color:var(--text);cursor:pointer;font-weight:600}
+    .controls .start{background:#14532d}.controls .stop{background:#7f1d1d}.controls .on{background:#1e3a8a}.controls .off{background:#334155}
+    .pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700}
+    .pill.running{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.35)}
+    .pill.stopped{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.35)}
+    .pill.debug{background:rgba(59,130,246,.15);color:var(--blue);border:1px solid rgba(59,130,246,.35)}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .kpi{flex:1 1 120px;min-width:120px;background:var(--panel-2);border:1px solid #1f2937;border-radius:14px;padding:12px}
+    .kpi h4{margin:0 0 6px;font-size:13px;color:var(--muted)} .kpi .num{font-size:26px;font-weight:800}
+    .text-box{width:100%;min-height:80px;max-height:160px;background:#0b1324;color:var(--text);border:1px solid #1f2937;border-radius:12px;padding:10px 12px;outline:none;overflow:auto;resize:vertical;line-height:1.35;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
+    .tier-card{margin-top:14px}.tier-card h3{margin:0 0 8px;font-size:16px}
+    .send-row{display:flex;gap:10px;margin-top:10px}
+    .send-row button{padding:10px 14px;font-weight:700;border:none;border-radius:10px;background:#1d4ed8;color:#fff;cursor:pointer}
+    .muted{color:var(--muted);font-size:12px}
+    pre{background:#0b1324;border:1px solid #1f2937;border-radius:12px;padding:12px;overflow:auto;max-height:220px;overflow-wrap:anywhere;word-break:break-word;white-space:pre-wrap}
   </style>
 </head>
 <body>
-<div class="wrap">
-
-  <!-- Header -->
-  <div class="row" style="align-items:center">
-    <div style="flex:1">
-      <h2 style="margin:0 0 2px 0">Pocket-Option Signals</h2>
-      <div class="muted small">
-        {% if tz %}Timezone: <b>{{ tz }}</b>{% endif %}
-        {% if now %} • Now: {{ now }}{% endif %}
-        {% if within is not none %} • Within window: <span class="pill">{{ 'YES' if within else 'NO' }}</span>{% endif %}
+  <h1>Live Engine</h1>
+  <div class="grid">
+    <div class="card">
+      <div class="controls">
+        <button class="start" onclick="post('/api/start')">Start</button>
+        <button class="stop" onclick="post('/api/stop')">Stop</button>
+        <button class="on" onclick="post('/api/debug_on')">Debug ON</button>
+        <button class="off" onclick="post('/api/debug_off')">Debug OFF</button>
       </div>
+      <div id="badges" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:12px">
+        <div class="kpi"><h4>Free</h4><div class="num" id="freeCount">0</div><div class="muted" id="freeCap"></div></div>
+        <div class="kpi"><h4>Basic</h4><div class="num" id="basicCount">0</div><div class="muted" id="basicCap"></div></div>
+        <div class="kpi"><h4>Pro</h4><div class="num" id="proCount">0</div><div class="muted" id="proCap"></div></div>
+        <div class="kpi"><h4>VIP</h4><div class="num" id="vipCount">0</div><div class="muted" id="vipCap"></div></div>
+        <div class="kpi"><h4>All</h4><div class="num" id="totalCount">0</div><div class="muted">day total</div></div>
+      </div>
+      <div style="margin-top:14px"><div class="muted">Tiers daily caps: Free=3, Basic=5, Pro=15, VIP=∞ (enforced)</div></div>
+      <div style="margin-top:16px"><h3 style="margin:0 0 8px">Telegram Bot</h3><button onclick="checkBot()">Check getMe()</button><div id="botInfo" class="muted" style="margin-top:8px"></div></div>
+      <div style="margin-top:16px"><h3 style="margin:0 0 8px">Last Send Result</h3><pre id="lastSend">—</pre></div>
     </div>
-    <div>
-      {% if session.admin %}
-        <a class="btn" href="{{ url_for('dashboard.logout') }}">Logout</a>
-      {% else %}
-        <a class="btn" href="{{ url_for('dashboard.login') }}">Login</a>
-      {% endif %}
-    </div>
-  </div>
-
-  <!-- Flash messages -->
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% if messages %}
-      {% for cat, msg in messages %}
-        <div class="flash {{ 'flash-err' if cat=='error' else 'flash-ok' }}">{{ msg }}</div>
-      {% endfor %}
-    {% endif %}
-  {% endwith %}
-
-  {% if view == 'login' %}
-    <div class="card" style="max-width:420px;margin:30px auto">
-      <h3>Admin Login</h3>
-      <form method="post">
-        <label>Password</label>
-        <input type="password" name="password" placeholder="••••••••">
-        <div style="margin-top:10px">
-          <button class="btn btn-acc" type="submit">Login</button>
-        </div>
-      </form>
-    </div>
-  {% elif view == 'index' %}
-    <div class="grid g-2">
-      <div class="card">
-        <h3>Status</h3>
-        <div class="kvs">
-          <div class="kv"><div class="k">Trading window</div><div class="v">{% if within %}Open{% else %}Closed{% endif %}</div></div>
-          <div class="kv"><div class="k">Timezone</div><div class="v">{{ tz or 'UTC' }}</div></div>
-          <div class="kv"><div class="k">Now</div><div class="v">{{ now }}</div></div>
-          <div class="kv"><div class="k">Uptime check</div><div class="v"><span class="pill">/<b>_up</b></span></div></div>
-        </div>
-        <p class="note" style="margin-top:10px">Login to configure dashboard, indicators, strategies, users, Telegram and backtests.</p>
-        <a class="btn btn-acc" href="{{ url_for('dashboard.login') }}">Go to Login</a>
+    <div class="card">
+      <h3 style="margin:0 0 12px">Send Messages</h3>
+      <div class="tier-card">
+        <h3>VIP <span class="muted">(test-send)</span></h3>
+        <textarea id="vipText" class="text-box" placeholder="Type a VIP test message..."></textarea>
+        <div class="send-row"><button onclick="sendVIP()">Send VIP Test</button><span id="vipCfg" class="muted"></span></div>
       </div>
-      <div class="card">
-        <h3>About</h3>
-        <p>This service sends binary options signals to Telegram channels, supports Deriv/Pocket-Option symbols, backtesting with screenshots, and a live engine with daily caps per tier.</p>
+      <div class="tier-card">
+        <h3>Free</h3>
+        <textarea id="freeText" class="text-box" placeholder="Message for Free tier (cap 3/day)"></textarea>
+        <div class="send-row"><button onclick="sendTier('free','freeText')">Send Free</button><span id="freeCfg" class="muted"></span></div>
       </div>
-    </div>
-
-  {% elif view == 'dashboard' %}
-  <div class="split">
-    <div>
-      <!-- Window / TF / Expiry -->
-      <div class="card">
-        <h3>Trading Window & Defaults</h3>
-        <form method="post" action="{{ url_for('dashboard.update_window') }}">
-          <div class="row">
-            <div>
-              <label>Start</label>
-              <input type="time" name="start" value="{{ (window or {}).get('start','08:00') }}">
-            </div>
-            <div>
-              <label>End</label>
-              <input type="time" name="end" value="{{ (window or {}).get('end','17:00') }}">
-            </div>
-            <div>
-              <label>Timezone</label>
-              <input type="text" name="timezone" value="{{ (window or {}).get('timezone', tz or 'UTC') }}">
-            </div>
-          </div>
-          <hr>
-          <div class="row">
-            <div>
-              <label>Live TF</label>
-              <select name="live_tf">
-                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                  <option value="{{t}}" {{ 'selected' if t==live_tf else '' }}>{{t}}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Live Expiry</label>
-              <select name="live_expiry">
-                {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
-                  <option value="{{e}}" {{ 'selected' if e==(live_expiry or '5m') else '' }}>{{e}}</option>
-                {% endfor %}
-              </select>
-            </div>
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save</button>
-          </div>
-        </form>
+      <div class="tier-card">
+        <h3>Basic</h3>
+        <textarea id="basicText" class="text-box" placeholder="Message for Basic tier (cap 5/day)"></textarea>
+        <div class="send-row"><button onclick="sendTier('basic','basicText')">Send Basic</button><span id="basicCfg" class="muted"></span></div>
       </div>
-
-      <!-- Symbols -->
-      <div class="card">
-        <h3>Symbols</h3>
-        <form method="post" action="{{ url_for('dashboard.update_symbols') }}">
-          <div class="row">
-            <div>
-              <label>Deriv (frx*) — multi</label>
-              <select name="symbols_deriv_multi" multiple size="8">
-                {% for s in available_groups[0]['items'] %}
-                  <option value="{{ s }}" {{ 'selected' if s in (active_symbols or []) else '' }}>{{ s }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Pocket Option majors — multi</label>
-              <select name="symbols_po_multi" multiple size="8">
-                {% for s in available_groups[1]['items'] %}
-                  <option value="{{ s }}" {{ 'selected' if s in (symbols_raw or []) else '' }}>{{ s }}</option>
-                {% endfor %}
-              </select>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Free text (comma/space)</label>
-              <input type="text" name="symbols_text" placeholder="frxEURUSD EURUSD GBPUSD ..." value="{{ (symbols_raw or [])|join(' ') }}">
-            </div>
-            <div style="align-self:flex-end">
-              <label class="small"><input type="checkbox" name="convert_po" /> Convert PO→Deriv</label>
-            </div>
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save Symbols</button>
-          </div>
-        </form>
-      </div>
-
-      <!-- Indicators -->
-      <div class="card">
-        <h3>Indicators</h3>
-        <form method="post" action="{{ url_for('dashboard.update_indicators') }}">
-          <div class="grid g-3">
-            {% for key, spec in specs.items() %}
-              {% set cfg = (indicators or {}).get(key, {}) %}
-              <div class="card" style="padding:12px">
-                <div class="row" style="align-items:center">
-                  <div style="flex:0">
-                    <input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if cfg.get('enabled') else '' }}>
-                  </div>
-                  <div style="flex:1">
-                    <b>{{ spec.name or spec.label or key }}</b>
-                    <div class="small legend muted">{{ spec.kind if spec.kind else '' }}</div>
-                  </div>
-                </div>
-                {% if spec.params %}
-                  <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:8px">
-                    {% for p_name, p_def in spec.params.items() %}
-                      {% set val = cfg.get(p_name, p_def) %}
-                      <div>
-                        <label class="small">{{ p_name }}</label>
-                        <input type="text" name="ind_{{key}}_{{p_name}}" value="{{ val }}">
-                      </div>
-                    {% endfor %}
-                  </div>
-                {% endif %}
-              </div>
-            {% endfor %}
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save Indicators</button>
-          </div>
-          <p class="note" style="margin-top:6px">Only <u>enabled</u> indicators render on screenshots and are respected by strategies/custom rules.</p>
-        </form>
-      </div>
-
-      <!-- Strategies + Custom rules -->
-      <div class="card">
-        <h3>Strategies & Custom</h3>
-        <form method="post" action="{{ url_for('dashboard.update_strategies') }}">
-          <div class="list">
-            {% for name, entry in strategies_all.items() %}
-              <label class="item small">
-                <input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled') or entry.get('enabled')) else '' }}>
-                {{ name }}
-              </label>
-            {% endfor %}
-          </div>
-          <hr>
-          <div class="row">
-            <div>
-              <label>Backtest TF</label>
-              <select name="bt_tf">
-                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                  <option value="{{t}}" {{ 'selected' if t==(bt.tf if bt else live_tf) else '' }}>{{t}}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Backtest Expiry</label>
-              <select name="bt_expiry">
-                {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
-                  <option value="{{e}}" {{ 'selected' if (bt.expiry if bt else live_expiry)==e else '' }}>{{e}}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Live TF</label>
-              <select name="live_tf">
-                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                  <option value="{{t}}" {{ 'selected' if t==live_tf else '' }}>{{t}}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Live Expiry</label>
-              <select name="live_expiry">
-                {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
-                  <option value="{{e}}" {{ 'selected' if e==live_expiry else '' }}>{{e}}</option>
-                {% endfor %}
-              </select>
-            </div>
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save Strategy Toggles & Defaults</button>
-          </div>
-        </form>
-
-        <!-- Custom slots -->
-        <hr>
-        <div class="grid g-3">
-          {% for c in customs %}
-          <div class="card" style="padding:12px">
-            <h3 style="margin-bottom:8px">CUSTOM {{ c._idx }}</h3>
-            <form method="post" action="{{ url_for('dashboard.update_custom') }}">
-              <input type="hidden" name="slot" value="{{ c._idx }}">
-              <label class="small"><input type="checkbox" name="enabled" {{ 'checked' if c.get('enabled') else '' }}> Enabled</label>
-              <div class="row">
-                <div>
-                  <label>Mode</label>
-                  <select name="mode">
-                    <option value="SIMPLE" {{ 'selected' if (c.get('mode','SIMPLE')=='SIMPLE') else '' }}>SIMPLE</option>
-                    <option value="JSON" {{ 'selected' if (c.get('mode')=='JSON') else '' }}>JSON</option>
-                  </select>
-                </div>
-                <div>
-                  <label>Lookback</label>
-                  <input type="number" name="lookback" value="{{ c.get('lookback',3) }}">
-                </div>
-                <div>
-                  <label>Tolerance %</label>
-                  <input type="text" name="tol_pct" value="{{ c.get('tol_pct',0.1) }}">
-                </div>
-              </div>
-              <div class="row">
-                <div>
-                  <label>Simple BUY (text)</label>
-                  <textarea name="simple_buy" placeholder="e.g. RSI < 30 AND StochK cross up">{{ c.get('simple_buy','') }}</textarea>
-                </div>
-                <div>
-                  <label>Simple SELL (text)</label>
-                  <textarea name="simple_sell" placeholder="e.g. RSI > 70 AND StochK cross down">{{ c.get('simple_sell','') }}</textarea>
-                </div>
-              </div>
-              <div>
-                <label>JSON buy_rule</label>
-                <textarea name="buy_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":"<","v":30}]}'>{{ c.get('buy_rule')|tojson if c.get('buy_rule') else '' }}</textarea>
-              </div>
-              <div>
-                <label>JSON sell_rule</label>
-                <textarea name="sell_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":">","v":70}]}'>{{ c.get('sell_rule')|tojson if c.get('sell_rule') else '' }}</textarea>
-              </div>
-              <div style="margin-top:8px">
-                <button class="btn btn-acc" type="submit">Save CUSTOM {{ c._idx }}</button>
-              </div>
-            </form>
-          </div>
-          {% endfor %}
-        </div>
-      </div>
-
-      <!-- Users -->
-      <div class="card">
-        <h3>Users</h3>
-        <div class="grid g-2">
-          <div class="card">
-            <h3>Add / Update</h3>
-            <form method="post" action="{{ url_for('dashboard.users_add') }}">
-              <label>Telegram ID</label>
-              <input type="text" name="telegram_id" placeholder="123456789">
-              <div class="row">
-                <div>
-                  <label>Tier</label>
-                  <select name="tier">
-                    <option>free</option><option>basic</option><option>pro</option><option>vip</option>
-                  </select>
-                </div>
-                <div>
-                  <label>Expires at (YYYY-MM-DD)</label>
-                  <input type="date" name="expires_at">
-                </div>
-              </div>
-              <div style="margin-top:10px">
-                <button class="btn btn-acc" type="submit">Save User</button>
-              </div>
-            </form>
-          </div>
-          <div class="card">
-            <h3>Existing</h3>
-            {% if users and users|length %}
-              <div class="list">
-                {% for u in users %}
-                  <div class="item small">
-                    <b>{{ u.telegram_id }}</b> • {{ u.tier|upper }} {% if u.expires_at %} • exp: {{ u.expires_at }}{% endif %}
-                    <form method="post" action="{{ url_for('dashboard.users_delete') }}" style="display:inline">
-                      <input type="hidden" name="telegram_id" value="{{ u.telegram_id }}">
-                      <button class="btn btn-err small" type="submit">Delete</button>
-                    </form>
-                  </div>
-                {% endfor %}
-              </div>
-            {% else %}
-              <div class="muted">No users yet.</div>
-            {% endif %}
-          </div>
-        </div>
-      </div>
-
-      <!-- Backtest + Screenshot -->
-      <div class="card">
-        <h3>Backtest & Screenshot</h3>
-        <form method="post" action="{{ url_for('dashboard.backtest') }}" enctype="multipart/form-data">
-          <div class="row">
-            <div>
-              <label>Symbols (space/comma)</label>
-              <input type="text" name="bt_symbols" placeholder="frxEURUSD frxGBPUSD ..." value="{{ (active_symbols or [])|join(' ') }}">
-              <label class="small"><input type="checkbox" name="convert_po_bt"> Convert PO→Deriv</label>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>TF</label>
-              <select name="bt_tf">
-                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                  <option value="{{t}}" {{ 'selected' if (bt.tf if bt else live_tf)==t else '' }}>{{t}}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Expiry</label>
-              <select name="bt_expiry">
-                {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
-                  <option value="{{e}}" {{ 'selected' if (bt.expiry if bt else live_expiry)==e else '' }}>{{e}}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Strategy</label>
-              <select name="bt_strategy">
-                <option>BASE</option><option>TREND</option><option>CHOP</option>
-                <option>CUSTOM1</option><option>CUSTOM2</option><option>CUSTOM3</option>
-              </select>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>Upload CSV</label>
-              <input type="file" name="bt_csv" accept=".csv">
-            </div>
-            <div style="flex:0.6">
-              <label class="small"><input type="checkbox" name="use_server"> Use Deriv server fetch</label>
-              <div class="row">
-                <div>
-                  <label>Candles</label>
-                  <input type="number" name="bt_count" value="300" min="100" max="5000">
-                </div>
-              </div>
-            </div>
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Run Backtest & Show Screenshot</button>
-            <span class="note">Plot shows ONLY enabled indicators + BUY/SELL markers + shaded expiry.</span>
-          </div>
-        </form>
-
-        {% if bt and bt.get('plot_name') %}
-          <hr>
-          <div class="grid g-2">
-            <div>
-              <div class="kvs">
-                <div class="kv"><div class="k">TF</div><div class="v">{{ bt.tf }}</div></div>
-                <div class="kv"><div class="k">Expiry</div><div class="v">{{ bt.expiry }}</div></div>
-                <div class="kv"><div class="k">Strategy</div><div class="v">{{ bt.strategy }}</div></div>
-              </div>
-              <p class="note" style="margin-top:6px">
-                Summary: {{ bt.summary }}{% if bt.warnings %} • <span class="warn">{{ bt.warnings|join('; ') }}</span>{% endif %}
-              </p>
-              <p><a href="{{ url_for('dashboard.backtest_last_json') }}">Last JSON</a> •
-                 <a href="{{ url_for('dashboard.backtest_last_csv') }}">Last CSV</a></p>
-            </div>
-          </div>
-          <img class="plot" src="{{ url_for('dashboard.plot_file', name=bt.plot_name) }}" alt="Backtest plot">
-        {% elif bt and bt.get('error') %}
-          <div class="flash flash-err"><b>Backtest error:</b> {{ bt.error }}</div>
-        {% endif %}
-      </div>
-
-      <!-- Telegram -->
-      <div class="card">
-        <h3>Telegram</h3>
-        <div class="row">
-          <form method="post" action="{{ url_for('dashboard.telegram_test') }}">
-            <button class="btn btn-ok" type="submit">Send Test</button>
-          </form>
-          <a class="btn" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Open Diagnostics (JSON)</a>
-        </div>
-        <p class="note">Set env: <code>TELEGRAM_BOT_TOKEN</code>, and channel IDs:
-          <code>TELEGRAM_CHAT_ID_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code>.
-        </p>
-      </div>
-
-      <!-- Deriv fetch (optional helper) -->
-      <div class="card">
-        <h3>Deriv: Fetch CSV (optional)</h3>
-        <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
-          <div class="row">
-            <div>
-              <label>Symbols (space/comma)</label>
-              <input type="text" name="fetch_symbols" placeholder="frxEURUSD frxGBPUSD ...">
-              <label class="small"><input type="checkbox" name="convert_po_fetch"> Convert PO→Deriv</label>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>TF</label>
-              <select name="fetch_tf">
-                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                  <option>{{ t }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Candles</label>
-              <input type="number" name="fetch_count" value="300" min="100" max="5000">
-            </div>
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn" type="submit">Fetch</button>
-          </div>
-          <p class="note">Requires <code>data_fetch.py</code> with <code>fetch_one_symbol()</code> + <code>deriv_csv_path()</code>.</p>
-        </form>
-      </div>
-    </div>
-
-    <!-- Right column -->
-    <div class="right-sticky">
-      <div class="card">
-        <h3>Live Engine</h3>
-        <div class="row">
-          <button class="btn btn-ok" onclick="hit('/live/start')">Start</button>
-          <button class="btn btn-err" onclick="hit('/live/stop')">Stop</button>
-          <button class="btn" onclick="hit('/live/debug/on')">Debug ON</button>
-          <button class="btn" onclick="hit('/live/debug/off')">Debug OFF</button>
-        </div>
-        <hr>
-        <div class="kvs" id="liveStats">
-          <div class="kv"><div class="k">Status</div><div class="v" id="lv">...</div></div>
-          <div class="kv"><div class="k">Free</div><div class="v" id="t_free">0</div></div>
-          <div class="kv"><div class="k">Basic</div><div class="v" id="t_basic">0</div></div>
-          <div class="kv"><div class="k">Pro</div><div class="v" id="t_pro">0</div></div>
-          <div class="kv"><div class="k">VIP</div><div class="v" id="t_vip">0</div></div>
-          <div class="kv"><div class="k">All</div><div class="v" id="t_all">0</div></div>
-        </div>
-        <p class="note small">Tiers daily caps: Free=3, Basic=6, Pro=15, VIP=∞ (enforced in live engine).</p>
-      </div>
-      <div class="card">
-        <h3>Quick Links</h3>
-        <div class="list">
-          <a class="item" href="{{ url_for('dashboard.up_check') }}" target="_blank">/_up</a>
-          <a class="item" href="{{ url_for('dashboard.live_status') }}" target="_blank">/live/status</a>
-          <a class="item" href="{{ url_for('dashboard.live_tally') }}" target="_blank">/live/tally</a>
-          <a class="item" href="{{ url_for('dashboard.backtest_last_json') }}" target="_blank">/backtest/last.json</a>
-          <a class="item" href="{{ url_for('dashboard.backtest_last_csv') }}" target="_blank">/backtest/last.csv</a>
-          <a class="item" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">/telegram/diag</a>
-        </div>
+      <div class="tier-card">
+        <h3>Pro</h3>
+        <textarea id="proText" class="text-box" placeholder="Message for Pro tier (cap 15/day)"></textarea>
+        <div class="send-row"><button onclick="sendTier('pro','proText')">Send Pro</button><span id="proCfg" class="muted"></span></div>
       </div>
     </div>
   </div>
-  {% endif %}
-</div>
 
-<script>
-async function hit(url){
-  try{
-    const r = await fetch(url);
-    const js = await r.json().catch(()=>({}));
-    console.log(url, js);
-    refreshLive();
-  }catch(e){ console.error(e); }
-}
-async function refreshLive(){
-  try{
-    const s = await fetch('/live/status').then(r=>r.json());
-    const t = await fetch('/live/tally').then(r=>r.json());
-    const lv = document.getElementById('lv');
-    if (lv) lv.textContent = (s && s.status) ? (s.status.state || JSON.stringify(s.status)) : '—';
-    if (t && t.tally){
-      const z=t.tally;
-      setVal('t_free', z.free || 0);
-      setVal('t_basic', z.basic || 0);
-      setVal('t_pro', z.pro || 0);
-      setVal('t_vip', z.vip || 0);
-      setVal('t_all', z.all || 0);
+  <script>
+    async function post(url="", body={}){ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); return r.json(); }
+    async function get(url=""){ const r=await fetch(url); return r.json(); }
+
+    function capText(cap){ if(cap==null) return ""; if(cap===Infinity || cap==="Infinity") return "cap: ∞"; return `cap: ${cap}`; }
+
+    function renderStatus(s){
+      const badges=document.getElementById("badges");
+      badges.innerHTML=`<span class="pill ${s.running?'running':'stopped'}">${s.running?'RUNNING':'STOPPED'}</span>
+                        <span class="pill debug">${s.debug?'DEBUG ON':'DEBUG OFF'}</span>
+                        <span class="pill">UTC Day: ${s.day}</span>`;
+      document.getElementById("freeCount").textContent=s.tallies.free??0;
+      document.getElementById("basicCount").textContent=s.tallies.basic??0;
+      document.getElementById("proCount").textContent=s.tallies.pro??0;
+      document.getElementById("vipCount").textContent=s.tallies.vip??0;
+      document.getElementById("totalCount").textContent=s.tallies.all??s.tallies.total??0;
+      document.getElementById("freeCap").textContent=capText(s.caps.free);
+      document.getElementById("basicCap").textContent=capText(s.caps.basic);
+      document.getElementById("proCap").textContent=capText(s.caps.pro);
+      document.getElementById("vipCap").textContent=capText(s.caps.vip);
+      document.getElementById("freeCfg").textContent=s.configured_chats.free?"chat configured":"no chat id";
+      document.getElementById("basicCfg").textContent=s.configured_chats.basic?"chat configured":"no chat id";
+      document.getElementById("proCfg").textContent=s.configured_chats.pro?"chat configured":"no chat id";
+      document.getElementById("vipCfg").textContent=s.configured_chats.vip?"chat configured":"no chat id";
+      const last=s.last_send_result&&Object.keys(s.last_send_result).length?JSON.stringify(s.last_send_result,null,2):"—";
+      document.getElementById("lastSend").textContent=last;
     }
-  }catch(e){console.error(e);}
-}
-function setVal(id,v){ const el=document.getElementById(id); if(el) el.textContent = v; }
-refreshLive();
-setInterval(refreshLive, 6000);
-</script>
+    async function refresh(){ renderStatus(await get("/api/status")); }
+    async function checkBot(){ const info=await get("/api/check_bot"); document.getElementById("botInfo").textContent=JSON.stringify(info.getMe||info,null,2); }
+    async function sendVIP(){ const text=document.getElementById("vipText").value.trim(); const res=await post("/api/test/vip",{text}); renderStatus(res.status); }
+    async function sendTier(tier,area){ const text=document.getElementById(area).value.trim(); const res=await post("/api/send",{tier,text}); if(!res.result?.ok&&res.result?.error){alert(res.result.error)} renderStatus(res.status||await get("/api/status")); }
+    refresh(); setInterval(refresh,4000);
+  </script>
 </body>
 </html>
