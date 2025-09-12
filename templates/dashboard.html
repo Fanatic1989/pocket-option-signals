@@ -1,3 +1,4 @@
+<!-- templates/dashboard.html — your full dashboard with fit-in-boxes + live stats -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -30,8 +31,7 @@
     .btn:hover{background:#2a3246}
     .btn-acc{background:#1463b8;border-color:#237ad7}
     .btn-acc:hover{background:#1a6ed0}
-    .btn-warn{background:#3d2d00;border-color:#5c4500;color:#ffd666}
-    .btn-ok{background:#06361a;border-color:#0b5; color:#aef1c7}
+    .btn-ok{background:#06361a;border-color:#0b5;color:#aef1c7}
     .btn-err{background:#3a1212;border-color:#6b1c1c;color:#ffb1b1}
     .muted{color:var(--muted)}
     .pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.12);font-size:12px;color:#cbd4ea}
@@ -75,7 +75,7 @@
     </div>
   </div>
 
-  <!-- Flash messages -->
+  <!-- Flash -->
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       {% for cat, msg in messages %}
@@ -90,9 +90,7 @@
       <form method="post">
         <label>Password</label>
         <input type="password" name="password" placeholder="••••••••">
-        <div style="margin-top:10px">
-          <button class="btn btn-acc" type="submit">Login</button>
-        </div>
+        <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Login</button></div>
       </form>
     </div>
 
@@ -111,7 +109,7 @@
       </div>
       <div class="card">
         <h3>About</h3>
-        <p>This service sends binary options signals to Telegram channels, supports Deriv/Pocket-Option symbols, backtesting with screenshots, and a live engine with daily caps per tier.</p>
+        <p>Sends binary options signals to Telegram tiers with daily caps, supports Deriv/PO symbols, screenshots, and a live engine.</p>
       </div>
     </div>
 
@@ -123,18 +121,9 @@
         <h3>Trading Window & Defaults</h3>
         <form method="post" action="{{ url_for('dashboard.update_window') }}">
           <div class="row">
-            <div>
-              <label>Start</label>
-              <input type="time" name="start" value="{{ (window or {}).get('start','08:00') }}">
-            </div>
-            <div>
-              <label>End</label>
-              <input type="time" name="end" value="{{ (window or {}).get('end','17:00') }}">
-            </div>
-            <div>
-              <label>Timezone</label>
-              <input type="text" name="timezone" value="{{ (window or {}).get('timezone', tz or 'UTC') }}">
-            </div>
+            <div><label>Start</label><input type="time" name="start" value="{{ (window or {}).get('start','08:00') }}"></div>
+            <div><label>End</label><input type="time" name="end" value="{{ (window or {}).get('end','17:00') }}"></div>
+            <div><label>Timezone</label><input type="text" name="timezone" value="{{ (window or {}).get('timezone', tz or 'UTC') }}"></div>
           </div>
           <hr>
           <div class="row">
@@ -203,9 +192,7 @@
               {% set cfg = (indicators or {}).get(key, {}) %}
               <div class="card" style="padding:12px">
                 <div class="row" style="align-items:center">
-                  <div style="flex:0">
-                    <input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if cfg.get('enabled') else '' }}>
-                  </div>
+                  <div style="flex:0"><input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if cfg.get('enabled') else '' }}></div>
                   <div style="flex:1">
                     <b>{{ spec.name or spec.label or key }}</b>
                     <div class="small legend muted">{{ spec.kind if spec.kind else '' }}</div>
@@ -226,7 +213,7 @@
             {% endfor %}
           </div>
           <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save Indicators</button></div>
-          <p class="note" style="margin-top:6px">Only <u>enabled</u> indicators render on screenshots and are respected by strategies/custom rules.</p>
+          <p class="note" style="margin-top:6px">Only <u>enabled</u> indicators render on screenshots and are used by strategies.</p>
         </form>
       </div>
 
@@ -297,14 +284,8 @@
                     <option value="JSON" {{ 'selected' if (c.get('mode')=='JSON') else '' }}>JSON</option>
                   </select>
                 </div>
-                <div>
-                  <label>Lookback</label>
-                  <input type="number" name="lookback" value="{{ c.get('lookback',3) }}">
-                </div>
-                <div>
-                  <label>Tolerance %</label>
-                  <input type="text" name="tol_pct" value="{{ c.get('tol_pct',0.1) }}">
-                </div>
+                <div><label>Lookback</label><input type="number" name="lookback" value="{{ c.get('lookback',3) }}"></div>
+                <div><label>Tolerance %</label><input type="text" name="tol_pct" value="{{ c.get('tol_pct',0.1) }}"></div>
               </div>
               <div class="row">
                 <div>
@@ -343,14 +324,9 @@
               <div class="row">
                 <div>
                   <label>Tier</label>
-                  <select name="tier">
-                    <option>free</option><option>basic</option><option>pro</option><option>vip</option>
-                  </select>
+                  <select name="tier"><option>free</option><option>basic</option><option>pro</option><option>vip</option></select>
                 </div>
-                <div>
-                  <label>Expires at (YYYY-MM-DD)</label>
-                  <input type="date" name="expires_at">
-                </div>
+                <div><label>Expires at (YYYY-MM-DD)</label><input type="date" name="expires_at"></div>
               </div>
               <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save User</button></div>
             </form>
@@ -406,48 +382,31 @@
             </div>
             <div>
               <label>Strategy</label>
-              <select name="bt_strategy">
-                <option>BASE</option><option>TREND</option><option>CHOP</option>
-                <option>CUSTOM1</option><option>CUSTOM2</option><option>CUSTOM3</option>
-              </select>
+              <select name="bt_strategy"><option>BASE</option><option>TREND</option><option>CHOP</option><option>CUSTOM1</option><option>CUSTOM2</option><option>CUSTOM3</option></select>
             </div>
           </div>
           <div class="row">
-            <div>
-              <label>Upload CSV</label>
-              <input type="file" name="bt_csv" accept=".csv">
-            </div>
+            <div><label>Upload CSV</label><input type="file" name="bt_csv" accept=".csv"></div>
             <div style="flex:0.6">
-              <label class="small"><i>Or</i> use Deriv server fetch</label>
+              <label class="small"><input type="checkbox" name="use_server"> Use Deriv server fetch</label>
               <div class="row">
-                <div>
-                  <label>Candles</label>
-                  <input type="number" name="bt_count" value="500" min="100" max="5000">
-                </div>
+                <div><label>Candles</label><input type="number" name="bt_count" value="300" min="100" max="5000"></div>
               </div>
             </div>
           </div>
           <div style="margin-top:10px">
             <button class="btn btn-acc" type="submit">Run Backtest & Show Screenshot</button>
-            <span class="note">Plot shows ONLY enabled indicators + BUY/SELL markers.</span>
+            <span class="note">Plot shows enabled indicators + BUY/SELL + shaded expiry.</span>
           </div>
         </form>
 
         {% if bt and bt.get('plot_name') %}
           <hr>
-          <div class="grid g-2">
-            <div>
-              <div class="kvs">
-                <div class="kv"><div class="k">TF</div><div class="v">{{ bt.tf }}</div></div>
-                <div class="kv"><div class="k">Expiry</div><div class="v">{{ bt.expiry }}</div></div>
-                <div class="kv"><div class="k">Strategy</div><div class="v">{{ bt.strategy }}</div></div>
-              </div>
-              <p class="note" style="margin-top:6px">
-                Summary: {{ bt.summary }}
-              </p>
-              <p><a href="{{ url_for('dashboard.backtest_last_json') }}">Last JSON</a> •
-                 <a href="{{ url_for('dashboard.backtest_last_csv') }}">Last CSV</a></p>
-            </div>
+          <div class="kvs">
+            <div class="kv"><div class="k">TF</div><div class="v">{{ bt.tf }}</div></div>
+            <div class="kv"><div class="k">Expiry</div><div class="v">{{ bt.expiry }}</div></div>
+            <div class="kv"><div class="k">Strategy</div><div class="v">{{ bt.strategy }}</div></div>
+            <div class="kv"><div class="k">Summary</div><div class="v">{{ bt.summary }}</div></div>
           </div>
           <img class="plot" src="{{ url_for('dashboard.plot_file', name=bt.plot_name) }}" alt="Backtest plot">
         {% elif bt and bt.get('error') %}
@@ -459,13 +418,10 @@
       <div class="card">
         <h3>Telegram</h3>
         <div class="row">
-          <form method="post" action="{{ url_for('dashboard.telegram_test') }}">
-            <button class="btn btn-ok" type="submit">Send Test (all configured tiers)</button>
-          </form>
+          <form method="post" action="{{ url_for('dashboard.telegram_test') }}"><button class="btn btn-ok" type="submit">Send Test (all tiers)</button></form>
           <a class="btn" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Open Diagnostics (JSON)</a>
         </div>
-        <p class="note">Set env: <code>TELEGRAM_BOT_TOKEN</code> and channel IDs:
-          <code>TELEGRAM_CHAT_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code> (or their *_ID_* variants).</p>
+        <p class="note">Set env: <code>TELEGRAM_BOT_TOKEN</code> and tier chat IDs: <code>TELEGRAM_CHAT_FREE</code>, <code>TELEGRAM_CHAT_BASIC</code>, <code>TELEGRAM_CHAT_PRO</code>, <code>TELEGRAM_CHAT_VIP</code>.</p>
       </div>
     </div>
 
@@ -488,7 +444,7 @@
           <div class="kv"><div class="k">VIP</div><div class="v" id="t_vip">0</div></div>
           <div class="kv"><div class="k">All</div><div class="v" id="t_all">0</div></div>
         </div>
-        <p class="note small">Tiers daily caps: Free=3, Basic=6, Pro=15, VIP=∞ (enforced in live engine).</p>
+        <p class="note small">Daily caps: Free=3, Basic=6, Pro=15, VIP=∞.</p>
       </div>
       <div class="card">
         <h3>Quick Links</h3>
@@ -511,23 +467,25 @@ async function hit(url){
   try{
     const r = await fetch(url);
     const js = await r.json().catch(()=>({}));
-    console.log(url, js);
     refreshLive();
+    return js;
   }catch(e){ console.error(e); }
 }
 async function refreshLive(){
   try{
     const s = await fetch('/live/status').then(r=>r.json());
-    const t = await fetch('/live/tally').then(r=>r.json());
     const lv = document.getElementById('lv');
-    if (lv) lv.textContent = (s && s.status) ? (s.status.state || JSON.stringify(s.status)) : '—';
-    if (t && t.tally){
-      const z=t.tally;
-      setVal('t_free', z.free || 0);
-      setVal('t_basic', z.basic || 0);
-      setVal('t_pro', z.pro || 0);
-      setVal('t_vip', z.vip || 0);
-      setVal('t_all', z.all || 0);
+    if (lv) {
+      const st = (s && s.status) ? s.status : {};
+      const badge = st.running ? 'RUNNING' : 'STOPPED';
+      lv.textContent = `${badge}${st.debug ? ' • DEBUG' : ''}`;
+      const t = st.tally || {};
+      const by = t.by_tier || {};
+      setVal('t_free', by.free || 0);
+      setVal('t_basic', by.basic || 0);
+      setVal('t_pro', by.pro || 0);
+      setVal('t_vip', by.vip || 0);
+      setVal('t_all', t.total || 0);
     }
   }catch(e){console.error(e);}
 }
