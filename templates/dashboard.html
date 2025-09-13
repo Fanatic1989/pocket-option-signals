@@ -1,438 +1,422 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>PO Signals — Dashboard</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <!-- Tailwind (CDN build is fine for dashboard) -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    :root { color-scheme: dark; }
-    body { background:#0b0f17; color:#e5e7eb; }
-    .card { background:#0f172a; border:1px solid #1e293b; border-radius:14px; }
-    .card h3 { color:#cbd5e1; }
-    .btn { @apply px-3 py-2 rounded-lg border border-slate-600; }
-    .btn-primary { background:#22c55e; border-color:#16a34a; color:#04130a; font-weight:700; }
-    .btn-ghost { background:#0b0f17; }
-    .badge { @apply text-xs px-2 py-0.5 rounded bg-slate-800 border border-slate-700; }
-    input[type="text"], input[type="number"], select, textarea {
-      background:#0b1220; border:1px solid #1f2a40; border-radius:10px; padding:.5rem .6rem; width:100%;
-      color:#e5e7eb; outline:none;
-    }
-    input[type="checkbox"] { width:1rem; height:1rem; }
-    .grid-pairs label { background:#0b1220; border:1px solid #1f2a40; border-radius:10px; padding:.35rem .55rem; }
-    .kpi { background:#0b1220; border:1px solid #1f2a40; border-radius:12px; padding:.6rem .7rem; }
-    .pill { background:#0b1220; border:1px solid #1f2a40; border-radius:999px; padding:.2rem .6rem; }
-    .hint { color:#94a3b8; font-size:.8rem; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-    .legend-dot { width:.6rem; height:.6rem; border-radius:50%; display:inline-block; margin-right:.35rem; }
-  </style>
+<meta charset="utf-8">
+<title>Signals Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0b0f17; --panel: #101826; --muted: #6b7280; --text: #e5e7eb; --accent:#22c55e; --warn:#f59e0b; --err:#ef4444; --line:#1f2937;
+  }
+  html, body { background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif; }
+  a { color: #93c5fd; text-decoration: none; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 18px; }
+  .grid { display: grid; gap: 16px; }
+  .g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  @media (max-width: 960px){ .g2,.g3 { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 8px; font-size: 18px; }
+  .card h4 { margin: 12px 0 8px; font-size: 15px; color: #cbd5e1; }
+  .muted { color: var(--muted); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .btn { background: #1f2937; color: var(--text); border: 1px solid var(--line); padding: 8px 12px; border-radius: 10px; cursor: pointer; }
+  .btn.primary { background: #2563eb; border-color: #1d4ed8; }
+  .btn.success { background: var(--accent); color: #052e16; border: none; }
+  .btn.warn { background: var(--warn); color: #3b1d00; border: none; }
+  .btn.danger { background: var(--err); color: #3b0d0d; border: none; }
+  .btn:disabled { opacity: .6; cursor: not-allowed; }
+  label { display: inline-flex; align-items: center; gap: 6px; }
+  input[type="text"], input[type="number"], select, textarea { width: 100%; background: #0b1220; color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+  input[type="checkbox"] { transform: translateY(1px); }
+  textarea { min-height: 70px; }
+  .kvs { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; align-items: center; }
+  .hr { height: 1px; background: var(--line); margin: 10px 0; }
+  .pill { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #0f172a; border: 1px solid var(--line); font-size: 12px; }
+  .tag { display: inline-block; padding: 2px 6px; border-radius: 6px; background: #0f172a; border: 1px solid var(--line); font-size: 12px; }
+  img.plot { width: 100%; border-radius: 12px; border: 1px solid var(--line); background: #0b0f17; }
+  pre { background: #0b1220; color: #cbd5e1; padding: 10px; border-radius: 12px; border: 1px solid var(--line); overflow: auto; }
+  .cols-3 { columns: 3; column-gap: 16px; }
+  @media (max-width: 1100px){ .cols-3 { columns: 2; } }
+  @media (max-width: 800px){ .cols-3 { columns: 1; } }
+  .pair-box { break-inside: avoid; margin-bottom: 8px; }
+  .toast { padding: 8px 10px; border-radius: 10px; background: #0b1220; border:1px solid var(--line); }
+  .ok { border-color: #14532d; }
+  .err { border-color: #7f1d1d; }
+</style>
 </head>
-<body class="min-h-screen">
+<body>
+<div class="wrap">
+  <div class="row" style="justify-content: space-between;">
+    <div>
+      <h2 style="margin:0;">Signals Dashboard</h2>
+      <div class="muted">Local: {{ now_local }} • TZ: {{ tz }} • Window OK: <span class="pill">{{ 'YES' if window_ok else 'NO' }}</span></div>
+    </div>
+    <div class="row">
+      {% if session.admin %}
+        <form action="{{ url_for('dashboard.logout') }}" method="get"><button class="btn">Logout</button></form>
+      {% else %}
+        <form action="{{ url_for('dashboard.login') }}" method="post" class="row">
+          <input type="password" name="password" placeholder="Admin password">
+          <button class="btn">Login</button>
+        </form>
+      {% endif %}
+    </div>
+  </div>
 
-  <!-- Top bar -->
-  <header class="w-full border-b border-slate-800">
-    <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
-      <div class="flex items-center gap-3">
-        <div class="font-extrabold text-lg tracking-wide">PO Signals</div>
-        <span class="pill text-xs">{{ now_local }}</span>
-        <span class="pill text-xs">TZ: {{ TZ.zone if TZ else tz }}</span>
-        <span class="pill text-xs">{{ "Window OK" if window_ok else "Outside Window" }}</span>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    <div class="grid" style="margin-top:12px;">
+      {% for cat, msg in messages %}
+        <div class="toast {{ 'ok' if cat=='ok' else 'err' if cat=='error' else '' }}">{{ msg }}</div>
+      {% endfor %}
+    </div>
+  {% endif %}
+  {% endwith %}
+
+  {% if session.admin %}
+  <form id="mainForm" action="{{ url_for('dashboard.view') }}" method="post">
+    <div class="grid g2" style="margin-top:14px;">
+      <!-- Settings -->
+      <div class="card">
+        <h3>General Settings</h3>
+        <div class="kvs">
+          <div>Window (Mon–Fri):</div>
+          <div class="row" style="gap:6px;">
+            <input type="text" name="window_start" value="{{ cfg.window.start if cfg.window else '08:00' }}" style="max-width:110px">
+            <span class="muted">to</span>
+            <input type="text" name="window_end" value="{{ cfg.window.end if cfg.window else '17:00' }}" style="max-width:110px">
+            <input type="text" name="window_tz" value="{{ tz }}" style="max-width:220px">
+          </div>
+
+          <div>Live TF / Expiry:</div>
+          <div class="row" style="gap:6px;">
+            <select name="live_tf" style="max-width:130px">
+              {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+                <option value="{{ tf }}" {{ 'selected' if cfg.live_tf==tf else '' }}>{{ tf }}</option>
+              {% endfor %}
+            </select>
+            <select name="live_expiry" style="max-width:130px">
+              {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
+                <option value="{{ e }}" {{ 'selected' if cfg.live_expiry==e else '' }}>{{ e }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div>Deriv Fetch:</div>
+          <div class="row" style="gap:6px;">
+            <label><input type="checkbox" name="use_deriv_fetch" {{ 'checked' if cfg.use_deriv_fetch else '' }}> Use Deriv server fetch</label>
+            <input type="number" name="deriv_count" min="60" step="1" value="{{ cfg.deriv_count or 300 }}" style="max-width:120px">
+          </div>
+        </div>
+        <div class="hr"></div>
+
+        <h4>Pairs (PO majors) + Manual Symbols</h4>
+        <div class="cols-3" id="poPairs">
+          {% set majors = ['EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','AUDUSD','NZDUSD','EURGBP','EURJPY','GBPJPY','EURAUD','AUDJPY','CADJPY','CHFJPY'] %}
+          {% for po in majors %}
+            <div class="pair-box"><label><input type="checkbox" class="po-check" value="{{ po }}"> {{ po }}</label></div>
+          {% endfor %}
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <label><input type="checkbox" id="convertPO" name="convert_po" {{ 'checked' if False else '' }}> Convert PO → Deriv (frx…)</label>
+        </div>
+        <div style="margin-top:8px;">
+          <textarea id="symbols_text" name="symbols_text" placeholder="Manual symbols (space or comma separated)">{{ ' '.join(cfg.symbols_raw or []) }}</textarea>
+          <div class="muted" style="margin-top:4px;">Hint: You can type PO (e.g. EURUSD) or Deriv codes (e.g. frxEURUSD). If any PO majors are present, the Convert box will auto-toggle.</div>
+        </div>
+        <div class="row" style="margin-top:10px; justify-content:flex-end;">
+          <button type="submit" class="btn success">Save Settings</button>
+        </div>
       </div>
-      <div class="flex items-center gap-2">
-        <a href="/" class="btn btn-ghost">Home</a>
-        <a href="/dashboard" class="btn btn-ghost">Dashboard</a>
+
+      <!-- Strategies & Custom Rules -->
+      <div class="card">
+        <h3>Strategies</h3>
+        <div class="row" style="gap:12px; flex-wrap: wrap;">
+          {% for name in ['BASE','TREND','CHOP','CUSTOM1','CUSTOM2','CUSTOM3'] %}
+            <label class="tag"><input type="checkbox" name="s_{{ name }}" {{ 'checked' if cfg.strategies.get(name,{}).get('enabled') else '' }}> {{ name }}</label>
+          {% endfor %}
+        </div>
+        <h4 style="margin-top:12px;">Custom Rules</h4>
+        <div class="grid g3">
+          <div>
+            <div class="muted">CUSTOM1</div>
+            <textarea name="custom1_rules" placeholder="Write simple rules / notes…">{{ cfg.custom1_rules or '' }}</textarea>
+          </div>
+          <div>
+            <div class="muted">CUSTOM2</div>
+            <textarea name="custom2_rules" placeholder="Write simple rules / notes…">{{ cfg.custom2_rules or '' }}</textarea>
+          </div>
+          <div>
+            <div class="muted">CUSTOM3</div>
+            <textarea name="custom3_rules" placeholder="Write simple rules / notes…">{{ cfg.custom3_rules or '' }}</textarea>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px; justify-content:flex-end;">
+          <button type="submit" class="btn">Save Strategies/Rules</button>
+        </div>
       </div>
     </div>
-  </header>
 
-  <!-- Flash messages (Flask) -->
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% if messages %}
-      <div class="max-w-7xl mx-auto px-4 mt-4 space-y-2">
-        {% for category, message in messages %}
-          <div class="rounded-lg px-3 py-2 border
-                      {% if category in ['ok','success'] %}border-emerald-600 bg-emerald-900/20 text-emerald-300
-                      {% elif category == 'error' %}border-rose-600 bg-rose-900/20 text-rose-300
-                      {% else %}border-slate-700 bg-slate-800/40 text-slate-300{% endif %}">
-            {{ message }}
+    <!-- Indicators -->
+    <div class="card" style="margin-top:16px;">
+      <h3>Indicators</h3>
+      <div class="grid g3">
+        {% for key, spec in ind_specs.items() %}
+          {% set block = cfg.indicators.get(key, {}) %}
+          <div class="card" style="padding:10px;">
+            <div class="row" style="justify-content:space-between;">
+              <div><strong>{{ spec.title }}</strong> <span class="muted">({{ key }})</span></div>
+              <label><input type="checkbox" name="ind_{{ key }}" {{ 'checked' if block.enabled else '' }}> Enabled</label>
+            </div>
+            {% if spec.fields %}
+              <div class="kvs" style="margin-top:6px;">
+                {% for fname, default in spec.fields.items() %}
+                  <div class="muted">{{ fname }}</div>
+                  <div><input type="text" name="ind_{{ key }}_{{ fname }}" value="{{ block.get(fname, default) }}"></div>
+                {% endfor %}
+              </div>
+            {% else %}
+              <div class="muted" style="margin-top:6px;">No parameters</div>
+            {% endif %}
           </div>
         {% endfor %}
       </div>
-    {% endif %}
-  {% endwith %}
-
-  <main class="max-w-7xl mx-auto px-4 py-6">
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
-      <!-- LEFT COLUMN -->
-      <section class="lg:col-span-2 space-y-5">
-
-        <!-- Save Config Form -->
-        <form method="POST" action="{{ url_for('dashboard.view') }}" enctype="multipart/form-data" class="space-y-5">
-          <!-- Window / Time / Engine -->
-          <div class="card p-4">
-            <div class="flex items-center justify-between">
-              <h3 class="font-semibold">Window & Defaults</h3>
-              <span class="hint">Mon–Fri enforced in backend</span>
-            </div>
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">
-              <div>
-                <label class="text-xs text-slate-400">Start (local)</label>
-                <input type="text" name="window_start" value="{{ (cfg.get('window_start') or '08:00') }}" placeholder="08:00">
-              </div>
-              <div>
-                <label class="text-xs text-slate-400">End (local)</label>
-                <input type="text" name="window_end" value="{{ (cfg.get('window_end') or '17:00') }}" placeholder="17:00">
-              </div>
-              <div>
-                <label class="text-xs text-slate-400">Deriv fetch (count)</label>
-                <input type="number" min="100" step="10" name="deriv_count" value="{{ cfg.get('deriv_count',300) }}">
-                <label class="inline-flex items-center gap-2 text-sm mt-1">
-                  <input type="checkbox" name="use_deriv_fetch" {% if cfg.get('use_deriv_fetch') %}checked{% endif %}>
-                  Enable Deriv server fetch (fallback is CSV)
-                </label>
-              </div>
-              <div class="flex items-end">
-                <button class="btn btn-primary w-full" type="submit">Save Window & Defaults</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- Pairs Selector + Manual -->
-          <div class="card p-4">
-            <div class="flex items-center justify-between mb-3">
-              <h3 class="font-semibold">Pairs</h3>
-              <span class="hint">Tick majors or type any additional symbols</span>
-            </div>
-
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-2 grid-pairs">
-              {% set majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"] %}
-              {% set existing = (cfg.get('symbols_raw') or []) %}
-              {% for po in majors %}
-              <label class="inline-flex items-center gap-2 text-sm">
-                <input type="checkbox" name="pair_{{ po }}" value="{{ po }}"
-                       {% if po in existing or ('frx' + po) in existing %}checked{% endif %}>
-                {{ po }}
-              </label>
-              {% endfor %}
-            </div>
-
-            <div class="mt-3">
-              <label class="block text-xs text-slate-400">Manual symbols (space or comma separated)</label>
-              <textarea name="symbols_text" rows="2">{{ " ".join(existing) }}</textarea>
-            </div>
-
-            <div class="mt-2">
-              <label class="inline-flex items-center gap-2 text-sm">
-                <input type="checkbox" name="convert_po" >
-                Convert PocketOption majors → Deriv (EURUSD → frxEURUSD)
-              </label>
-              <div class="hint mt-1">Saved to <span class="mono">cfg.symbols_raw</span>. Backtest can also request PO→Deriv conversion on the fly.</div>
-            </div>
-
-            <div class="mt-3">
-              <button class="btn btn-primary" type="submit">Save Pairs</button>
-            </div>
-          </div>
-
-          <!-- Strategies -->
-          <div class="card p-4">
-            <h3 class="font-semibold mb-3">Strategies (enable/disable)</h3>
-            <div class="grid grid-cols-2 md:grid-cols-6 gap-2">
-              {% for name in ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"] %}
-              <label class="inline-flex items-center gap-2 text-sm">
-                <input type="checkbox" name="strategy_{{ name }}" {% if cfg.get(name) %}checked{% endif %}>
-                {{ name }}
-              </label>
-              {% endfor %}
-            </div>
-          </div>
-
-          <!-- Custom Rules (text boxes) -->
-          <div class="card p-4">
-            <div class="flex items-center justify-between">
-              <h3 class="font-semibold">Custom Rules</h3>
-              <span class="hint">These are free text notes for your CUSTOM1–3 strategies</span>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3">
-              <div>
-                <label class="text-xs text-slate-400">CUSTOM 1</label>
-                <textarea name="custom1_rules" rows="6" placeholder="Write your rules for CUSTOM1">{{ cfg.get("custom1_rules","") }}</textarea>
-              </div>
-              <div>
-                <label class="text-xs text-slate-400">CUSTOM 2</label>
-                <textarea name="custom2_rules" rows="6" placeholder="Write your rules for CUSTOM2">{{ cfg.get("custom2_rules","") }}</textarea>
-              </div>
-              <div>
-                <label class="text-xs text-slate-400">CUSTOM 3</label>
-                <textarea name="custom3_rules" rows="6" placeholder="Write your rules for CUSTOM3">{{ cfg.get("custom3_rules","") }}</textarea>
-              </div>
-            </div>
-            <div class="mt-3">
-              <button class="btn btn-primary" type="submit">Save Custom Rules</button>
-            </div>
-          </div>
-
-          <!-- Indicators -->
-          <div class="card p-4">
-            <div class="flex items-center justify-between">
-              <h3 class="font-semibold">Indicators</h3>
-              <span class="hint">Toggles & parameters map 1-for-1 to <span class="mono">INDICATOR_SPECS</span></span>
-            </div>
-
-            <!-- Render indicator cards -->
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
-              {% for key, spec in ind_specs.items() %}
-                {% set saved = (cfg.get('indicators',{}).get(key) or {}) %}
-                <div class="p-3 rounded-lg border border-slate-700 bg-slate-900/30">
-                  <div class="flex items-center justify-between">
-                    <div class="font-semibold">{{ spec.title }}</div>
-                    <label class="inline-flex items-center gap-2 text-sm">
-                      <input type="checkbox" name="ind_{{ key }}" {% if saved.get('enabled') %}checked{% endif %}>
-                      Enable
-                    </label>
-                  </div>
-                  {% if spec.fields %}
-                  <div class="grid grid-cols-2 gap-2 mt-3">
-                    {% for fname, default in spec.fields.items() %}
-                    <div>
-                      <label class="text-xs text-slate-400">{{ fname }}</label>
-                      <input type="text" name="ind_{{ key }}_{{ fname }}" value="{{ saved.get(fname, default) }}">
-                    </div>
-                    {% endfor %}
-                  </div>
-                  {% endif %}
-                  <div class="mt-2 text-xs text-slate-500">Panel: {{ spec.panel }}</div>
-                </div>
-              {% endfor %}
-            </div>
-
-            <div class="mt-3">
-              <button class="btn btn-primary" type="submit">Save Indicators</button>
-            </div>
-          </div>
-        </form>
-
-        <!-- Telegram Broadcaster -->
-        <div class="card p-4">
-          <div class="flex items-center justify-between">
-            <h3 class="font-semibold">Telegram — Broadcast / Test</h3>
-            <span class="hint">Tiers: free / basic / pro / vip</span>
-          </div>
-          <div class="grid grid-cols-1 md:grid-cols-6 gap-3 mt-3">
-            <div class="md:col-span-5">
-              <input type="text" id="tg_text" placeholder="Enter a message to broadcast…">
-            </div>
-            <div>
-              <select id="tg_tier">
-                <option value="all">All tiers</option>
-                <option value="free">free</option>
-                <option value="basic">basic</option>
-                <option value="pro">pro</option>
-                <option value="vip">vip</option>
-              </select>
-            </div>
-          </div>
-          <div class="flex items-center gap-3 mt-3">
-            <button class="btn btn-primary" id="btnSendTG">Send</button>
-            <button class="btn" id="btnTestAll">Send Test to All</button>
-            <span id="tg_result" class="hint"></span>
-          </div>
-        </div>
-
-      </section>
-
-      <!-- RIGHT COLUMN -->
-      <aside class="space-y-5">
-        <!-- Engine Status / Live Controls -->
-        <div class="card p-4">
-          <div class="flex items-center justify-between">
-            <h3 class="font-semibold">Live Engine</h3>
-            <div class="flex gap-2">
-              <button class="btn" id="btnStart">Start</button>
-              <button class="btn" id="btnStop">Stop</button>
-            </div>
-          </div>
-          <div id="engine_status" class="mt-3 text-sm mono">Loading…</div>
-          <div class="mt-3 grid grid-cols-4 gap-2">
-            <div class="kpi text-center">
-              <div class="text-xs text-slate-400">FREE</div>
-              <div id="k_free" class="font-semibold">0</div>
-            </div>
-            <div class="kpi text-center">
-              <div class="text-xs text-slate-400">BASIC</div>
-              <div id="k_basic" class="font-semibold">0</div>
-            </div>
-            <div class="kpi text-center">
-              <div class="text-xs text-slate-400">PRO</div>
-              <div id="k_pro" class="font-semibold">0</div>
-            </div>
-            <div class="kpi text-center">
-              <div class="text-xs text-slate-400">VIP</div>
-              <div id="k_vip" class="font-semibold">0</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Backtest -->
-        <div class="card p-4">
-          <div class="flex items-center justify-between">
-            <h3 class="font-semibold">Backtest / Screenshot</h3>
-            <span class="hint">Use Deriv server or upload CSV</span>
-          </div>
-
-          <form id="btForm" class="mt-3 space-y-3">
-            <div class="grid grid-cols-2 gap-2">
-              <div>
-                <label class="text-xs text-slate-400">Timeframe</label>
-                <select name="tf">
-                  {% for t in ["M1","M2","M3","M5","M10","M15","M30","H1","H4","D1"] %}
-                  <option value="{{ t }}" {% if t==(cfg.get('bt_tf') or 'M1') %}selected{% endif %}>{{ t }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div>
-                <label class="text-xs text-slate-400">Expiry</label>
-                <select name="expiry">
-                  {% for e in ["1m","3m","5m","10m","30m","1h","4h"] %}
-                  <option value="{{ e }}" {% if e==(cfg.get('bt_expiry') or '5m') %}selected{% endif %}>{{ e }}</option>
-                  {% endfor %}
-                </select>
-              </div>
-            </div>
-
-            <div>
-              <label class="text-xs text-slate-400">Strategy</label>
-              <select name="strategy">
-                {% for s in ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"] %}
-                <option value="{{ s }}">{{ s }}</option>
-                {% endfor %}
-              </select>
-            </div>
-
-            <div>
-              <label class="block text-xs text-slate-400">Symbols for this run (space/comma separated). Empty = use saved pairs.</label>
-              <input name="symbols" type="text" placeholder="e.g. frxEURUSD frxGBPUSD" value="{{ ' '.join(cfg.get('symbols_raw',[]) or []) }}">
-              <label class="inline-flex items-center gap-2 text-sm mt-2">
-                <input type="checkbox" name="convert_po_deriv">
-                Convert PocketOption majors to Deriv for this run
-              </label>
-            </div>
-
-            <div class="grid grid-cols-2 gap-2">
-              <div>
-                <label class="text-xs text-slate-400">Use Deriv server fetch</label>
-                <label class="inline-flex items-center gap-2">
-                  <input type="checkbox" name="use_deriv_fetch" {% if cfg.get('use_deriv_fetch') %}checked{% endif %}>
-                  <span class="hint">If unchecked, upload CSV</span>
-                </label>
-              </div>
-              <div>
-                <label class="text-xs text-slate-400">Target candles (count)</label>
-                <input type="number" min="120" step="10" name="target" value="{{ cfg.get('deriv_count',300) }}">
-              </div>
-            </div>
-
-            <div>
-              <label class="text-xs text-slate-400">CSV Upload (optional; overrides Deriv fetch)</label>
-              <input type="file" name="csv" accept=".csv" class="w-full">
-            </div>
-
-            <div class="flex items-center gap-3">
-              <button class="btn btn-primary" type="submit">Run Backtest</button>
-              <span id="bt_msg" class="hint"></span>
-            </div>
-          </form>
-
-          <div id="bt_out" class="mt-4 hidden">
-            <div class="text-sm">Stats: <span id="bt_stats" class="mono"></span></div>
-            <div class="mt-2">
-              <img id="bt_img" src="" alt="Backtest chart" class="w-full rounded-lg border border-slate-700">
-            </div>
-          </div>
-        </div>
-
-      </aside>
+      <div class="row" style="margin-top:10px; justify-content:flex-end;">
+        <button type="submit" class="btn">Save Indicators</button>
+      </div>
     </div>
-  </main>
+  </form>
 
-  <script>
-    // ---------- Live Status ----------
-    async function refreshStatus() {
-      try {
-        const r = await fetch('/live/status');
-        const js = await r.json();
-        const s = js || {};
-        document.getElementById('engine_status').textContent = JSON.stringify(s, null, 2);
-      } catch(e) {
-        document.getElementById('engine_status').textContent = 'Status error: '+e;
-      }
-      try {
-        const r2 = await fetch('/live/tally');
-        const t = await r2.json();
-        document.getElementById('k_free').textContent  = (t.free ?? t?.by_tier?.free ?? 0);
-        document.getElementById('k_basic').textContent = (t.basic ?? t?.by_tier?.basic ?? 0);
-        document.getElementById('k_pro').textContent   = (t.pro ?? t?.by_tier?.pro ?? 0);
-        document.getElementById('k_vip').textContent   = (t.vip ?? t?.by_tier?.vip ?? 0);
-      } catch {}
+  <!-- Backtest & Plot -->
+  <div class="grid g2" style="margin-top:16px;">
+    <div class="card">
+      <h3>Backtest</h3>
+      <form id="btForm" action="{{ url_for('dashboard.backtest') }}" method="post" enctype="multipart/form-data" onsubmit="return runBacktest(event);">
+        <div class="kvs">
+          <div>Symbols:</div>
+          <div><input type="text" name="bt_symbols" id="bt_symbols" placeholder="Leave blank to use saved symbols"></div>
+
+          <div>PO → Deriv:</div>
+          <div><label><input type="checkbox" name="convert_po_bt" id="convert_po_bt"> Convert</label></div>
+
+          <div>TF / Expiry:</div>
+          <div class="row">
+            <select name="bt_tf" id="bt_tf" style="max-width:130px">
+              {% for tf in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+                <option value="{{ tf }}" {{ 'selected' if cfg.live_tf==tf else '' }}>{{ tf }}</option>
+              {% endfor %}
+            </select>
+            <select name="bt_expiry" id="bt_expiry" style="max-width:130px">
+              {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
+                <option value="{{ e }}" {{ 'selected' if cfg.live_expiry==e else '' }}>{{ e }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div>Deriv fetch:</div>
+          <div class="row">
+            <label><input type="checkbox" name="use_deriv_fetch" {{ 'checked' if cfg.use_deriv_fetch else '' }}> Use Deriv</label>
+            <input type="number" name="bt_count" min="60" step="1" value="{{ cfg.deriv_count or 300 }}" style="max-width:120px">
+          </div>
+
+          <div>Strategy:</div>
+          <div>
+            <select name="bt_strategy" id="bt_strategy" style="max-width:160px">
+              {% for name in ['BASE','TREND','CHOP','CUSTOM1','CUSTOM2','CUSTOM3'] %}
+                <option value="{{ name }}">{{ name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div>CSV (optional):</div>
+          <div><input type="file" name="bt_csv" accept=".csv"></div>
+        </div>
+
+        <div class="row" style="margin-top:10px; gap:8px;">
+          <button class="btn primary" id="btnRunBT">Run Backtest</button>
+          <span id="btMsg" class="muted"></span>
+        </div>
+      </form>
+
+      <div id="btResult" style="margin-top:12px; display:none;">
+        <div class="row" style="justify-content: space-between;">
+          <div><span class="pill" id="btSummary">—</span></div>
+          <div class="muted">TF: <span id="btTF">-</span> • Exp: <span id="btExp">-</span> • Strategy: <span id="btStrat">-</span></div>
+        </div>
+        <div class="hr"></div>
+        <img id="btPlot" class="plot" alt="Backtest plot">
+      </div>
+    </div>
+
+    <!-- Live Engine -->
+    <div class="card">
+      <h3>Live Engine</h3>
+      <div class="row" style="gap:8px; margin-bottom:8px;">
+        <button class="btn success" id="btnStart">Start</button>
+        <button class="btn danger" id="btnStop">Stop</button>
+        <button class="btn" id="btnRefresh">Refresh</button>
+        <span id="liveMsg" class="muted"></span>
+      </div>
+      <pre id="liveStatus">{ "loading": true }</pre>
+
+      <div class="hr"></div>
+      <h4>Telegram Broadcast</h4>
+      <form id="tgForm" onsubmit="return sendTG(event);">
+        <div class="kvs">
+          <div>Tier:</div>
+          <div>
+            <select id="tgTier">
+              <option value="all">All</option>
+              <option value="free">Free</option>
+              <option value="basic">Basic</option>
+              <option value="pro">Pro</option>
+              <option value="vip">VIP</option>
+            </select>
+          </div>
+          <div>Message:</div>
+          <div><textarea id="tgText" placeholder="Type a message to broadcast"></textarea></div>
+        </div>
+        <div class="row" style="margin-top:8px; gap:8px;">
+          <button class="btn">Send</button>
+          <button class="btn warn" id="btnTgTest">Send Test (All)</button>
+          <span id="tgMsg" class="muted"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+(function(){
+  // --- Pairs selector merges into symbols_text and auto-checks Convert PO→Deriv ---
+  const majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"];
+  const form = document.getElementById('mainForm');
+  const symbolsBox = document.getElementById('symbols_text');
+  const convertBox = document.getElementById('convertPO');
+  const pairChecks = Array.from(document.querySelectorAll('.po-check'));
+
+  function collectPairsIntoSymbols() {
+    const selected = pairChecks.filter(c => c.checked).map(c => c.value);
+    const manualRaw = (symbolsBox.value || "").replace(/[;\n\t]/g, " ");
+    const manualParts = manualRaw.split(/[,\s]+/).filter(Boolean);
+    // Dedup preserving order
+    const merged = [];
+    for (const t of [...selected, ...manualParts]) {
+      if (!merged.includes(t)) merged.push(t);
     }
-    refreshStatus();
-    setInterval(refreshStatus, 5000);
+    symbolsBox.value = merged.join(" ");
+    // If any PO majors present, auto-check Convert
+    const hasPO = merged.some(s => majors.includes(s.toUpperCase()));
+    if (hasPO) convertBox.checked = true;
+  }
 
-    document.getElementById('btnStart').addEventListener('click', async () => {
-      const r = await fetch('/live/start', {method:'POST'});
-      await refreshStatus();
-    });
-    document.getElementById('btnStop').addEventListener('click', async () => {
-      const r = await fetch('/live/stop', {method:'POST'});
-      await refreshStatus();
-    });
+  if (form) {
+    form.addEventListener('submit', (e) => { collectPairsIntoSymbols(); });
+  }
 
-    // ---------- Telegram ----------
-    document.getElementById('btnSendTG').addEventListener('click', async () => {
-      const text = document.getElementById('tg_text').value.trim();
-      const tier = document.getElementById('tg_tier').value;
-      if (!text) { document.getElementById('tg_result').textContent='Text required'; return; }
-      const fd = new FormData();
-      fd.append('text', text);
-      fd.append('tier', tier);
-      const r = await fetch('/telegram/send', {method:'POST', body: fd});
-      const js = await r.json();
-      document.getElementById('tg_result').textContent = js.ok ? 'Sent' : ('Error: '+(js.error||''));
-    });
+  // --- Backtest AJAX ---
+  async function runBacktest(ev){
+    ev.preventDefault();
+    const f = document.getElementById('btForm');
+    const btn = document.getElementById('btnRunBT');
+    const msg = document.getElementById('btMsg');
+    const out = document.getElementById('btResult');
+    const plot = document.getElementById('btPlot');
+    const sum = document.getElementById('btSummary');
+    const bttf = document.getElementById('btTF');
+    const btexp = document.getElementById('btExp');
+    const btstr = document.getElementById('btStrat');
 
-    document.getElementById('btnTestAll').addEventListener('click', async () => {
-      const fd = new FormData();
-      fd.append('text', '🧪 Dashboard Test');
-      const r = await fetch('/telegram/test', {method:'POST', body: fd});
-      const js = await r.json();
-      document.getElementById('tg_result').textContent = js.ok ? 'Test sent' : 'Test error';
-    });
+    btn.disabled = true; msg.textContent = "Running…";
+    try{
+      // If symbols empty, we leave blank to use saved cfg; else ensure proper splitting
+      const fd = new FormData(f);
+      const symRaw = (fd.get('bt_symbols') || "").toString();
+      const cleaned = symRaw.replace(/[;\n\t]/g, " ").split(/[,\s]+/).filter(Boolean).join(',');
+      fd.set('bt_symbols', cleaned);
 
-    // ---------- Backtest ----------
-    const btForm = document.getElementById('btForm');
-    btForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      document.getElementById('bt_msg').textContent = 'Running…';
-      const fd = new FormData(btForm);
-      try {
-        const r = await fetch('/backtest', {method:'POST', body: fd});
-        const js = await r.json();
-        if (!js.ok) {
-          document.getElementById('bt_msg').textContent = 'Error: '+(js.error||'');
-          document.getElementById('bt_out').classList.add('hidden');
-          return;
-        }
-        document.getElementById('bt_stats').textContent =
-          (js.stats?.wins||0)+'W / '+(js.stats?.loss||0)+'L / '+(js.stats?.draw||0)+'D — WR '+(js.stats?.win_rate?.toFixed(1)||'0.0')+'%';
-        document.getElementById('bt_img').src = js.plot.startsWith('/static/') ? js.plot : ('/static/plots/'+js.plot);
-        document.getElementById('bt_out').classList.remove('hidden');
-        document.getElementById('bt_msg').textContent = 'Done';
-      } catch (err) {
-        document.getElementById('bt_msg').textContent = 'Error: '+err;
-        document.getElementById('bt_out').classList.add('hidden');
+      const res = await fetch(f.action, { method: 'POST', body: fd });
+      const js = await res.json();
+      if(!res.ok || !js.ok){
+        throw new Error((js && (js.error || js.code)) || ("HTTP "+res.status));
       }
-    });
-  </script>
+      msg.textContent = "OK";
+      sum.textContent = (js.stats ? `${js.stats.wins||0}W / ${js.stats.loss||0}L / ${js.stats.draw||0}D — WR ${(js.stats.win_rate||0).toFixed(1)}%` : "—");
+      bttf.textContent = (fd.get('bt_tf') || '').toString();
+      btexp.textContent = (fd.get('bt_expiry') || '').toString();
+      btstr.textContent = (fd.get('bt_strategy') || '').toString();
+      plot.src = js.plot;
+      out.style.display = 'block';
+    }catch(err){
+      msg.textContent = "Error: " + (err.message || err);
+      out.style.display = 'none';
+    }finally{
+      btn.disabled = false;
+    }
+    return false;
+  }
+  window.runBacktest = runBacktest;
+
+  // --- Live Engine controls ---
+  const liveStatus = document.getElementById('liveStatus');
+  const liveMsg = document.getElementById('liveMsg');
+  const btnStart = document.getElementById('btnStart');
+  const btnStop = document.getElementById('btnStop');
+  const btnRefresh = document.getElementById('btnRefresh');
+
+  async function refreshStatus(){
+    try{
+      const res = await fetch('/api/status');
+      const js = await res.json();
+      liveStatus.textContent = JSON.stringify(js, null, 2);
+    }catch(e){
+      liveStatus.textContent = JSON.stringify({ ok:false, error: (e && e.message) || e }, null, 2);
+    }
+  }
+  async function postJSON(url){
+    const res = await fetch(url, { method: 'POST' });
+    return res.json();
+  }
+  if(btnStart){ btnStart.onclick = async ()=>{ liveMsg.textContent = 'Starting…'; const js = await postJSON('/api/start'); liveMsg.textContent = js.ok ? 'Running' : ('Error: '+(js.msg||'')); refreshStatus(); };}
+  if(btnStop){ btnStop.onclick  = async ()=>{ liveMsg.textContent = 'Stopping…'; const js = await postJSON('/api/stop');  liveMsg.textContent = js.ok ? 'Stopped'  : ('Error: '+(js.msg||'')); refreshStatus(); };}
+  if(btnRefresh){ btnRefresh.onclick = refreshStatus; }
+  refreshStatus();
+
+  // --- Telegram ---
+  async function sendTG(ev){
+    ev.preventDefault();
+    const tier = document.getElementById('tgTier').value;
+    const text = document.getElementById('tgText').value.trim();
+    const msg = document.getElementById('tgMsg');
+    if(!text){ msg.textContent = "Enter text"; return false; }
+    try{
+      const fd = new URLSearchParams();
+      fd.set('tier', tier); fd.set('text', text);
+      const res = await fetch('/telegram/send', { method: 'POST', headers: { 'Content-Type':'application/x-www-form-urlencoded' }, body: fd.toString() });
+      const js = await res.json();
+      msg.textContent = js.ok ? 'Sent.' : ('Error: '+(js.error||''));
+    }catch(e){ msg.textContent = 'Error: '+(e.message||e); }
+    return false;
+  }
+  window.sendTG = sendTG;
+  const btnTgTest = document.getElementById('btnTgTest');
+  if(btnTgTest){
+    btnTgTest.onclick = async (ev)=>{
+      ev.preventDefault();
+      const msg = document.getElementById('tgMsg');
+      try{
+        const fd = new URLSearchParams(); fd.set('text','🧪 Test broadcast');
+        const res = await fetch('/telegram/test', { method: 'POST', headers: { 'Content-Type':'application/x-www-form-urlencoded' }, body: fd.toString() });
+        const js = await res.json();
+        msg.textContent = js.ok ? 'Test sent.' : 'Error sending test';
+      }catch(e){ msg.textContent = 'Error: ' + (e.message||e); }
+      return false;
+    };
+  }
+})();
+</script>
 </body>
 </html>
