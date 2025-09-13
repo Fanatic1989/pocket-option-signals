@@ -18,14 +18,13 @@
     .card{background:var(--card);border-radius:var(--br);padding:16px;border:1px solid rgba(255,255,255,.06)}
     .card h3{margin:0 0 10px 0;font-size:16px}
     label{display:inline-block;margin:6px 0 4px 0;color:#cfd6e7}
-    input[type=text],input[type=password],input[type=number],input[type=time],input[type=date],select,textarea{
+    input[type=text],input[type=number],input[type=time],input[type=date],select,textarea{
       width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
-      background:#0d1117;color:var(--text);outline:none;
-      overflow-wrap:anywhere;word-break:break-word;white-space:normal;
+      background:#0d1117;color:var(--text);outline:none;overflow-wrap:anywhere;word-break:break-word;
     }
-    textarea{min-height:80px;max-height:260px;resize:vertical}
+    textarea{min-height:80px}
     .row{display:flex;gap:10px;flex-wrap:wrap}
-    .row > *{flex:1 1 180px}
+    .row > *{flex:1; min-width: 140px}
     .btn{display:inline-block;background:#212838;color:#eaf1ff;border:1px solid rgba(255,255,255,.15);
       padding:10px 14px;border-radius:10px;cursor:pointer}
     .btn:hover{background:#2a3246}
@@ -36,15 +35,15 @@
     .btn-err{background:#3a1212;border-color:#6b1c1c;color:#ffb1b1}
     .muted{color:var(--muted)}
     .pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid rgba(255,255,255,.12);font-size:12px;color:#cbd4ea}
-    .flash{padding:10px 12px;border-radius:10px;margin-bottom:10px;overflow-wrap:anywhere;word-break:break-word}
+    .flash{padding:10px 12px;border-radius:10px;margin-bottom:10px}
     .flash-ok{background:#062a17;border:1px solid #0b4; color:#baf7d2}
     .flash-err{background:#2a0c0c;border:1px solid #b33; color:#ffc9c9}
     img.plot{max-width:100%;border-radius:12px;border:1px solid rgba(255,255,255,.1)}
     hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:14px 0}
     .kvs{display:grid;grid-template-columns:repeat(4, minmax(0,1fr)); gap:8px}
-    .kvs .kv{background:#0f1420;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px}
+    .kvs .kv{background:#0f1420;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px; min-width: 0}
     .kv .k{font-size:12px;color:#aab3c7}
-    .kv .v{font-size:16px;margin-top:2px;overflow-wrap:anywhere;word-break:break-word}
+    .kv .v{font-size:16px;margin-top:2px; overflow-wrap:anywhere}
     .split{display:grid;grid-template-columns:2fr 1fr; gap:16px}
     .right-sticky{position:sticky; top:16px}
     .small{font-size:12px}
@@ -53,8 +52,6 @@
     .note{font-size:12px;color:#9fb0cc}
     .legend{font-size:12px;color:#96a1b8}
     .center{display:flex;align-items:center;justify-content:center}
-    /* keep long config/JSON and codes inside boxes */
-    code, pre{overflow-wrap:anywhere;word-break:break-word;white-space:pre-wrap}
   </style>
 </head>
 <body>
@@ -62,7 +59,7 @@
 
   <!-- Header -->
   <div class="row" style="align-items:center">
-    <div style="flex:1 1 auto">
+    <div style="flex:1; min-width: 240px">
       <h2 style="margin:0 0 2px 0">Pocket-Option Signals</h2>
       <div class="muted small">
         {% if tz %}Timezone: <b>{{ tz }}</b>{% endif %}
@@ -70,7 +67,7 @@
         {% if within is not none %} • Within window: <span class="pill">{{ 'YES' if within else 'NO' }}</span>{% endif %}
       </div>
     </div>
-    <div style="flex:0 0 auto">
+    <div>
       {% if session.admin %}
         <a class="btn" href="{{ url_for('dashboard.logout') }}">Logout</a>
       {% else %}
@@ -83,7 +80,7 @@
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       {% for cat, msg in messages %}
-        <div class="flash {{ 'flash-err' if cat=='error' else 'flash-ok' }}">{{ msg|safe }}</div>
+        <div class="flash {{ 'flash-err' if cat=='error' else 'flash-ok' }}">{{ msg }}</div>
       {% endfor %}
     {% endif %}
   {% endwith %}
@@ -207,90 +204,36 @@
         <h3>Indicators</h3>
         <form method="post" action="{{ url_for('dashboard.update_indicators') }}">
           <div class="grid g-3">
-            {% set IND_LIST = [
-              ('SMA',   'Simple MA',       {'period':50}),
-              ('EMA',   'Exponential MA',  {'period':20}),
-              ('WMA',   'Weighted MA',     {'period':20}),
-              ('SMMA',  'Smoothed MA',     {'period':20}),
-              ('TMA',   'Triangular MA',   {'period':20}),
-              ('RSI',   'RSI',             {'period':14, 'show': True}),
-              ('STOCH', 'Stochastic',      {'k':14,'d':3,'show': True}),
-              ('ATR',   'ATR',             {'period':14, 'show': False}),
-              ('ADX',   'ADX/+DI/-DI',     {'period':14, 'show': False})
-            ] %}
-            {% for key, title, defaults in IND_LIST %}
+            {% for key, spec in specs.items() %}
               {% set cfg = (indicators or {}).get(key, {}) %}
               <div class="card" style="padding:12px">
                 <div class="row" style="align-items:center">
-                  <div style="flex:0 0 auto">
+                  <div style="flex:0">
                     <input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if cfg.get('enabled') else '' }}>
                   </div>
-                  <div style="flex:1 1 auto">
-                    <b>{{ title }}</b>
-                    <div class="small legend muted">
-                      {% if key in ['RSI','STOCH','ATR','ADX'] %}oscillator{% else %}overlay{% endif %}
-                    </div>
+                  <div style="flex:1; min-width: 120px">
+                    <b>{{ spec.name or spec.label or key }}</b>
+                    <div class="small legend muted">{{ spec.kind if spec.kind else '' }}</div>
                   </div>
                 </div>
-
-                <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:8px">
-                  {% if key in ['RSI'] %}
-                    <div>
-                      <label class="small">period</label>
-                      <input type="text" name="ind_RSI_period" value="{{ cfg.get('period', defaults['period']) }}">
-                    </div>
-                    <div>
-                      <label class="small">show</label>
-                      <select name="ind_RSI_show">
-                        <option value="True" {{ 'selected' if (cfg.get('show', True)) else '' }}>True</option>
-                        <option value="False" {{ 'selected' if not (cfg.get('show', True)) else '' }}>False</option>
-                      </select>
-                    </div>
-                  {% elif key in ['STOCH'] %}
-                    <div>
-                      <label class="small">k</label>
-                      <input type="text" name="ind_STOCH_k" value="{{ cfg.get('k', defaults['k']) }}">
-                    </div>
-                    <div>
-                      <label class="small">d</label>
-                      <input type="text" name="ind_STOCH_d" value="{{ cfg.get('d', defaults['d']) }}">
-                    </div>
-                    <div>
-                      <label class="small">show</label>
-                      <select name="ind_STOCH_show">
-                        <option value="True" {{ 'selected' if (cfg.get('show', True)) else '' }}>True</option>
-                        <option value="False" {{ 'selected' if not (cfg.get('show', True)) else '' }}>False</option>
-                      </select>
-                    </div>
-                  {% elif key in ['ATR','ADX'] %}
-                    <div>
-                      <label class="small">period</label>
-                      <input type="text" name="ind_{{key}}_period" value="{{ cfg.get('period', defaults['period']) }}">
-                    </div>
-                    <div>
-                      <label class="small">show</label>
-                      <select name="ind_{{key}}_show">
-                        <option value="True" {{ 'selected' if (cfg.get('show', defaults['show'])) else '' }}>True</option>
-                        <option value="False" {{ 'selected' if not (cfg.get('show', defaults['show'])) else '' }}>False</option>
-                      </select>
-                    </div>
-                  {% else %}
-                    <div>
-                      <label class="small">period</label>
-                      <input type="text" name="ind_{{key}}_period" value="{{ cfg.get('period', defaults['period']) }}">
-                    </div>
-                    <div class="muted small" style="align-self:end">overlay</div>
-                  {% endif %}
-                </div>
+                {% if spec.params %}
+                  <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:8px">
+                    {% for p_name, p_def in spec.params.items() %}
+                      {% set val = cfg.get(p_name, p_def) %}
+                      <div>
+                        <label class="small">{{ p_name }}</label>
+                        <input type="text" name="ind_{{key}}_{{p_name}}" value="{{ val }}">
+                      </div>
+                    {% endfor %}
+                  </div>
+                {% endif %}
               </div>
             {% endfor %}
           </div>
           <div style="margin-top:10px">
             <button class="btn btn-acc" type="submit">Save Indicators</button>
           </div>
-          <p class="note" style="margin-top:6px">
-            <b>RSI</b> and <b>Stochastic</b> render on <u>separate panels</u> in screenshots. MAs are overlays on price.
-          </p>
+          <p class="note" style="margin-top:6px">Only <u>enabled</u> indicators render on screenshots and are respected by strategies/custom rules.</p>
         </form>
       </div>
 
@@ -301,7 +244,7 @@
           <div class="list">
             {% for name, entry in strategies_all.items() %}
               <label class="item small">
-                <input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled') or entry.get('enabled')) else '' }}>
+                <input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled')) else '' }}>
                 {{ name }}
               </label>
             {% endfor %}
@@ -312,7 +255,7 @@
               <label>Backtest TF</label>
               <select name="bt_tf">
                 {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                  <option value="{{t}}" {{ 'selected' if t==(bt.tf if bt else live_tf) else '' }}>{{t}}</option>
+                  <option value="{{t}}" {{ 'selected' if (bt.tf if bt else live_tf)==t else '' }}>{{t}}</option>
                 {% endfor %}
               </select>
             </div>
@@ -345,107 +288,6 @@
             <button class="btn btn-acc" type="submit">Save Strategy Toggles & Defaults</button>
           </div>
         </form>
-
-        <!-- Custom slots -->
-        <hr>
-        <div class="grid g-3">
-          {% for c in customs %}
-          <div class="card" style="padding:12px">
-            <h3 style="margin-bottom:8px">CUSTOM {{ c._idx }}</h3>
-            <form method="post" action="{{ url_for('dashboard.update_custom') }}">
-              <input type="hidden" name="slot" value="{{ c._idx }}">
-              <label class="small"><input type="checkbox" name="enabled" {{ 'checked' if c.get('enabled') else '' }}> Enabled</label>
-              <div class="row">
-                <div>
-                  <label>Mode</label>
-                  <select name="mode">
-                    <option value="SIMPLE" {{ 'selected' if (c.get('mode','SIMPLE')=='SIMPLE') else '' }}>SIMPLE</option>
-                    <option value="JSON" {{ 'selected' if (c.get('mode')=='JSON') else '' }}>JSON</option>
-                  </select>
-                </div>
-                <div>
-                  <label>Lookback</label>
-                  <input type="number" name="lookback" value="{{ c.get('lookback',3) }}">
-                </div>
-                <div>
-                  <label>Tolerance %</label>
-                  <input type="text" name="tol_pct" value="{{ c.get('tol_pct',0.1) }}">
-                </div>
-              </div>
-              <div class="row">
-                <div>
-                  <label>Simple BUY (text)</label>
-                  <textarea name="simple_buy" placeholder="e.g. RSI &lt; 30 AND StochK cross up">{{ c.get('simple_buy','') }}</textarea>
-                </div>
-                <div>
-                  <label>Simple SELL (text)</label>
-                  <textarea name="simple_sell" placeholder="e.g. RSI &gt; 70 AND StochK cross down">{{ c.get('simple_sell','') }}</textarea>
-                </div>
-              </div>
-              <div>
-                <label>JSON buy_rule</label>
-                <textarea name="buy_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":"<","v":30}]}'>{{ c.get('buy_rule')|tojson if c.get('buy_rule') else '' }}</textarea>
-              </div>
-              <div>
-                <label>JSON sell_rule</label>
-                <textarea name="sell_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":">","v":70}]}'>{{ c.get('sell_rule')|tojson if c.get('sell_rule') else '' }}</textarea>
-              </div>
-              <div style="margin-top:8px">
-                <button class="btn btn-acc" type="submit">Save CUSTOM {{ c._idx }}</button>
-              </div>
-            </form>
-          </div>
-          {% endfor %}
-        </div>
-      </div>
-
-      <!-- Users -->
-      <div class="card">
-        <h3>Users</h3>
-        <div class="grid g-2">
-          <div class="card">
-            <h3>Add / Update</h3>
-            <form method="post" action="{{ url_for('dashboard.users_add') }}">
-              <label>Telegram ID</label>
-              <input type="text" name="telegram_id" placeholder="123456789">
-              <div class="row">
-                <div>
-                  <label>Tier</label>
-                  <select name="tier">
-                    <option>free</option><option>basic</option><option>pro</option><option>vip</option>
-                  </select>
-                </div>
-                <div>
-                  <label>Expires at (YYYY-MM-DD)</label>
-                  <input type="date" name="expires_at">
-                </div>
-              </div>
-              <div style="margin-top:10px">
-                <button class="btn btn-acc" type="submit">Save User</button>
-              </div>
-            </form>
-          </div>
-          <div class="card">
-            <h3>Existing</h3>
-            {% if users and users|length %}
-              <div class="list">
-                {% for u in users %}
-                  <div class="item small" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                    <div><b>{{ u.telegram_id }}</b></div>
-                    <div>{{ u.tier|upper }}</div>
-                    {% if u.expires_at %}<div>exp: {{ u.expires_at }}</div>{% endif %}
-                    <form method="post" action="{{ url_for('dashboard.users_delete') }}" style="display:inline">
-                      <input type="hidden" name="telegram_id" value="{{ u.telegram_id }}">
-                      <button class="btn btn-err small" type="submit">Delete</button>
-                    </form>
-                  </div>
-                {% endfor %}
-              </div>
-            {% else %}
-              <div class="muted">No users yet.</div>
-            {% endif %}
-          </div>
-        </div>
       </div>
 
       <!-- Backtest + Screenshot -->
@@ -489,11 +331,11 @@
               <label>Upload CSV</label>
               <input type="file" name="bt_csv" accept=".csv">
             </div>
-            <div style="flex:0.8">
+            <div style="flex:0.6">
               <label class="small"><input type="checkbox" name="use_server"> Use Deriv server fetch</label>
               <div class="row">
                 <div>
-                  <label>Candles</label>
+                  <label>Target candles</label>
                   <input type="number" name="bt_count" value="300" min="100" max="5000">
                 </div>
               </div>
@@ -501,7 +343,7 @@
           </div>
           <div style="margin-top:10px">
             <button class="btn btn-acc" type="submit">Run Backtest & Show Screenshot</button>
-            <span class="note">Plot shows ONLY enabled indicators. RSI &amp; Stoch draw on separate panels with BUY/SELL markers.</span>
+            <span class="note">Plot shows ONLY enabled indicators + BUY/SELL markers + shaded expiry.</span>
           </div>
         </form>
 
@@ -517,7 +359,8 @@
               <p class="note" style="margin-top:6px">
                 Summary: {{ bt.summary }}{% if bt.warnings %} • <span class="warn">{{ bt.warnings|join('; ') }}</span>{% endif %}
               </p>
-              <p><a href="{{ url_for('dashboard.backtest_last_json') }}">Last JSON</a></p>
+              <p><a href="{{ url_for('dashboard.backtest_last_json') }}">Last JSON</a> •
+                 <a href="{{ url_for('dashboard.backtest_last_csv') }}">Last CSV</a></p>
             </div>
           </div>
           <img class="plot" src="{{ url_for('dashboard.plot_file', name=bt.plot_name) }}" alt="Backtest plot">
@@ -531,46 +374,14 @@
         <h3>Telegram</h3>
         <div class="row">
           <form method="post" action="{{ url_for('dashboard.telegram_test') }}">
-            <button class="btn btn-ok" type="submit">Send Test to All Tiers</button>
+            <button class="btn btn-ok" type="submit">Send Test</button>
           </form>
           <a class="btn" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Open Diagnostics (JSON)</a>
         </div>
-        <p class="note">Env required: <code>TELEGRAM_BOT_TOKEN</code>, and channel IDs:
-          <code>TELEGRAM_CHAT_ID_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code>.
-        </p>
+        <p class="note">Env needed: <code>TELEGRAM_BOT_TOKEN</code>, channels:
+          <code>TELEGRAM_CHAT_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code>.</p>
       </div>
 
-      <!-- Deriv fetch (optional helper) -->
-      <div class="card">
-        <h3>Deriv: Fetch CSV (optional)</h3>
-        <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
-          <div class="row">
-            <div>
-              <label>Symbols (space/comma)</label>
-              <input type="text" name="fetch_symbols" placeholder="frxEURUSD frxGBPUSD ...">
-              <label class="small"><input type="checkbox" name="convert_po_fetch"> Convert PO→Deriv</label>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label>TF</label>
-              <select name="fetch_tf">
-                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
-                  <option>{{ t }}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div>
-              <label>Candles</label>
-              <input type="number" name="fetch_count" value="300" min="100" max="5000">
-            </div>
-          </div>
-          <div style="margin-top:10px">
-            <button class="btn" type="submit">Fetch</button>
-          </div>
-          <p class="note">Creates CSVs under <code>static/fetch/</code> with most-recent candles.</p>
-        </form>
-      </div>
     </div>
 
     <!-- Right column -->
@@ -585,7 +396,7 @@
         </div>
         <hr>
         <div class="kvs" id="liveStats">
-          <div class="kv"><div class="k">Status</div><div class="v" id="lv">—</div></div>
+          <div class="kv"><div class="k">Status</div><div class="v" id="lv">...</div></div>
           <div class="kv"><div class="k">Free</div><div class="v" id="t_free">0</div></div>
           <div class="kv"><div class="k">Basic</div><div class="v" id="t_basic">0</div></div>
           <div class="kv"><div class="k">Pro</div><div class="v" id="t_pro">0</div></div>
@@ -597,10 +408,10 @@
       <div class="card">
         <h3>Quick Links</h3>
         <div class="list">
-          <a class="item" href="{{ url_for('dashboard.up_check') }}" target="_blank">/_up</a>
           <a class="item" href="{{ url_for('dashboard.live_status') }}" target="_blank">/live/status</a>
           <a class="item" href="{{ url_for('dashboard.live_tally') }}" target="_blank">/live/tally</a>
           <a class="item" href="{{ url_for('dashboard.backtest_last_json') }}" target="_blank">/backtest/last.json</a>
+          <a class="item" href="{{ url_for('dashboard.backtest_last_csv') }}" target="_blank">/backtest/last.csv</a>
           <a class="item" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">/telegram/diag</a>
         </div>
       </div>
@@ -623,7 +434,7 @@ async function refreshLive(){
     const s = await fetch('/live/status').then(r=>r.json());
     const t = await fetch('/live/tally').then(r=>r.json());
     const lv = document.getElementById('lv');
-    if (lv) lv.textContent = (s && s.status) ? (s.status.state || (s.status.running ? 'RUNNING' : 'STOPPED')) : '—';
+    if (lv) lv.textContent = (s && s.status) ? (s.status.running ? 'RUNNING' : 'STOPPED') : '—';
     if (t && t.tally){
       const z=t.tally;
       setVal('t_free', z.free || 0);
