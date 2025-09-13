@@ -109,6 +109,10 @@ def tg_test() -> Tuple[bool, str]:
     ok_any = any(v.get("ok") for v in results.values())
     return ok_any, json.dumps(results)
 
+# Backwards-compat shim for older app.py imports
+def tg_test_all() -> Tuple[bool, str]:
+    return tg_test()
+
 # ===================== Live Engine ===========================================
 
 class LiveEngine:
@@ -161,7 +165,6 @@ class LiveEngine:
     def tally(self) -> Dict[str, Any]:
         self._maybe_reset_tallies()
         with self._lock:
-            # deep copy
             return json.loads(json.dumps(self._tally))
 
     def status(self) -> Dict[str, Any]:
@@ -219,7 +222,6 @@ class LiveEngine:
             self._last_send = {"ok": False, "info": msg}
             return False, msg
 
-        # Optional: prepend debug prefix
         text_to_send = text
         if self.debug:
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -234,10 +236,6 @@ class LiveEngine:
 
     # ---------- Loop ----------
     def _loop(self) -> None:
-        """
-        Very light loop: You can wire strategy logic here later.
-        Currently just idles and resets tallies each day, optionally logs a heartbeat.
-        """
         while True:
             with self._lock:
                 running = self._running
@@ -253,5 +251,5 @@ class LiveEngine:
                 self._last_error = f"{type(e).__name__}: {e}"
                 time.sleep(max(1, self._sleep_seconds))
 
-# Singleton exported for routes
+# Singleton exported for routes/app
 ENGINE = LiveEngine()
