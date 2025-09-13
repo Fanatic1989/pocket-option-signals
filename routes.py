@@ -6,12 +6,14 @@ import os
 import io
 import json
 import time
+import math
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
+import pandas as pd
 from flask import (
     Blueprint, render_template, request, redirect, url_for, flash, session,
-    send_from_directory, jsonify, current_app
+    send_from_directory, jsonify
 )
 
 # ---- Local modules -----------------------------------------------------------
@@ -86,9 +88,7 @@ def view():
 def _ctx_base(cfg: Optional[dict] = None) -> dict:
     cfg = cfg or get_config() or {}
 
-    # Indicator specs: if you keep specs elsewhere you can inject here
     specs = cfg.get("indicator_specs") or {
-        # Minimal defaults; template iterates this structure
         "SMA":   {"name":"Simple MA",      "kind":"overlay",   "params":{"period":50}},
         "EMA":   {"name":"Exponential MA", "kind":"overlay",   "params":{"period":20}},
         "WMA":   {"name":"Weighted MA",    "kind":"overlay",   "params":{"period":20}},
@@ -100,9 +100,8 @@ def _ctx_base(cfg: Optional[dict] = None) -> dict:
         "ADX":   {"name":"ADX/+DI/-DI",    "kind":"oscillator","params":{"period":14, "show": False}},
     }
 
-    strategies_saved = cfg.get("strategies", {})  # SOURCE OF TRUTH
+    strategies_saved = cfg.get("strategies", {})
     strategies_all = {
-        # Catalog only (labels); no defaults that flip boxes on
         "BASE":    {"label":"BASE"},
         "TREND":   {"label":"TREND"},
         "CHOP":    {"label":"CHOP"},
@@ -175,23 +174,16 @@ def update_window():
 @admin_required
 def update_symbols():
     cfg = get_config() or {}
-    active = set(cfg.get("active_symbols", []))
-    raw = set(cfg.get("symbols_raw", []))
-
     deriv_multi = request.form.getlist("symbols_deriv_multi")
     po_multi = request.form.getlist("symbols_po_multi")
     text = (request.form.get("symbols_text") or "").replace(",", " ").split()
     convert = bool(request.form.get("convert_po"))
 
-    chosen = list(set(deriv_multi + po_multi + text))
-    raw = chosen[:]  # keep what user typed/selected for display
-
-    # Normalize to Deriv symbols if requested
-    if convert:
-        chosen = convert_po_to_deriv(chosen)
+    chosen_raw = list(set(deriv_multi + po_multi + text))
+    chosen = convert_po_to_deriv(chosen_raw) if convert else chosen_raw[:]
 
     cfg["active_symbols"] = chosen
-    cfg["symbols_raw"] = raw
+    cfg["symbols_raw"] = chosen_raw
     set_config(cfg)
     flash(f"Saved {len(chosen)} symbol(s).", "ok")
     return redirect(url_for("dashboard.view"))
@@ -201,9 +193,8 @@ def update_symbols():
 @admin_required
 def update_indicators():
     cfg = get_config() or {}
-    specs = cfg.get("indicator_specs") or {}   # leave existing descriptions
+    specs = cfg.get("indicator_specs") or {}
 
-    # Derive enabled + params from form
     result: Dict[str, dict] = {}
     def upd(key: str, params: List[str]):
         enabled = bool(request.form.get(f"ind_{key}_enabled"))
@@ -212,7 +203,6 @@ def update_indicators():
             form_key = f"ind_{key}_{p}"
             if form_key in request.form:
                 val = request.form.get(form_key)
-                # cast numerics when possible
                 try:
                     if val is None: pass
                     elif val.strip() == "": pass
@@ -223,12 +213,9 @@ def update_indicators():
                 entry[p] = val
         result[key] = entry
 
-    # Accept keys known in specs or from a default list
     keys = list((specs or {}).keys()) or ["SMA","EMA","WMA","SMMA","TMA","RSI","STOCH","ATR","ADX"]
     for k in keys:
-        # collect param names if present in specs
         params = list(((specs.get(k) or {}).get("params") or {}).keys())
-        # if specs absent, fall back to common fields
         if not params:
             if k == "RSI": params = ["period","show"]
             elif k == "STOCH": params = ["k","d","show"]
@@ -241,7 +228,7 @@ def update_indicators():
     flash("Indicators saved.", "ok")
     return redirect(url_for("dashboard.view"))
 
-# ---------- strategies (FIX: no default re-enable) ---------------------------
+# ---------- strategies --------------------------------------------------------
 @bp.post("/strategies/save")
 @admin_required
 def update_strategies():
@@ -253,10 +240,9 @@ def update_strategies():
         new_state[n] = {"enabled": bool(request.form.get(f"s_{n}"))}
     cfg["strategies"] = new_state
 
-    # Also allow defaults on this form
-    if "bt_tf" in request.form:     cfg["bt_tf"] = (request.form.get("bt_tf") or cfg.get("bt_tf","M1")).upper()
-    if "bt_expiry" in request.form: cfg["bt_expiry"] = (request.form.get("bt_expiry") or cfg.get("bt_expiry","5m")).lower()
-    if "live_tf" in request.form:   cfg["live_tf"] = (request.form.get("live_tf") or cfg.get("live_tf","M1")).upper()
+    if "bt_tf" in request.form:       cfg["bt_tf"] = (request.form.get("bt_tf") or cfg.get("bt_tf","M1")).upper()
+    if "bt_expiry" in request.form:   cfg["bt_expiry"] = (request.form.get("bt_expiry") or cfg.get("bt_expiry","5m")).lower()
+    if "live_tf" in request.form:     cfg["live_tf"] = (request.form.get("live_tf") or cfg.get("live_tf","M1")).upper()
     if "live_expiry" in request.form: cfg["live_expiry"] = (request.form.get("live_expiry") or cfg.get("live_expiry","5m")).lower()
 
     set_config(cfg)
@@ -321,7 +307,6 @@ def users_add():
         flash("Telegram ID required", "error")
         return redirect(url_for("dashboard.view"))
 
-    # upsert
     found = None
     for u in users:
         if str(u.get("telegram_id")) == str(tid):
@@ -364,10 +349,8 @@ def backtest():
     else:
         syms = syms_raw[:]
 
-    # Only the first symbol is plotted per-run (simple dashboard UX)
     sym = syms[0] if syms else "frxEURUSD"
 
-    # Map TF -> seconds
     tf_map = {
         "M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,
         "H1":3600,"H4":14400,"D1":86400
@@ -375,25 +358,21 @@ def backtest():
     gran = tf_map.get(tf, 60)
 
     try:
-        # Load data
         df = None
         file = request.files.get("bt_csv")
         if file and file.filename:
-            # CSV upload
             df = load_csv(io.BytesIO(file.read()))
         elif use_server:
-            df = fetch_deriv_history(sym, granularity_sec=gran, days=5)
+            # Approximate day span to cover requested candle count
+            approx_days = max(1, math.ceil((count * gran) / 86400) + 1)
+            df = fetch_deriv_history(sym, granularity_sec=gran, days=approx_days)
         else:
             raise RuntimeError("No data source selected. Upload CSV or tick 'Use Deriv server fetch'.")
 
-        # Indicators config
         indicators = cfg.get("indicators", {})
-        # Backtest engine
         signals, stats = backtest_run(df, strategy, indicators, expiry)
 
-        # Plot
         plot_name = plot_signals(df, signals, indicators, strategy, tf, expiry)
-
         summary = f"W:{stats['wins']} L:{stats['loss']} D:{stats['draw']} | Win%={stats['win_rate']:.1f}%"
         result = {
             "tf": tf, "expiry": expiry, "strategy": strategy,
@@ -420,8 +399,67 @@ def backtest_last_json():
 
 @bp.get("/backtest/last.csv")
 def backtest_last_csv():
-    # stub: you can persist the last df if you want
     return jsonify({"ok": False, "error": "Not implemented"})
+
+# ---------- Deriv: Fetch CSV (wired to dashboard.html form) ------------------
+@bp.post("/deriv/fetch")
+@admin_required
+def deriv_fetch():
+    """
+    Fetch candles from Deriv for given symbols & TF and save CSVs under static/fetch/.
+    This satisfies the dashboard's 'Deriv: Fetch CSV (optional)' form.
+    """
+    symbols_text = (request.form.get("fetch_symbols") or "").replace(",", " ").split()
+    convert = bool(request.form.get("convert_po_fetch"))
+    tf = (request.form.get("fetch_tf") or "M1").upper()
+    count = int(request.form.get("fetch_count") or 300)
+
+    if not symbols_text:
+        flash("Enter at least one symbol.", "error")
+        return redirect(url_for("dashboard.view"))
+
+    symbols = convert_po_to_deriv(symbols_text) if convert else symbols_text[:]
+
+    tf_map = {
+        "M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,
+        "H1":3600,"H4":14400,"D1":86400
+    }
+    gran = tf_map.get(tf, 60)
+    days = max(1, math.ceil((count * gran) / 86400) + 1)
+
+    out_dir = os.path.join("static", "fetch")
+    os.makedirs(out_dir, exist_ok=True)
+
+    made = []
+    errors = []
+    for sym in symbols:
+        try:
+            df = fetch_deriv_history(sym, granularity_sec=gran, days=days)
+            if df.empty:
+                errors.append(f"{sym}: empty data")
+                continue
+            # Trim to requested count (most recent rows)
+            if len(df) > count:
+                df = df.iloc[-count:]
+            # Write CSV
+            fn = f"{sym}_{tf}_{len(df)}.csv"
+            path = os.path.join(out_dir, fn)
+            df_out = df.reset_index().rename(columns={"time": "timestamp"})
+            df_out.to_csv(path, index=False)
+            made.append(fn)
+        except Exception as e:
+            errors.append(f"{sym}: {e}")
+
+    if made:
+        links = " • ".join([f"<a href='{url_for('dashboard.fetch_file', name=f)}' target='_blank'>{f}</a>" for f in made])
+        flash(f"Fetched {len(made)} file(s): {links}", "ok")
+    if errors:
+        flash("Errors: " + "; ".join(errors), "error")
+    return redirect(url_for("dashboard.view"))
+
+@bp.get("/fetch/<name>")
+def fetch_file(name: str):
+    return send_from_directory(os.path.join("static","fetch"), name, as_attachment=True)
 
 # ---------- Live engine (UI uses /live/*) ------------------------------------
 @bp.get("/live/status")
@@ -463,7 +501,7 @@ def live_debug_off():
     ENGINE.debug = False
     return jsonify({"ok": True, "debug": False})
 
-# ---------- API used by alternative front-end (kept for compatibility) -------
+# ---------- API (compat with alt front-end) ----------------------------------
 @bp.get("/api/status")
 def api_status():
     t = ENGINE.tally()
@@ -507,8 +545,7 @@ def api_send():
 
 @bp.get("/api/check_bot")
 def api_check_bot():
-    # Minimal getMe/diag
-    info = {"ok": bool(BOT_TOKEN), "configured_chats": {k: bool(v) for k,v in TIER_TO_CHAT.items()}}
+    info = {"ok": bool(BOT_TOKEN), "configured_chats": {k: bool(v) for k, v in TIER_TO_CHAT.items()}}
     return jsonify(info)
 
 @bp.post("/api/test/vip")
@@ -522,7 +559,7 @@ def api_test_vip():
 @bp.post("/telegram/test")
 @admin_required
 def telegram_test():
-    ok, info_json = tg_test()   # sends a short message to each configured tier respecting their chat ids
+    ok, info_json = tg_test()
     flash(f"Telegram test: {info_json}", "ok" if ok else "error")
     return redirect(url_for("dashboard.view"))
 
