@@ -1,14 +1,8 @@
-# utils.py — config store, TZ, sqlite, Deriv fetch (REST + WebSocket fallback),
-# symbols, backtest helpers, plotting (separate RSI & Stochastic panels)
-import os, json, sqlite3
-from datetime import datetime, time as dtime, timezone
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+# utils.py — config store, TZ, sqlite, Deriv fetch, symbols, indicator toolkit, backtest & plotting
+import os, json, sqlite3, math
+from datetime import datetime, time as dtime, timedelta, timezone
 
-# -----------------------------------------------------------------------------
-# Timezone
-# -----------------------------------------------------------------------------
+# --------------------------- Timezone ----------------------------------------
 TIMEZONE = os.getenv("APP_TZ", "America/Port_of_Spain")
 try:
     import pytz
@@ -17,21 +11,17 @@ except Exception:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo(TIMEZONE)
 
-# -----------------------------------------------------------------------------
-# Optional mplfinance
-# -----------------------------------------------------------------------------
-try:
-    import mplfinance as mpf
-    HAVE_MPLFIN = True
-except Exception:
-    HAVE_MPLFIN = False
+# --------------------------- Std libs ----------------------------------------
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-# -----------------------------------------------------------------------------
-# App / DB
-# -----------------------------------------------------------------------------
 DB_PATH = os.getenv("SQLITE_PATH", "members.db")
-DERIV_APP_ID = os.getenv("DERIV_APP_ID", "99185")
 
+# ============================== SQLite =======================================
 def exec_sql(sql, params=(), fetch=False):
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     try:
@@ -53,62 +43,23 @@ def get_config() -> dict:
     except: return {}
 
 def set_config(cfg: dict):
-    exec_sql(
-        "INSERT INTO app_config(k,v) VALUES('config',?) "
-        "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
-        (json.dumps(cfg),)
-    )
+    exec_sql("INSERT INTO app_config(k,v) VALUES('config',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+             (json.dumps(cfg),))
 
-# -----------------------------------------------------------------------------
-# Safe coercion helpers
-# -----------------------------------------------------------------------------
-def safe_int(x, default=0):
-    if x is None: return int(default)
-    if isinstance(x, (int, np.integer)): return int(x)
-    if isinstance(x, (float, np.floating)): return int(x)
-    if isinstance(x, str):
-        try: return int(float(x.strip()))
-        except Exception: return int(default)
-    if isinstance(x, dict):
-        for k in ("sec","secs","seconds","granularity","value","v"):
-            if k in x: return safe_int(x[k], default)
-        for v in x.values():
-            try: return safe_int(v, default)
-            except Exception: pass
-        return int(default)
-    try: return int(x)
-    except Exception: return int(default)
-
-def safe_app_id(s):
-    if not s: return "99185"
-    if isinstance(s, (int, np.integer)): return str(int(s))
-    if isinstance(s, str):
-        digits = "".join(ch for ch in s if ch.isdigit())
-        return digits or "99185"
-    return "99185"
-
-DERIV_APP_ID = safe_app_id(DERIV_APP_ID)
-
-# -----------------------------------------------------------------------------
-# Trading window
-# -----------------------------------------------------------------------------
+# ============================== Trading window ===============================
 def within_window(cfg: dict) -> bool:
     w = cfg.get("window") or {}
     start = w.get("start") or cfg.get("window_start","08:00")
     end   = w.get("end")   or cfg.get("window_end","17:00")
-    now_tt = datetime.now(TZ).time()
-    def hhmm(v, fallback):
-        try:
-            h,m = [int(x) for x in (v or fallback).split(":")[:2]]
-            return h,m
-        except Exception:
-            return (8,0) if fallback=="08:00" else (17,0)
-    s_h,s_m = hhmm(start,"08:00"); e_h,e_m = hhmm(end,"17:00")
+    try:
+        now_tt = datetime.now(TZ).time()
+    except Exception:
+        now_tt = datetime.utcnow().time()
+    s_h,s_m = [int(x) for x in (start or "08:00").split(":")[:2]]
+    e_h,e_m = [int(x) for x in (end   or "17:00").split(":")[:2]]
     return dtime(s_h,s_m) <= now_tt <= dtime(e_h,e_m)
 
-# -----------------------------------------------------------------------------
-# Symbols & mapping
-# -----------------------------------------------------------------------------
+# ============================== Symbols mapping ==============================
 PO_PAIRS = [
   "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD",
   "EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"
@@ -124,13 +75,12 @@ def convert_po_to_deriv(symbols):
     out = []
     for s in symbols:
         s = (s or "").strip().upper()
-        if s.startswith(("FRX","frx")): out.append("frx"+s[-6:])
+        if s.startswith("FRX"): out.append(s if s.startswith("frx") else "frx"+s[3:])
+        elif s.startswith("frx"): out.append(s)
         else: out.append(PO2DERIV.get(s, s))
     return out
 
-# -----------------------------------------------------------------------------
-# CSV loader
-# -----------------------------------------------------------------------------
+# ============================== Data loading/fetch ============================
 def load_csv(csv_file) -> pd.DataFrame:
     df = pd.read_csv(csv_file)
     cols = {c.lower(): c for c in df.columns}
@@ -143,239 +93,371 @@ def load_csv(csv_file) -> pd.DataFrame:
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
     return df
 
-# -----------------------------------------------------------------------------
-# Deriv REST + WebSocket fallback (Deriv-only)
-# -----------------------------------------------------------------------------
-def _series_from_maybe_dict_col(col):
-    s = pd.Series(col)
-    if s.dtype == "O":
-        def pick(v):
-            if isinstance(v, (int, float, np.integer, np.floating, str)): return v
-            if isinstance(v, dict):
-                for k in ("epoch","time","t","open","o","high","h","low","l","close","c","value","v"):
-                    if k in v: return v[k]
-            return np.nan
-        return s.map(pick)
-    return s
-
-def _normalize_ohlc_frame(js: dict) -> pd.DataFrame:
-    rows = js.get("candles") or js.get("history") or js.get("prices") or js.get("data") or []
-    if not rows: raise RuntimeError("empty candles")
-    df = pd.DataFrame(rows)
-
-    epoch = None
-    for k in ("epoch","time","t"):
-        if k in df:
-            epoch = _series_from_maybe_dict_col(df[k]); break
-    if epoch is None and len(df.columns)==1 and df.shape[0] and isinstance(df.iloc[0,0], dict):
-        sub = pd.DataFrame(df.iloc[:,0].tolist())
-        for k in ("epoch","time","t"):
-            if k in sub:
-                epoch = _series_from_maybe_dict_col(sub[k]); df = sub; break
-    if epoch is None: raise RuntimeError("no epoch/time column")
-
-    def grab(name_list):
-        for n in name_list:
-            if n in df: return _series_from_maybe_dict_col(df[n])
-        return pd.Series(np.nan, index=df.index)
-
-    o = grab(["open","o"]); h = grab(["high","h"]); l = grab(["low","l"]); c = grab(["close","c"])
-    out = pd.DataFrame({
-        "time": pd.to_datetime(pd.to_numeric(epoch, errors="coerce"), unit="s", utc=True),
-        "Open": pd.to_numeric(o, errors="coerce"),
-        "High": pd.to_numeric(h, errors="coerce"),
-        "Low" : pd.to_numeric(l, errors="coerce"),
-        "Close": pd.to_numeric(c, errors="coerce")
-    }).dropna()
-    if out.empty: raise RuntimeError("parsed empty candles")
-    return out.set_index("time").sort_index()
-
-def _fetch_deriv_rest(symbol: str, granularity_sec, days, attempts_log: list) -> pd.DataFrame | None:
+def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: str|None=None):
+    """
+    Only Deriv endpoints (no Yahoo). Tries v4 -> v3 -> explore.
+    Returns pandas DataFrame or raises RuntimeError with info.
+    """
     import requests
-    sym = (symbol or "").strip()
-    if not sym.lower().startswith("frx"):
-        sym = PO2DERIV.get(sym.upper(), sym)
-    if not sym.lower().startswith("frx"):
-        return None
-    sym_lc = "frx" + sym[-6:].upper()
-    sym_uc = sym_lc.upper()
-    candidates = [sym_lc, sym_uc] if sym_lc != sym_uc else [sym_lc]
-
-    gran = safe_int(granularity_sec, 300)
-    allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
-    gran = min(allowed, key=lambda g: abs(g - gran))
-    d = safe_int(days, 5)
-    approx = min(2000, max(300, int(d * 86400 // gran)))
-
-    def try_request(url, params):
-        params = dict(params or {})
-        if DERIV_APP_ID: params["app_id"] = DERIV_APP_ID
-        r = requests.get(url, params=params, timeout=15)
-        attempts_log.append((url, r.status_code))
-        if not r.ok: return None
-        try:
-            return _normalize_ohlc_frame(r.json())
-        except Exception:
-            return None
-
-    for s in candidates:
-        for base in ("https://api.deriv.com/api/v4/price_history",
-                     "https://api.deriv.com/api/v3/price_history"):
-            df = try_request(base, {"symbol": s, "granularity": gran, "count": approx})
-            if df is not None and not df.empty: return df
-
-    for s in candidates:
-        df = try_request("https://api.deriv.com/api/explore/candles",
-                         {"symbol": s, "granularity": gran, "count": approx})
-        if df is not None and not df.empty: return df
-        end = int(datetime.now(timezone.utc).timestamp())
-        start = end - d*86400
-        df = try_request("https://api.deriv.com/api/explore/candles",
-                         {"symbol": s, "granularity": gran, "start": start, "end": end})
-        if df is not None and not df.empty: return df
-    return None
-
-def _fetch_deriv_ws(symbol: str, granularity_sec, days, attempts_log: list) -> pd.DataFrame | None:
-    try:
-        from websocket import create_connection
-    except Exception as e:
-        attempts_log.append(("websocket-client-missing", str(e)))
-        return None
-
-    sym = (symbol or "").strip()
-    if not sym.lower().startswith("frx"):
-        sym = PO2DERIV.get(sym.upper(), sym)
-    if not sym.lower().startswith("frx"):
-        attempts_log.append(("ws_symbol_invalid", symbol))
-        return None
-    sym = ("FRX" + sym[-6:].upper())
-
-    gran = safe_int(granularity_sec, 300)
-    allowed = [60, 120, 180, 300, 600, 900, 1800, 3600, 14400, 86400]
-    gran = min(allowed, key=lambda g: abs(g - gran))
-    d = safe_int(days, 5)
-    count = min(2000, max(300, int(d * 86400 // gran)))
-
-    appid = safe_app_id(DERIV_APP_ID)
-    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id={appid}"
-
-    req = {
-        "ticks_history": sym,
-        "adjust_start_time": 1,
-        "count": int(count),
-        "end": "latest",
-        "granularity": int(gran),
-        "style": "candles"
-    }
-
-    try:
-        ws = create_connection(ws_url, timeout=15)
-        ws.send(json.dumps(req))
-        raw = ws.recv()
-        ws.close()
-    except Exception as e:
-        attempts_log.append(("ws_connect_error", str(e)))
-        return None
-
-    try:
-        js = json.loads(raw)
-        if js.get("error"):
-            attempts_log.append(("ws_error", js["error"]))
-            return None
-        df = _normalize_ohlc_frame(js)
-        return df
-    except Exception as e:
-        attempts_log.append(("ws_parse_error", str(e)))
-        return None
-
-def fetch_deriv_history(symbol: str, granularity_sec, days=5) -> pd.DataFrame:
     attempts = []
-    df = _fetch_deriv_rest(symbol, granularity_sec, days, attempts)
-    if df is None or df.empty:
-        df = _fetch_deriv_ws(symbol, granularity_sec, days, attempts)
-    if df is None or df.empty:
-        raise RuntimeError(
-            f"Deriv fetch failed for symbol={symbol}, tf={safe_int(granularity_sec,300)}. "
-            f"Attempts: {attempts}. Tip: set DERIV_APP_ID and ensure pair exists (e.g. frxEURUSD). "
-            f"You can also uncheck 'Use Deriv server fetch' and upload a CSV."
-        )
-    return df
+    qs = {"ticks_history": symbol, "style": "candles", "granularity": granularity, "count": count}
+    if app_id:
+        qs["app_id"] = app_id
 
-# -----------------------------------------------------------------------------
-# Backtest helpers
-# -----------------------------------------------------------------------------
-EXPIRY_TO_BARS = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
+    for base in ("https://api.deriv.com/api/v4/price_history",
+                 "https://api.deriv.com/api/v3/price_history"):
+        try:
+            r = requests.get(base, params=qs, timeout=15)
+            attempts.append((base, r.status_code))
+            if r.ok and r.headers.get("content-type","").startswith("application/json"):
+                js = r.json()
+                candles = js.get("candles") or js.get("history")
+                if candles:
+                    d = pd.DataFrame(candles)
+                    # normalize
+                    epoch = d.get("epoch") if "epoch" in d else d.get("time")
+                    out = pd.DataFrame({
+                        "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
+                        "Open": pd.to_numeric(d.get("open"), errors="coerce"),
+                        "High": pd.to_numeric(d.get("high"), errors="coerce"),
+                        "Low" : pd.to_numeric(d.get("low"), errors="coerce"),
+                        "Close": pd.to_numeric(d.get("close"), errors="coerce"),
+                    }).dropna()
+                    if not out.empty:
+                        return out.set_index("time").sort_index()
+        except Exception:
+            attempts.append((base, "EXC"))
 
+    # Explore (undocumented) fallback
+    try:
+        url = "https://api.deriv.com/api/explore/candles"
+        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": count}, timeout=15)
+        attempts.append((url, r.status_code))
+        if r.ok:
+            js = r.json()
+            rows = js.get("candles") or js.get("history") or []
+            d = pd.DataFrame(rows)
+            epoch = d.get("epoch") if "epoch" in d else d.get("time")
+            out = pd.DataFrame({
+                "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
+                "Open": pd.to_numeric(d.get("open"), errors="coerce"),
+                "High": pd.to_numeric(d.get("high"), errors="coerce"),
+                "Low" : pd.to_numeric(d.get("low"), errors="coerce"),
+                "Close": pd.to_numeric(d.get("close"), errors="coerce"),
+            }).dropna()
+            if not out.empty:
+                return out.set_index("time").sort_index()
+    except Exception:
+        attempts.append(("explore/candles", "EXC"))
+
+    app = f" (DERIV_APP_ID={app_id})" if app_id else ""
+    raise RuntimeError(f"Deriv fetch failed for symbol={symbol}, granularity={granularity}. Attempts: {attempts}{app}")
+
+def fetch_deriv_history(symbol: str, granularity_sec: int, count: int=300) -> pd.DataFrame:
+    app_id = os.getenv("DERIV_APP_ID") or os.getenv("DERIV_APPID") or os.getenv("DERIV_APP")
+    return _deriv_price_history(symbol, granularity_sec, count=count, app_id=app_id)
+
+# ============================== Indicator helpers ============================
+def _sma(s: pd.Series, p: int): return s.rolling(p).mean()
+def _ema(s: pd.Series, p: int): return s.ewm(span=p, adjust=False).mean()
+def _wma(s: pd.Series, p: int):
+    w = np.arange(1, p+1)
+    return s.rolling(p).apply(lambda x: (x*w).sum()/w.sum(), raw=True)
+def _smma(s: pd.Series, p: int):
+    alpha = 1/float(p)
+    return s.ewm(alpha=alpha, adjust=False).mean()
+def _tma(s: pd.Series, p: int):
+    return s.rolling(p).mean().rolling(p).mean()
+
+def _true_range(df):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([(high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr
+
+def _rsi(close, period=14):
+    delta = close.diff()
+    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / down.replace(0, np.nan)
+    return (100 - (100/(1+rs))).fillna(method="bfill")
+
+def _stoch(df, k=14, d=3):
+    lowk = df["Low"].rolling(k).min()
+    highk = df["High"].rolling(k).max()
+    kline = (df["Close"] - lowk) / (highk - lowk).replace(0, np.nan) * 100.0
+    dline = kline.rolling(d).mean()
+    return kline, dline
+
+def _adx(df, period=14):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    upmove = high.diff()
+    downmove = -low.diff()
+    plus_dm = np.where((upmove > downmove) & (upmove > 0), upmove, 0.0)
+    minus_dm = np.where((downmove > upmove) & (downmove > 0), downmove, 0.0)
+    tr = _true_range(df)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=close.index).ewm(alpha=1/period, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=close.index).ewm(alpha=1/period, adjust=False).mean() / atr
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0)
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx, plus_di, minus_di
+
+def _atr(df, period=14):
+    tr = _true_range(df)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def _bb(close, period=20, mult=2.0):
+    ma = close.rolling(period).mean()
+    sd = close.rolling(period).std()
+    upper = ma + mult*sd
+    lower = ma - mult*sd
+    width = (upper - lower)
+    return ma, upper, lower, width
+
+def _cci(df, period=20):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    sma = tp.rolling(period).mean()
+    md = (tp - sma).abs().rolling(period).mean()
+    return (tp - sma) / (0.015*md).replace(0, np.nan)
+
+def _donchian(df, period=20):
+    up = df["High"].rolling(period).max()
+    dn = df["Low"].rolling(period).min()
+    mid = (up + dn) / 2
+    return up, dn, mid
+
+def _keltner(df, period=20, mult=2.0):
+    ema = _ema(df["Close"], period)
+    atr = _atr(df, period)
+    upper = ema + mult*atr
+    lower = ema - mult*atr
+    return ema, upper, lower
+
+def _envelopes(close, period=20, pct=2.0):
+    ma = close.rolling(period).mean()
+    up = ma * (1 + pct/100.0)
+    dn = ma * (1 - pct/100.0)
+    return ma, up, dn
+
+def _ichimoku(df):
+    high, low = df["High"], df["Low"]
+    conv = (high.rolling(9).max() + low.rolling(9).min()) / 2
+    base = (high.rolling(26).max() + low.rolling(26).min()) / 2
+    span_a = (conv + base)/2
+    span_b = (high.rolling(52).max() + low.rolling(52).min()) / 2
+    lag = df["Close"].shift(-26)
+    return conv, base, span_a.shift(26), span_b.shift(26), lag
+
+def _macd(close, fast=12, slow=26, signal=9):
+    macd = _ema(close, fast) - _ema(close, slow)
+    sig = _ema(macd, signal)
+    hist = macd - sig
+    return macd, sig, hist
+
+def _psar(df, af_step=0.02, af_max=0.2):
+    high, low = df["High"].values, df["Low"].values
+    length = len(df)
+    psar = np.zeros(length)
+    bull = True
+    af = af_step
+    ep = low[0]
+    psar[0] = low[0]
+    for i in range(1, length):
+        prev = i-1
+        psar[i] = psar[prev] + af*(ep - psar[prev])
+        if bull:
+            psar[i] = min(psar[i], low[prev], low[i])
+            if high[i] > ep:
+                ep = high[i]; af = min(af+af_step, af_max)
+            if low[i] < psar[i]:
+                bull = False; psar[i] = ep; ep = low[i]; af = af_step
+        else:
+            psar[i] = max(psar[i], high[prev], high[i])
+            if low[i] < ep:
+                ep = low[i]; af = min(af+af_step, af_max)
+            if high[i] > psar[i]:
+                bull = True; psar[i] = ep; ep = high[i]; af = af_step
+    return pd.Series(psar, index=df.index)
+
+def _momentum(close, period=10): return (close / close.shift(period) - 1) * 100
+def _roc(close, period=10): return (close - close.shift(period)) / close.shift(period) * 100
+def _willr(df, period=14):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    return -100 * (high.rolling(period).max() - close) / (high.rolling(period).max() - low.rolling(period).min()).replace(0,np.nan)
+
+def _supertrend(df, period=10, mult=3.0):
+    atr = _atr(df, period)
+    hl2 = (df["High"] + df["Low"]) / 2
+    upper = hl2 + mult*atr
+    lower = hl2 - mult*atr
+    st = pd.Series(index=df.index, dtype=float)
+    dir_up = True
+    for i in range(len(df)):
+        if i==0:
+            st.iloc[i] = upper.iloc[i]
+            dir_up = True
+            continue
+        if df["Close"].iloc[i] > st.iloc[i-1]:
+            dir_up = True
+        elif df["Close"].iloc[i] < st.iloc[i-1]:
+            dir_up = False
+        if dir_up:
+            st.iloc[i] = max(lower.iloc[i], st.iloc[i-1])
+        else:
+            st.iloc[i] = min(upper.iloc[i], st.iloc[i-1])
+    return st, upper, lower
+
+def _vortex(df, period=14):
+    tr = _true_range(df)
+    vm_pos = (df["High"] - df["Low"].shift(1)).abs()
+    vm_neg = (df["Low"] - df["High"].shift(1)).abs()
+    vip = vm_pos.rolling(period).sum() / tr.rolling(period).sum()
+    vin = vm_neg.rolling(period).sum() / tr.rolling(period).sum()
+    return vip, vin
+
+def _ao(df):
+    mp = (df["High"] + df["Low"]) / 2
+    return _sma(mp, 5) - _sma(mp, 34)
+
+def _ac(df):
+    ao = _ao(df)
+    return ao - _sma(ao, 5)
+
+def _bears_power(df, period=13): return df["Low"] - _ema(df["Close"], period)
+def _bulls_power(df, period=13): return df["High"] - _ema(df["Close"], period)
+
+def _demarker(df, period=14):
+    up = (df["High"].diff().clip(lower=0)).rolling(period).sum()
+    dn = (-df["Low"].diff().clip(upper=0)).rolling(period).sum()
+    dem = up / (up + dn).replace(0, np.nan)
+    return dem
+
+def _osma(close, fast=12, slow=26, signal=9):
+    macd, sig, _ = _macd(close, fast, slow, signal)
+    return macd - sig
+
+def _zigzag(close, pct=1.0):
+    """Very simple ZigZag with percentage threshold."""
+    zz = pd.Series(index=close.index, dtype=float)
+    if close.empty: return zz
+    last_pivot = close.iloc[0]; last_dir = 0; zz.iloc[0]=last_pivot
+    for i, p in enumerate(close):
+        chg = (p-last_pivot)/last_pivot*100 if last_pivot!=0 else 0
+        if last_dir>=0 and chg<=-pct:
+            last_dir=-1; last_pivot=p
+            zz.iloc[i]=p
+        elif last_dir<=0 and chg>=pct:
+            last_dir=1; last_pivot=p
+            zz.iloc[i]=p
+    return zz
+
+# ============================== Compute indicators ===========================
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
     out = {}
+    if df is None or df.empty: return out
     close = df["Close"]
 
-    def _to_period_list(v):
-        if v is None: return []
-        if isinstance(v, (int, float, np.integer, np.floating, str)):
-            try: return [int(float(str(v)))]
-            except Exception: return []
-        if isinstance(v, (list, tuple)):
-            outv = []
-            for x in v:
-                try: outv.append(int(float(str(x))))
-                except Exception: pass
-            return outv
-        if isinstance(v, dict):
-            outv = []
-            for x in v.values():
-                try: outv.append(int(float(str(x))))
-                except Exception: pass
-            return outv
-        try: return [int(v)]
-        except Exception: return []
+    # Overlays (MAs, bands, etc.)
+    if (cfg := ind_cfg.get("SMA", {})).get("enabled"):
+        p = int(cfg.get("period", 50)); out[f"SMA"] = _sma(close, p)
+    if (cfg := ind_cfg.get("EMA", {})).get("enabled"):
+        p = int(cfg.get("period", 20)); out[f"EMA"] = _ema(close, p)
+    if (cfg := ind_cfg.get("WMA", {})).get("enabled"):
+        p = int(cfg.get("period", 20)); out[f"WMA"] = _wma(close, p)
+    if (cfg := ind_cfg.get("SMMA", {})).get("enabled"):
+        p = int(cfg.get("period", 20)); out[f"SMMA"] = _smma(close, p)
+    if (cfg := ind_cfg.get("TMA", {})).get("enabled"):
+        p = int(cfg.get("period", 20)); out[f"TMA"] = _tma(close, p)
 
-    # MAs (only draw what’s enabled)
-    if "SMA" in ind_cfg:
-        for p in _to_period_list(ind_cfg["SMA"]):
-            if p > 0:
-                out[f"SMA({p})"] = close.rolling(p).mean()
-    if "EMA" in ind_cfg:
-        for p in _to_period_list(ind_cfg["EMA"]):
-            if p > 0:
-                out[f"EMA({p})"] = close.ewm(span=p, adjust=False).mean()
-    if "WMA" in ind_cfg:
-        for p in _to_period_list(ind_cfg["WMA"]):
-            if p > 0:
-                w = np.arange(1, p + 1)
-                out[f"WMA({p})"] = close.rolling(p).apply(
-                    lambda x: (x * w).sum() / w.sum(), raw=True
-                )
-    if "SMMA" in ind_cfg:
-        for p in _to_period_list(ind_cfg["SMMA"]):
-            if p > 0:
-                out[f"SMMA({p})"] = close.ewm(alpha=1 / p, adjust=False).mean()
-    if "TMA" in ind_cfg:
-        for p in _to_period_list(ind_cfg["TMA"]):
-            if p > 0:
-                out[f"TMA({p})"] = close.rolling(p).mean().rolling(p).mean()
+    if (cfg := ind_cfg.get("BOLL", {})).get("enabled"):
+        p = int(cfg.get("period",20)); mult=float(cfg.get("mult",2))
+        ma, up, dn, width = _bb(close, p, mult)
+        out["BB_MA"]=ma; out["BB_UP"]=up; out["BB_DN"]=dn; out["BB_WIDTH"]=width
 
-    # Oscillators
-    if "RSI" in ind_cfg and isinstance(ind_cfg["RSI"], dict) and ind_cfg["RSI"].get("show", True):
-        pr_list = _to_period_list(ind_cfg["RSI"].get("period", 14)) or [14]
-        pr = max(1, pr_list[0])
-        delta = close.diff()
-        up = delta.clip(lower=0).ewm(alpha=1 / pr, adjust=False).mean()
-        down = (-delta.clip(upper=0)).ewm(alpha=1 / pr, adjust=False).mean()
-        rs = up / down.replace(0, np.nan)
-        out["RSI"] = (100 - (100 / (1 + rs))).fillna(method="bfill")
+    if (cfg := ind_cfg.get("KELTNER", {})).get("enabled"):
+        p=int(cfg.get("period",20)); mult=float(cfg.get("mult",2))
+        ma, up, dn = _keltner(df, p, mult)
+        out["KC_MA"]=ma; out["KC_UP"]=up; out["KC_DN"]=dn
 
-    if "STOCH" in ind_cfg and isinstance(ind_cfg["STOCH"], dict) and ind_cfg["STOCH"].get("show", True):
-        k_list = _to_period_list(ind_cfg["STOCH"].get("k", 14)) or [14]
-        d_list = _to_period_list(ind_cfg["STOCH"].get("d", 3)) or [3]
-        k = max(1, k_list[0]); d = max(1, d_list[0])
-        lowk = df["Low"].rolling(k).min(); highk = df["High"].rolling(k).max()
-        kline = (close - lowk) / (highk - lowk).replace(0, np.nan) * 100.0
-        dline = kline.rolling(d).mean()
-        out["STOCH_K"] = kline; out["STOCH_D"] = dline
+    if (cfg := ind_cfg.get("DONCHIAN", {})).get("enabled"):
+        p=int(cfg.get("period",20)); up,dn,mid=_donchian(df,p); out["DON_UP"]=up; out["DON_DN"]=dn; out["DON_MID"]=mid
+
+    if (cfg := ind_cfg.get("ENVELOPES", {})).get("enabled"):
+        p=int(cfg.get("period",20)); pct=float(cfg.get("pct",2))
+        ma, up, dn = _envelopes(close, p, pct)
+        out["ENV_MA"]=ma; out["ENV_UP"]=up; out["ENV_DN"]=dn
+
+    if (cfg := ind_cfg.get("ICHIMOKU", {})).get("enabled"):
+        conv, base, span_a, span_b, lag = _ichimoku(df)
+        out["ICH_CONV"]=conv; out["ICH_BASE"]=base; out["ICH_SA"]=span_a; out["ICH_SB"]=span_b; out["ICH_LAG"]=lag
+
+    if (cfg := ind_cfg.get("PSAR", {})).get("enabled"):
+        af=float(cfg.get("step",0.02)); afm=float(cfg.get("max",0.2))
+        out["PSAR"]=_psar(df, af_step=af, af_max=afm)
+
+    if (cfg := ind_cfg.get("SUPERTREND", {})).get("enabled"):
+        p=int(cfg.get("period",10)); mult=float(cfg.get("mult",3))
+        st, up, dn = _supertrend(df, p, mult)
+        out["ST"]=st; out["ST_UP"]=up; out["ST_DN"]=dn
+
+    # Oscillators (separate panels where appropriate)
+    if (cfg := ind_cfg.get("RSI", {})).get("enabled", cfg.get("show", True)):
+        p=int(cfg.get("period",14)); out["RSI"]=_rsi(close,p)
+
+    if (cfg := ind_cfg.get("STOCH", {})).get("enabled", cfg.get("show", True)):
+        k=int(cfg.get("k",14)); d=int(cfg.get("d",3))
+        kline,dline = _stoch(df,k,d); out["STOCH_K"]=kline; out["STOCH_D"]=dline
+
+    if (cfg := ind_cfg.get("ATR", {})).get("enabled", cfg.get("show", False)):
+        p=int(cfg.get("period",14)); out["ATR"]=_atr(df,p)
+
+    if (cfg := ind_cfg.get("ADX", {})).get("enabled", cfg.get("show", False)):
+        p=int(cfg.get("period",14)); adx, pdm, ndm = _adx(df,p); out["ADX"]=adx; out["+DI"]=pdm; out["-DI"]=ndm
+
+    if (cfg := ind_cfg.get("CCI", {})).get("enabled", False):
+        p=int(cfg.get("period",20)); out["CCI"]=_cci(df,p)
+
+    if (cfg := ind_cfg.get("MOMENTUM", {})).get("enabled", False):
+        p=int(cfg.get("period",10)); out["MOM"]=_momentum(close,p)
+
+    if (cfg := ind_cfg.get("ROC", {})).get("enabled", False):
+        p=int(cfg.get("period",10)); out["ROC"]=_roc(close,p)
+
+    if (cfg := ind_cfg.get("WILLR", {})).get("enabled", False):
+        p=int(cfg.get("period",14)); out["WILLR"]=_willr(df,p)
+
+    if (cfg := ind_cfg.get("VORTEX", {})).get("enabled", False):
+        p=int(cfg.get("period",14)); vip, vin = _vortex(df,p); out["VI+"]=vip; out["VI-"]=vin
+
+    if (cfg := ind_cfg.get("MACD", {})).get("enabled", False):
+        f=int(cfg.get("fast",12)); s=int(cfg.get("slow",26)); g=int(cfg.get("signal",9))
+        macd, sig, hist = _macd(close,f,s,g); out["MACD"]=macd; out["MACD_SIG"]=sig; out["MACD_HIST"]=hist
+
+    if (cfg := ind_cfg.get("AO", {})).get("enabled", False):
+        out["AO"]=_ao(df)
+    if (cfg := ind_cfg.get("AC", {})).get("enabled", False):
+        out["AC"]=_ac(df)
+
+    if (cfg := ind_cfg.get("BEARS", {})).get("enabled", False):
+        p=int(cfg.get("period",13)); out["BEARS"]=_bears_power(df,p)
+    if (cfg := ind_cfg.get("BULLS", {})).get("enabled", False):
+        p=int(cfg.get("period",13)); out["BULLS"]=_bulls_power(df,p)
+
+    if (cfg := ind_cfg.get("DEMARKER", {})).get("enabled", False):
+        p=int(cfg.get("period",14)); out["DEMARKER"]=_demarker(df,p)
+
+    if (cfg := ind_cfg.get("OSMA", {})).get("enabled", False):
+        out["OSMA"]=_osma(close)
+
+    if (cfg := ind_cfg.get("ZIGZAG", {})).get("enabled", False):
+        pct=float(cfg.get("pct",1.0)); out["ZZ"]=_zigzag(close,pct)
 
     return out
 
+# ============================== Simple strategy / signals ====================
 def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
     signals = []
     close = df["Close"]
@@ -386,34 +468,31 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         exp_pos = min(pos + max(1,bars), len(all_idx)-1)
         signals.append({"index": sig_idx, "direction": direction, "expiry_idx": all_idx[exp_pos]})
 
-    r = (rule_name or "").upper()
+    rule = (rule_name or "BASE").upper()
 
-    if r == "TREND":
-        sma50 = ind.get("SMA(50)")
-        if sma50 is None: return signals
-        above = close > sma50
-        cross_up = (above & (~above.shift(1).fillna(False)))
-        cross_dn = ((~above) & (above.shift(1).fillna(False)))
-        for ts, _ in cross_up[cross_up].items(): add(ts, "BUY", 5)
-        for ts, _ in cross_dn[cross_dn].items(): add(ts, "SELL", 5)
+    if rule == "TREND":
+        sma = ind.get("SMA") or _sma(close,50)
+        cross_up = (close.shift(1) <= sma.shift(1)) & (close > sma)
+        cross_dn = (close.shift(1) >= sma.shift(1)) & (close < sma)
+        for ts in close.index[cross_up.fillna(False)]: add(ts,"BUY",5)
+        for ts in close.index[cross_dn.fillna(False)]: add(ts,"SELL",5)
         return signals
 
-    if r == "CHOP":
-        rsi = ind.get("RSI")
-        if rsi is None: return signals
+    if rule == "CHOP":
+        rsi = ind.get("RSI") or _rsi(close,14)
         bounce_up = (rsi.shift(1) < 50) & (rsi >= 50)
         bounce_dn = (rsi.shift(1) > 50) & (rsi <= 50)
-        for ts in rsi.index[bounce_up.fillna(False)]: add(ts, "BUY", 3)
-        for ts in rsi.index[bounce_dn.fillna(False)]: add(ts, "SELL", 3)
+        for ts in rsi.index[bounce_up.fillna(False)]: add(ts,"BUY",3)
+        for ts in rsi.index[bounce_dn.fillna(False)]: add(ts,"SELL",3)
         return signals
 
-    # BASE / CUSTOM: stochastic cross
+    # BASE: Stochastic cross
     k = ind.get("STOCH_K"); d = ind.get("STOCH_D")
     if k is not None and d is not None:
         cross_up = (k.shift(1) < d.shift(1)) & (k >= d)
         cross_dn = (k.shift(1) > d.shift(1)) & (k <= d)
-        for ts in k.index[cross_up.fillna(False)]: add(ts, "BUY", 5)
-        for ts in k.index[cross_dn.fillna(False)]: add(ts, "SELL", 5)
+        for ts in k.index[cross_up.fillna(False)]: add(ts,"BUY",5)
+        for ts in k.index[cross_dn.fillna(False)]: add(ts,"SELL",5)
     return signals
 
 def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
@@ -435,231 +514,131 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
     return {"wins": wins, "loss": loss, "draw": draw, "total": wins+loss+draw,
             "win_rate": (wins*100.0/max(1,wins+loss))}
 
-# -----------------------------------------------------------------------------
-# Plotting — separate panels (RSI panel and Stochastic panel)
-# -----------------------------------------------------------------------------
-def _limit_df(df: pd.DataFrame, last_n: int = 180) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    if len(df) <= last_n: return df
-    return df.iloc[-last_n:].copy()
-
-def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
+# ============================== Plotting =====================================
+def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
     """
-    • last 180 candles
-    • BUY(▲)/SELL(▼) markers + shaded expiry
-    • MA overlays only for indicators enabled in config
-    • RSI and Stochastic each get their own panel if present
+    Clear, dark chart:
+      - Panel 1: Candles + overlays + markers
+      - Panel 2: RSI (if enabled)
+      - Panel 3: Stochastic (if enabled) + a few extra oscillators (MACD hist line, AO) to verify rules
     """
-    import matplotlib.dates as mdates
     os.makedirs("static/plots", exist_ok=True)
-
     if df is None or df.empty:
         out = "empty.png"
-        plt.figure(figsize=(8,2), dpi=160)
-        plt.text(0.5,0.5,"No data", ha="center")
-        plt.savefig(os.path.join("static","plots",out)); plt.close()
+        plt.figure(figsize=(10,2)); plt.text(0.5,0.5,"No data", ha="center"); plt.savefig("static/plots/"+out); plt.close()
         return out
 
-    df = _limit_df(df, 180)
-    ind = compute_indicators(df, indicators or {})
+    # Compute indicators with current config
+    ind = compute_indicators(df, indicators_cfg or {})
+    ts = df.index
 
-    out_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{strategy}_{tf}.png"
-    path = os.path.join("static","plots", out_name)
-
-    has_rsi = "RSI" in ind
-    has_sto = ("STOCH_K" in ind) and ("STOCH_D" in ind)
-
-    # ---------- mplfinance path ----------
-    if HAVE_MPLFIN:
-        addplots = []
-
-        # Overlays on price panel only for enabled MAs
-        for name, series in ind.items():
-            if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
-                addplots.append(mpf.make_addplot(series, panel=0, width=1.15, alpha=0.95))
-
-        # Decide panel indices
-        panels = [3]  # price panel ratio fixed later
-        panel_map = {}
-        panel_ratios = [4]  # price height
-
-        next_panel_idx = 1
-        if has_rsi:
-            panel_map["RSI"] = next_panel_idx
-            panel_ratios.append(1)   # RSI panel
-            next_panel_idx += 1
-        if has_sto:
-            panel_map["STOCH"] = next_panel_idx
-            panel_ratios.append(1)   # Stoch panel
-            next_panel_idx += 1
-
-        # Add RSI in its own panel
-        if has_rsi:
-            addplots.append(
-                mpf.make_addplot(ind["RSI"], panel=panel_map["RSI"],
-                                 ylim=(0,100), width=1.1, secondary_y=False, color="#60a5fa")
-            )
-
-        # Add Stochastic in its own panel
-        if has_sto:
-            pidx = panel_map["STOCH"]
-            addplots.append(mpf.make_addplot(ind["STOCH_K"], panel=pidx, width=1.0, color="#22c55e"))
-            addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=pidx, width=1.0, color="#f59e0b"))
-
-        style = mpf.make_mpf_style(
-            base_mpf_style="yahoo",
-            facecolor="#0b0f17",
-            gridstyle="-",
-            gridcolor="#192132",
-            marketcolors=mpf.make_marketcolors(up="#16a34a", down="#ef4444", wick="inherit", edge="inherit")
-        )
-
-        fig, axlist = mpf.plot(
-            df, type="candle", style=style, addplot=addplots, returnfig=True,
-            volume=False, figsize=(15, 8 + (2 if has_rsi else 0) + (2 if has_sto else 0)),
-            panel_ratios=tuple(panel_ratios) if len(panel_ratios) > 1 else None,
-            tight_layout=True, title=f"{strategy} • TF={tf} • Exp={expiry}"
-        )
-        ax_price = axlist[0]
-
-        # BUY/SELL markers + shaded expiry
-        if signals:
-            buy_x, buy_y, sell_x, sell_y = [], [], [], []
-            for s in signals:
-                idx = s["index"]
-                if idx not in df.index: continue
-                y = float(df.loc[idx,"Close"])
-                if s["direction"] == "BUY":
-                    buy_x.append(idx); buy_y.append(y)
-                else:
-                    sell_x.append(idx); sell_y.append(y)
-                ex = s.get("expiry_idx")
-                if ex in df.index:
-                    ax_price.axvspan(idx, ex, alpha=.15,
-                                     color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
-            if buy_x:
-                ax_price.scatter(buy_x, buy_y, marker="^", s=120, color="#22c55e",
-                                 edgecolors="white", linewidths=0.6, label="BUY")
-            if sell_x:
-                ax_price.scatter(sell_x, sell_y, marker="v", s=120, color="#ef4444",
-                                 edgecolors="white", linewidths=0.6, label="SELL")
-
-        ax_price.grid(True, alpha=.25)
-        ax_price.legend(loc="upper left", frameon=False)
-        fig.savefig(path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        return out_name
-
-    # ---------- Fallback matplotlib ----------
-    panels = 1 + int(has_rsi) + int(has_sto)
-    heights = [4] + ([1] if has_rsi else []) + ([1] if has_sto else [])
-    fig, axes = plt.subplots(
-        panels, 1, figsize=(15, 8 + (2 if has_rsi else 0) + (2 if has_sto else 0)),
-        dpi=200, sharex=True, gridspec_kw={"height_ratios": heights}
-    )
-    if panels == 1: axes = [axes]
+    # Figure layout
+    want_rsi = "RSI" in ind
+    want_sto = "STOCH_K" in ind and "STOCH_D" in ind
+    rows = 1 + (1 if want_rsi else 0) + (1 if want_sto else 0)
+    fig_h = 6 + (2 if want_rsi else 0) + (2 if want_sto else 0)
+    fig, axes = plt.subplots(rows, 1, figsize=(14, fig_h), sharex=True,
+                             gridspec_kw={"height_ratios":[4] + ([1] if want_rsi else []) + ([1] if want_sto else [])})
+    if rows == 1: axes = [axes]
     ax_price = axes[0]
+    ax_price.set_facecolor("#0b0f17")
+    fig.patch.set_facecolor("#0b0f17")
 
-    # candles
-    import matplotlib.dates as mdates
-    ts = mdates.date2num(df.index.to_pydatetime())
-    for t,(o,h,l,c) in enumerate(zip(df["Open"], df["High"], df["Low"], df["Close"])):
-        x = ts[t]
-        color = "#16a34a" if c>=o else "#ef4444"
-        ax_price.vlines(x, l, h, color=color, linewidth=1.0, alpha=.95)
-        ax_price.add_patch(plt.Rectangle((x-0.0022, min(o,c)), 0.0044, max(abs(c-o),1e-6),
-                                         facecolor=color, edgecolor=color, linewidth=.9, alpha=.95))
+    # --- Candles ---
+    dt = mdates.date2num(pd.to_datetime(ts).to_pydatetime())
+    for i,(t,o,h,l,c) in enumerate(zip(dt, df["Open"], df["High"], df["Low"], df["Close"])):
+        color = "#17c964" if c>=o else "#f44336"
+        ax_price.vlines(t, l, h, color=color, linewidth=0.8, alpha=.9, zorder=2)
+        ax_price.add_patch(plt.Rectangle((t-0.001, min(o,c)), 0.002, max(abs(c-o),1e-6),
+                                         facecolor=color, edgecolor=color, linewidth=.6, alpha=.95, zorder=3))
+    ax_price.set_ylabel("Price", color="#e8edf7")
 
-    # MA overlays only
-    for name, series in ind.items():
-        if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
-            ax_price.plot(series.index, series.values, linewidth=1.25, alpha=.95)
+    # --- Overlays ---
+    def plot_line(name, col):
+        if name in ind:
+            ax_price.plot(ts, ind[name], col, linewidth=1.2, alpha=.95, label=name)
+    overlay_colors = {
+        "SMA":"#ffd166", "EMA":"#60a5fa", "WMA":"#f59e0b", "SMMA":"#a78bfa","TMA":"#ef4444",
+        "BB_MA":"#9ca3af","BB_UP":"#374151","BB_DN":"#374151",
+        "KC_MA":"#94a3b8","KC_UP":"#475569","KC_DN":"#475569",
+        "DON_UP":"#4b5563","DON_DN":"#4b5563","DON_MID":"#64748b",
+        "ENV_MA":"#9ca3af","ENV_UP":"#52525b","ENV_DN":"#52525b",
+        "ICH_CONV":"#10b981","ICH_BASE":"#ef4444","ICH_SA":"#22d3ee","ICH_SB":"#fb7185",
+        "PSAR":"#f472b6","ST":"#22c55e"
+    }
+    for key, col in overlay_colors.items():
+        if key in ind:
+            ax_price.plot(ts, ind[key], color=col, linewidth=1.0, alpha=0.9, label=key)
 
-    # markers + expiry
+    # PSAR dots
+    if "PSAR" in ind:
+        ax_price.scatter(ts, ind["PSAR"], s=10, color="#f472b6", alpha=.8, zorder=5)
+
+    # --- BUY/SELL markers ---
     if signals:
+        buy_x=[]; buy_y=[]; sell_x=[]; sell_y=[]
         for s in signals:
-            idx = s["index"]
-            if idx in df.index:
-                y = float(df.loc[idx,"Close"])
-                ax_price.scatter([mdates.date2num(idx)], [y],
-                                 marker="^" if s["direction"]=="BUY" else "v",
-                                 s=140, color="#22c55e" if s["direction"]=="BUY" else "#ef4444",
-                                 edgecolors="white", linewidths=.6, zorder=5)
-                ex = s.get("expiry_idx")
-                if ex in df.index:
-                    ax_price.axvspan(mdates.date2num(idx), mdates.date2num(ex),
-                                     alpha=.15, color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
+            if s["index"] in df.index:
+                y = float(df.loc[s["index"],"Close"])
+                if s["direction"]=="BUY": buy_x.append(s["index"]); buy_y.append(y)
+                else: sell_x.append(s["index"]); sell_y.append(y)
+        if buy_x: ax_price.scatter(buy_x, buy_y, marker="^", s=60, color="#16a34a", label="BUY", zorder=6)
+        if sell_x: ax_price.scatter(sell_x, sell_y, marker="v", s=60, color="#ef4444", label="SELL", zorder=6)
+        ax_price.legend(loc="upper left", fontsize=9)
 
+    # --- RSI panel (dedicated) ---
     cur_row = 1
-    if has_rsi:
-        ax_rsi = axes[cur_row]; cur_row += 1
-        ax_rsi.plot(ind["RSI"].index, ind["RSI"].values, color="#60a5fa", linewidth=1.1)
-        ax_rsi.set_ylim(0,100); ax_rsi.grid(alpha=.25); ax_rsi.set_ylabel("RSI")
-        ax_rsi.axhline(50, color="#9aa4", linewidth=.8)
-    if has_sto:
-        ax_sto = axes[cur_row]
-        ax_sto.plot(ind["STOCH_K"].index, ind["STOCH_K"].values, color="#22c55e", linewidth=1.0, label="K")
-        ax_sto.plot(ind["STOCH_D"].index, ind["STOCH_D"].values, color="#f59e0b", linewidth=1.0, label="D")
-        ax_sto.set_ylim(0,100); ax_sto.grid(alpha=.25); ax_sto.set_ylabel("Stoch")
-        ax_sto.legend(loc="upper left", frameon=False)
+    if want_rsi:
+        ax_rsi = axes[cur_row]
+        ax_rsi.set_facecolor("#0b0f17")
+        ax_rsi.plot(ts, ind["RSI"], color="#60a5fa", linewidth=1.2, label="RSI")
+        ax_rsi.axhline(70, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_rsi.axhline(30, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_rsi.set_ylim(0,100); ax_rsi.set_yticks([0,30,50,70,100])
+        ax_rsi.legend(loc="upper left", fontsize=9)
+        cur_row += 1
 
-    ax_price.set_title(f"{strategy} • TF={tf} • Exp={expiry}")
-    ax_price.set_ylabel("Price"); ax_price.grid(alpha=.25)
-    fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(path, bbox_inches="tight")
+    # --- Stochastic panel (separate) + a few extra oscillators for verification
+    if want_sto:
+        ax_st = axes[cur_row]
+        ax_st.set_facecolor("#0b0f17")
+        ax_st.plot(ts, ind["STOCH_K"], color="#22c55e", linewidth=1.2, label="%K")
+        ax_st.plot(ts, ind["STOCH_D"], color="#f59e0b", linewidth=1.0, label="%D")
+        ax_st.axhline(80, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_st.axhline(20, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_st.set_ylim(0,100); ax_st.set_yticks([0,20,50,80,100])
+        # Add MACD hist line and AO lightly to verify rules (optional)
+        if "MACD_HIST" in ind:
+            ax_st.plot(ts, (ind["MACD_HIST"]*50)+50, color="#93c5fd", linewidth=.8, alpha=.6, label="MACDhist(n)")
+        if "AO" in ind:
+            ao_norm = (ind["AO"] - ind["AO"].rolling(50).min()) / (ind["AO"].rolling(50).max() - ind["AO"].rolling(50).min())
+            ax_st.plot(ts, (ao_norm*100).clip(0,100), color="#a78bfa", linewidth=.8, alpha=.6, label="AO(n)")
+        ax_st.legend(loc="upper left", fontsize=9)
+
+    # --- Cosmetics ---
+    ax_price.grid(color="#111827", linestyle="--", linewidth=0.5)
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    for ax in axes: 
+        ax.tick_params(colors="#cbd5e1")
+        for spine in ax.spines.values(): spine.set_color("#1f2937")
+
+    fig.suptitle(f"{strategy} • TF={tf} • Exp={expiry}", color="#e5e7eb", fontsize=14, fontweight="bold", y=0.98)
+    fig.autofmt_xdate()
+    fig.tight_layout(rect=[0,0,1,0.96])
+
+    out_name = f"{df.index[-1].strftime('%Y%m%d_%H%M%S')}_{strategy}_{tf}.png"
+    path = os.path.join("static","plots", out_name)
+    fig.savefig(path, dpi=140, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     return out_name
 
-# -----------------------------------------------------------------------------
-# Strategy requirements → always generate entries/exits
-# -----------------------------------------------------------------------------
-def ensure_strategy_requirements(ind_cfg: dict, strategy: str) -> dict:
-    cfg = {k: (v.copy() if isinstance(v, dict) else v) for k, v in (ind_cfg or {}).items()}
-    s = (strategy or "").upper()
+# ============================== Backtest =====================================
+EXPIRY_TO_BARS = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
 
-    if s in ("BASE", "CUSTOM1", "CUSTOM2", "CUSTOM3"):
-        st = cfg.get("STOCH")
-        if not isinstance(st, dict):
-            st = {"show": True, "k": 14, "d": 3}
-        else:
-            st.setdefault("show", True); st.setdefault("k", 14); st.setdefault("d", 3)
-        cfg["STOCH"] = st
-
-    if s == "TREND":
-        sma = cfg.get("SMA")
-        if sma is None:
-            cfg["SMA"] = [50]
-        elif isinstance(sma, (int, float, str)):
-            p = int(float(str(sma))); cfg["SMA"] = sorted({p, 50})
-        elif isinstance(sma, (list, tuple, set)):
-            cfg["SMA"] = sorted({int(float(str(x))) for x in sma} | {50})
-        elif isinstance(sma, dict):
-            vals = {50}
-            for v in sma.values():
-                try: vals.add(int(float(str(v))))
-                except: pass
-            cfg["SMA"] = sorted(vals)
-
-    if s == "CHOP":
-        rsi = cfg.get("RSI")
-        if not isinstance(rsi, dict):
-            rsi = {"show": True, "period": 14}
-        else:
-            rsi.setdefault("show", True); rsi.setdefault("period", 14)
-        cfg["RSI"] = rsi
-
-    return cfg
-
-# -----------------------------------------------------------------------------
-# Backtest run
-# -----------------------------------------------------------------------------
 def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str):
-    ind_cfg = ensure_strategy_requirements(indicators or {}, strategy)
-    ind = compute_indicators(df, ind_cfg)
-    signals = simple_rule_engine(df, ind, (strategy or "").upper())
-
-    bars_map = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
-    bars = bars_map.get((expiry or "5m").lower(), 5)
-
+    ind = compute_indicators(df, indicators or {})
+    signals = simple_rule_engine(df, ind, (strategy or "BASE").upper())
+    bars = EXPIRY_TO_BARS.get((expiry or "5m").lower(), 5)
     fixed = []
     for s in signals:
         i = s["index"]
@@ -667,6 +646,5 @@ def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str)
         exp_pos = min(pos + max(1,bars), len(df.index)-1)
         s["expiry_idx"] = df.index[exp_pos]
         fixed.append(s)
-
     stats = evaluate_signals_outcomes(df, fixed)
     return fixed, stats
