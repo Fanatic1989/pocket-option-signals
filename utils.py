@@ -1,6 +1,6 @@
-# utils.py — config store, TZ, sqlite, Deriv fetch, symbols, indicators, backtest & plotting
+# utils.py — config store, TZ, sqlite, Deriv fetch, symbols, indicator toolkit, backtest & plotting
 import os, json, sqlite3, math
-from datetime import datetime, date, time as dtime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 # --------------------------- Timezone ----------------------------------------
 TIMEZONE = os.getenv("APP_TZ", "America/Port_of_Spain")
@@ -47,36 +47,25 @@ def set_config(cfg: dict):
              (json.dumps(cfg),))
 
 # ============================== Trading window ===============================
-def _parse_hhmm(s: str, default: str) -> dtime:
-    try:
-        hh, mm = [int(x) for x in (s or default).split(":")[:2]]
-        return dtime(hh, mm)
-    except Exception:
-        return dtime(8, 0)
-
 def within_window(cfg: dict) -> bool:
     """
-    True if NOW is within configured window AND Mon-Fri.
-    Defaults: 08:00–17:00 in APP_TZ, weekdays only.
+    True only Mon–Fri AND between configured start/end (local TZ).
     """
     w = cfg.get("window") or {}
-    start = _parse_hhmm(w.get("start"), "08:00")
-    end   = _parse_hhmm(w.get("end"), "17:00")
-    mf_only = w.get("monday_friday_only", True)
-
+    start = w.get("start") or cfg.get("window_start","08:00")
+    end   = w.get("end")   or cfg.get("window_end","17:00")
     try:
-        now_local = datetime.now(TZ)
+        now_dt = datetime.now(TZ)
+        now_tt = now_dt.time()
     except Exception:
-        now_local = datetime.utcnow().replace(tzinfo=timezone.utc)
-    wd = now_local.weekday()  # 0=Mon, 6=Sun
-    if mf_only and wd >= 5:
+        now_dt = datetime.utcnow()
+        now_tt = now_dt.time()
+    # No weekends
+    if now_dt.weekday() >= 5:  # 5=Sat, 6=Sun
         return False
-    tt = now_local.time()
-    return (start <= tt <= end)
-
-def trading_open_now(cfg: dict) -> bool:
-    """Alias used by routes to gate sending."""
-    return within_window(cfg)
+    s_h,s_m = [int(x) for x in (start or "08:00").split(":")[:2]]
+    e_h,e_m = [int(x) for x in (end   or "17:00").split(":")[:2]]
+    return dtime(s_h,s_m) <= now_tt <= dtime(e_h,e_m)
 
 # ============================== Symbols mapping ==============================
 PO_PAIRS = [
@@ -93,14 +82,13 @@ DERIV2PO = {v:k for k,v in PO2DERIV.items()}
 def convert_po_to_deriv(symbols):
     out = []
     for s in symbols:
-        s = (s or "").strip()
-        if not s: continue
-        if s.startswith("frx"):
+        s = (s or "").strip().upper()
+        if s.startswith("FRX"):
+            out.append(s if s.startswith("frx") else "frx"+s[3:])
+        elif s.startswith("frx"):
             out.append(s)
-        elif s.upper().startswith("FRX"):
-            out.append("frx" + s[3:])
         else:
-            out.append(PO2DERIV.get(s.upper(), s))
+            out.append(PO2DERIV.get(s, s))
     return out
 
 # ============================== Data loading/fetch ============================
@@ -116,14 +104,14 @@ def load_csv(csv_file) -> pd.DataFrame:
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
     return df
 
-def _deriv_price_history(symbol: str, granularity: int, count: int=600, app_id: str|None=None):
+def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: str|None=None):
     """
     Only Deriv endpoints (no Yahoo). Tries v4 -> v3 -> explore.
     Returns pandas DataFrame or raises RuntimeError with info.
     """
     import requests
     attempts = []
-    qs = {"ticks_history": symbol, "style": "candles", "granularity": granularity, "count": int(count)}
+    qs = {"ticks_history": symbol, "style": "candles", "granularity": granularity, "count": count}
     if app_id:
         qs["app_id"] = app_id
 
@@ -137,6 +125,7 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=600, app_id: 
                 candles = js.get("candles") or js.get("history")
                 if candles:
                     d = pd.DataFrame(candles)
+                    # normalize
                     epoch = d.get("epoch") if "epoch" in d else d.get("time")
                     out = pd.DataFrame({
                         "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
@@ -150,10 +139,10 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=600, app_id: 
         except Exception:
             attempts.append((base, "EXC"))
 
-    # Explore fallback
+    # Explore (undocumented) fallback
     try:
         url = "https://api.deriv.com/api/explore/candles"
-        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": int(count)}, timeout=15)
+        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": count}, timeout=15)
         attempts.append((url, r.status_code))
         if r.ok:
             js = r.json()
@@ -175,9 +164,9 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=600, app_id: 
     app = f" (DERIV_APP_ID={app_id})" if app_id else ""
     raise RuntimeError(f"Deriv fetch failed for symbol={symbol}, granularity={granularity}. Attempts: {attempts}{app}")
 
-def fetch_deriv_history(symbol: str, granularity_sec: int, count: int=600) -> pd.DataFrame:
+def fetch_deriv_history(symbol: str, granularity_sec: int, count: int=300) -> pd.DataFrame:
     app_id = os.getenv("DERIV_APP_ID") or os.getenv("DERIV_APPID") or os.getenv("DERIV_APP")
-    return _deriv_price_history(symbol, int(granularity_sec), count=int(count), app_id=app_id)
+    return _deriv_price_history(symbol, granularity_sec, count=count, app_id=app_id)
 
 # ============================== Indicator helpers ============================
 def _sma(s: pd.Series, p: int): return s.rolling(p).mean()
@@ -362,16 +351,61 @@ def _osma(close, fast=12, slow=26, signal=9):
     return macd - sig
 
 def _zigzag(close, pct=1.0):
+    """Very simple ZigZag with percentage threshold."""
     zz = pd.Series(index=close.index, dtype=float)
     if close.empty: return zz
     last_pivot = close.iloc[0]; last_dir = 0; zz.iloc[0]=last_pivot
     for i, p in enumerate(close):
         chg = (p-last_pivot)/last_pivot*100 if last_pivot!=0 else 0
         if last_dir>=0 and chg<=-pct:
-            last_dir=-1; last_pivot=p; zz.iloc[i]=p
+            last_dir=-1; last_pivot=p
+            zz.iloc[i]=p
         elif last_dir<=0 and chg>=pct:
-            last_dir=1; last_pivot=p; zz.iloc[i]=p
+            last_dir=1; last_pivot=p
+            zz.iloc[i]=p
     return zz
+
+# ---------- NEW: Bill Williams Alligator ----------
+def _smma_series(s: pd.Series, period: int) -> pd.Series:
+    alpha = 1.0 / float(period)
+    return s.ewm(alpha=alpha, adjust=False).mean()
+
+def _alligator(df: pd.DataFrame,
+               jaw=13, teeth=8, lips=5,
+               jaw_shift=8, teeth_shift=5, lips_shift=3):
+    price = (df["High"] + df["Low"]) / 2.0
+    jaw_line   = _smma_series(price, int(jaw)).shift(int(jaw_shift))
+    teeth_line = _smma_series(price, int(teeth)).shift(int(teeth_shift))
+    lips_line  = _smma_series(price, int(lips)).shift(int(lips_shift))
+    return jaw_line, teeth_line, lips_line
+
+# ---------- NEW: Aroon (up/down) ----------
+def _aroon(df: pd.DataFrame, period=14):
+    high = df["High"]; low = df["Low"]
+    roll_high_idx = high.rolling(period+1).apply(lambda x: period - np.argmax(x[::-1]), raw=True)
+    roll_low_idx  = low.rolling(period+1).apply(lambda x: period - np.argmin(x[::-1]),  raw=True)
+    aroon_up   = (period - roll_high_idx) / period * 100.0
+    aroon_down = (period - roll_low_idx)  / period * 100.0
+    return aroon_up, aroon_down
+
+# ---------- NEW: Fractal Chaos Bands ----------
+def _fractal_bands(df: pd.DataFrame, lookback=2, smooth=5):
+    H = df["High"]; L = df["Low"]
+    hi = (H.shift(2) < H.shift(1)) & (H.shift(1) < H) & (H.shift(-1) < H) & (H.shift(-2) < H)
+    lo = (L.shift(2) > L.shift(1)) & (L.shift(1) > L) & (L.shift(-1) > L) & (L.shift(-2) > L)
+    up  = H.where(hi).ffill().rolling(int(smooth)).max()
+    dn  = L.where(lo).ffill().rolling(int(smooth)).min()
+    return up, dn
+
+# ---------- NEW: Schaff Trend Cycle (STC) ----------
+def _stc(close: pd.Series, fast=23, slow=50, cycle=10):
+    macd = _ema(close, int(fast)) - _ema(close, int(slow))
+    lowk = macd.rolling(int(cycle)).min()
+    highk = macd.rolling(int(cycle)).max()
+    raw = (macd - lowk) / (highk - lowk).replace(0, np.nan) * 100.0
+    stc1 = raw.ewm(span=3, adjust=False).mean()
+    stc2 = stc1.ewm(span=3, adjust=False).mean()
+    return stc2.clip(0, 100)
 
 # ============================== Compute indicators ===========================
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
@@ -379,17 +413,17 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
     if df is None or df.empty: return out
     close = df["Close"]
 
-    # Overlays
+    # Overlays (MAs, bands, etc.)
     if (cfg := ind_cfg.get("SMA", {})).get("enabled"):
-        p = int(cfg.get("period", 50)); out["SMA"] = _sma(close, p)
+        p = int(cfg.get("period", 50)); out[f"SMA"] = _sma(close, p)
     if (cfg := ind_cfg.get("EMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out["EMA"] = _ema(close, p)
+        p = int(cfg.get("period", 20)); out[f"EMA"] = _ema(close, p)
     if (cfg := ind_cfg.get("WMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out["WMA"] = _wma(close, p)
+        p = int(cfg.get("period", 20)); out[f"WMA"] = _wma(close, p)
     if (cfg := ind_cfg.get("SMMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out["SMMA"] = _smma(close, p)
+        p = int(cfg.get("period", 20)); out[f"SMMA"] = _smma(close, p)
     if (cfg := ind_cfg.get("TMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out["TMA"] = _tma(close, p)
+        p = int(cfg.get("period", 20)); out[f"TMA"] = _tma(close, p)
 
     if (cfg := ind_cfg.get("BOLL", {})).get("enabled"):
         p = int(cfg.get("period",20)); mult=float(cfg.get("mult",2))
@@ -410,8 +444,8 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
         out["ENV_MA"]=ma; out["ENV_UP"]=up; out["ENV_DN"]=dn
 
     if (cfg := ind_cfg.get("ICHIMOKU", {})).get("enabled"):
-        conv, base, sa, sb, lag = _ichimoku(df)
-        out["ICH_CONV"]=conv; out["ICH_BASE"]=base; out["ICH_SA"]=sa; out["ICH_SB"]=sb; out["ICH_LAG"]=lag
+        conv, base, span_a, span_b, lag = _ichimoku(df)
+        out["ICH_CONV"]=conv; out["ICH_BASE"]=base; out["ICH_SA"]=span_a; out["ICH_SB"]=span_b; out["ICH_LAG"]=lag
 
     if (cfg := ind_cfg.get("PSAR", {})).get("enabled"):
         af=float(cfg.get("step",0.02)); afm=float(cfg.get("max",0.2))
@@ -422,54 +456,92 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
         st, up, dn = _supertrend(df, p, mult)
         out["ST"]=st; out["ST_UP"]=up; out["ST_DN"]=dn
 
-    # Oscillators
-    if (cfg := ind_cfg.get("RSI", {})).get("enabled"):
+    # NEW: Alligator
+    if (cfg := ind_cfg.get("ALLIGATOR", {})).get("enabled"):
+        jaw  = int(cfg.get("jaw", 13))
+        teeth= int(cfg.get("teeth", 8))
+        lips = int(cfg.get("lips", 5))
+        jsh  = int(cfg.get("jaw_shift", 8))
+        tsh  = int(cfg.get("teeth_shift", 5))
+        lsh  = int(cfg.get("lips_shift", 3))
+        jaw_line, teeth_line, lips_line = _alligator(df, jaw, teeth, lips, jsh, tsh, lsh)
+        out["ALLIG_JAW"] = jaw_line
+        out["ALLIG_TEETH"] = teeth_line
+        out["ALLIG_LIPS"] = lips_line
+
+    # NEW: Fractal Chaos Bands
+    if (cfg := ind_cfg.get("FRACTAL", {})).get("enabled"):
+        look = int(cfg.get("lookback", 2))
+        sm   = int(cfg.get("smooth", 5))
+        up, dn = _fractal_bands(df, look, sm)
+        out["FRACTAL_UP"] = up
+        out["FRACTAL_DN"] = dn
+
+    # Oscillators (separate panels where appropriate)
+    if (cfg := ind_cfg.get("RSI", {})).get("enabled", cfg.get("show", True)):
         p=int(cfg.get("period",14)); out["RSI"]=_rsi(close,p)
 
-    if (cfg := ind_cfg.get("STOCH", {})).get("enabled"):
+    if (cfg := ind_cfg.get("STOCH", {})).get("enabled", cfg.get("show", True)):
         k=int(cfg.get("k",14)); d=int(cfg.get("d",3))
         kline,dline = _stoch(df,k,d); out["STOCH_K"]=kline; out["STOCH_D"]=dline
 
-    if (cfg := ind_cfg.get("ATR", {})).get("enabled"):
+    if (cfg := ind_cfg.get("ATR", {})).get("enabled", cfg.get("show", False)):
         p=int(cfg.get("period",14)); out["ATR"]=_atr(df,p)
 
-    if (cfg := ind_cfg.get("ADX", {})).get("enabled"):
+    if (cfg := ind_cfg.get("ADX", {})).get("enabled", cfg.get("show", False)):
         p=int(cfg.get("period",14)); adx, pdm, ndm = _adx(df,p); out["ADX"]=adx; out["+DI"]=pdm; out["-DI"]=ndm
 
-    if (cfg := ind_cfg.get("CCI", {})).get("enabled"):
+    if (cfg := ind_cfg.get("CCI", {})).get("enabled", False):
         p=int(cfg.get("period",20)); out["CCI"]=_cci(df,p)
 
-    if (cfg := ind_cfg.get("MOMENTUM", {})).get("enabled"):
+    if (cfg := ind_cfg.get("MOMENTUM", {})).get("enabled", False):
         p=int(cfg.get("period",10)); out["MOM"]=_momentum(close,p)
 
-    if (cfg := ind_cfg.get("ROC", {})).get("enabled"):
+    if (cfg := ind_cfg.get("ROC", {})).get("enabled", False):
         p=int(cfg.get("period",10)); out["ROC"]=_roc(close,p)
 
-    if (cfg := ind_cfg.get("WILLR", {})).get("enabled"):
+    if (cfg := ind_cfg.get("WILLR", {})).get("enabled", False):
         p=int(cfg.get("period",14)); out["WILLR"]=_willr(df,p)
 
-    if (cfg := ind_cfg.get("VORTEX", {})).get("enabled"):
+    if (cfg := ind_cfg.get("VORTEX", {})).get("enabled", False):
         p=int(cfg.get("period",14)); vip, vin = _vortex(df,p); out["VI+"]=vip; out["VI-"]=vin
 
-    if (cfg := ind_cfg.get("MACD", {})).get("enabled"):
+    if (cfg := ind_cfg.get("MACD", {})).get("enabled", False):
         f=int(cfg.get("fast",12)); s=int(cfg.get("slow",26)); g=int(cfg.get("signal",9))
         macd, sig, hist = _macd(close,f,s,g); out["MACD"]=macd; out["MACD_SIG"]=sig; out["MACD_HIST"]=hist
 
-    if (cfg := ind_cfg.get("AO", {})).get("enabled"): out["AO"]=_ao(df)
-    if (cfg := ind_cfg.get("AC", {})).get("enabled"): out["AC"]=_ac(df)
+    if (cfg := ind_cfg.get("AO", {})).get("enabled", False):
+        out["AO"]=_ao(df)
+    if (cfg := ind_cfg.get("AC", {})).get("enabled", False):
+        out["AC"]=_ac(df)
 
-    if (cfg := ind_cfg.get("BEARS", {})).get("enabled"):
+    if (cfg := ind_cfg.get("BEARS", {})).get("enabled", False):
         p=int(cfg.get("period",13)); out["BEARS"]=_bears_power(df,p)
-    if (cfg := ind_cfg.get("BULLS", {})).get("enabled"):
+    if (cfg := ind_cfg.get("BULLS", {})).get("enabled", False):
         p=int(cfg.get("period",13)); out["BULLS"]=_bulls_power(df,p)
 
-    if (cfg := ind_cfg.get("DEMARKER", {})).get("enabled"):
+    if (cfg := ind_cfg.get("DEMARKER", {})).get("enabled", False):
         p=int(cfg.get("period",14)); out["DEMARKER"]=_demarker(df,p)
 
-    if (cfg := ind_cfg.get("OSMA", {})).get("enabled"): out["OSMA"]=_osma(close)
+    if (cfg := ind_cfg.get("OSMA", {})).get("enabled", False):
+        out["OSMA"]=_osma(close)
 
-    if (cfg := ind_cfg.get("ZIGZAG", {})).get("enabled"):
+    if (cfg := ind_cfg.get("ZIGZAG", {})).get("enabled", False):
         pct=float(cfg.get("pct",1.0)); out["ZZ"]=_zigzag(close,pct)
+
+    # NEW: Aroon
+    if (cfg := ind_cfg.get("AROON", {})).get("enabled"):
+        p = int(cfg.get("period", 14))
+        up, dn = _aroon(df, p)
+        out["AROON_UP"] = up
+        out["AROON_DN"] = dn
+
+    # NEW: Schaff Trend Cycle
+    if (cfg := ind_cfg.get("STC", {})).get("enabled"):
+        f = int(cfg.get("fast", 23))
+        s = int(cfg.get("slow", 50))
+        c = int(cfg.get("cycle", 10))
+        out["STC"] = _stc(close, f, s, c)
 
     return out
 
@@ -532,17 +604,25 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
 
 # ============================== Plotting =====================================
 def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
+    """
+    Clear, dark chart:
+      - Panel 1: Candles + overlays + markers
+      - Panel 2: RSI (if enabled)
+      - Panel 3: Stochastic (if enabled) + optional Aroon/STC overlays on that oscillator pane
+    """
     os.makedirs("static/plots", exist_ok=True)
     if df is None or df.empty:
         out = "empty.png"
         plt.figure(figsize=(10,2)); plt.text(0.5,0.5,"No data", ha="center"); plt.savefig("static/plots/"+out); plt.close()
         return out
 
+    # Compute indicators with current config
     ind = compute_indicators(df, indicators_cfg or {})
     ts = df.index
 
+    # Figure layout
     want_rsi = "RSI" in ind
-    want_sto = "STOCH_K" in ind and "STOCH_D" in ind
+    want_sto = ("STOCH_K" in ind and "STOCH_D" in ind) or ("AROON_UP" in ind) or ("STC" in ind)
     rows = 1 + (1 if want_rsi else 0) + (1 if want_sto else 0)
     fig_h = 6 + (2 if want_rsi else 0) + (2 if want_sto else 0)
     fig, axes = plt.subplots(rows, 1, figsize=(14, fig_h), sharex=True,
@@ -552,7 +632,7 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
     ax_price.set_facecolor("#0b0f17")
     fig.patch.set_facecolor("#0b0f17")
 
-    # Candles
+    # --- Candles ---
     dt = mdates.date2num(pd.to_datetime(ts).to_pydatetime())
     for i,(t,o,h,l,c) in enumerate(zip(dt, df["Open"], df["High"], df["Low"], df["Close"])):
         color = "#17c964" if c>=o else "#f44336"
@@ -561,7 +641,7 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
                                          facecolor=color, edgecolor=color, linewidth=.6, alpha=.95, zorder=3))
     ax_price.set_ylabel("Price", color="#e8edf7")
 
-    # Overlays
+    # --- Overlays ---
     overlay_colors = {
         "SMA":"#ffd166", "EMA":"#60a5fa", "WMA":"#f59e0b", "SMMA":"#a78bfa","TMA":"#ef4444",
         "BB_MA":"#9ca3af","BB_UP":"#374151","BB_DN":"#374151",
@@ -569,15 +649,23 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         "DON_UP":"#4b5563","DON_DN":"#4b5563","DON_MID":"#64748b",
         "ENV_MA":"#9ca3af","ENV_UP":"#52525b","ENV_DN":"#52525b",
         "ICH_CONV":"#10b981","ICH_BASE":"#ef4444","ICH_SA":"#22d3ee","ICH_SB":"#fb7185",
-        "PSAR":"#f472b6","ST":"#22c55e","ZZ":"#93c5fd"
+        "PSAR":"#f472b6","ST":"#22c55e",
+        # New overlays
+        "ALLIG_JAW":"#60a5fa",
+        "ALLIG_TEETH":"#ef4444",
+        "ALLIG_LIPS":"#22c55e",
+        "FRACTAL_UP":"#94a3b8",
+        "FRACTAL_DN":"#94a3b8",
     }
     for key, col in overlay_colors.items():
         if key in ind:
             ax_price.plot(ts, ind[key], color=col, linewidth=1.0, alpha=0.9, label=key)
+
+    # PSAR dots
     if "PSAR" in ind:
         ax_price.scatter(ts, ind["PSAR"], s=10, color="#f472b6", alpha=.8, zorder=5)
 
-    # Markers
+    # --- BUY/SELL markers ---
     if signals:
         buy_x=[]; buy_y=[]; sell_x=[]; sell_y=[]
         for s in signals:
@@ -589,26 +677,38 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         if sell_x: ax_price.scatter(sell_x, sell_y, marker="v", s=60, color="#ef4444", label="SELL", zorder=6)
         ax_price.legend(loc="upper left", fontsize=9)
 
-    # RSI panel
-    cur = 1
+    # --- RSI panel (dedicated) ---
+    cur_row = 1
     if want_rsi:
-        ax = axes[cur]; cur += 1
-        ax.set_facecolor("#0b0f17")
-        ax.plot(ts, ind["RSI"], color="#60a5fa", linewidth=1.2, label="RSI")
-        ax.axhline(70, color="#6b7280", linewidth=.8, linestyle="--")
-        ax.axhline(30, color="#6b7280", linewidth=.8, linestyle="--")
-        ax.set_ylim(0,100); ax.set_yticks([0,30,50,70,100]); ax.legend(loc="upper left", fontsize=9)
+        ax_rsi = axes[cur_row]
+        ax_rsi.set_facecolor("#0b0f17")
+        ax_rsi.plot(ts, ind["RSI"], color="#60a5fa", linewidth=1.2, label="RSI")
+        ax_rsi.axhline(70, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_rsi.axhline(30, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_rsi.set_ylim(0,100); ax_rsi.set_yticks([0,30,50,70,100])
+        ax_rsi.legend(loc="upper left", fontsize=9)
+        cur_row += 1
 
-    # Stoch panel
+    # --- Stochastic panel (+ optional Aroon/STC) ---
     if want_sto:
-        ax = axes[cur]
-        ax.set_facecolor("#0b0f17")
-        ax.plot(ts, ind["STOCH_K"], color="#22c55e", linewidth=1.2, label="%K")
-        ax.plot(ts, ind["STOCH_D"], color="#f59e0b", linewidth=1.0, label="%D")
-        ax.axhline(80, color="#6b7280", linewidth=.8, linestyle="--")
-        ax.axhline(20, color="#6b7280", linewidth=.8, linestyle="--")
-        ax.set_ylim(0,100); ax.set_yticks([0,20,50,80,100]); ax.legend(loc="upper left", fontsize=9)
+        ax_st = axes[cur_row]
+        ax_st.set_facecolor("#0b0f17")
+        if "STOCH_K" in ind:
+            ax_st.plot(ts, ind["STOCH_K"], color="#22c55e", linewidth=1.2, label="%K")
+        if "STOCH_D" in ind:
+            ax_st.plot(ts, ind["STOCH_D"], color="#f59e0b", linewidth=1.0, label="%D")
+        if "AROON_UP" in ind:
+            ax_st.plot(ts, ind["AROON_UP"], color="#93c5fd", linewidth=.9, alpha=.9, label="Aroon Up")
+        if "AROON_DN" in ind:
+            ax_st.plot(ts, ind["AROON_DN"], color="#fca5a5", linewidth=.9, alpha=.9, label="Aroon Down")
+        if "STC" in ind:
+            ax_st.plot(ts, ind["STC"], color="#a78bfa", linewidth=1.0, alpha=.9, label="STC")
+        ax_st.axhline(80, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_st.axhline(20, color="#6b7280", linewidth=.8, linestyle="--")
+        ax_st.set_ylim(0,100); ax_st.set_yticks([0,20,50,80,100])
+        ax_st.legend(loc="upper left", fontsize=9)
 
+    # --- Cosmetics ---
     ax_price.grid(color="#111827", linestyle="--", linewidth=0.5)
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
     for ax in axes:
@@ -616,7 +716,8 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         for spine in ax.spines.values(): spine.set_color("#1f2937")
 
     fig.suptitle(f"{strategy} • TF={tf} • Exp={expiry}", color="#e5e7eb", fontsize=14, fontweight="bold", y=0.98)
-    fig.autofmt_xdate(); fig.tight_layout(rect=[0,0,1,0.96])
+    fig.autofmt_xdate()
+    fig.tight_layout(rect=[0,0,1,0.96])
 
     out_name = f"{df.index[-1].strftime('%Y%m%d_%H%M%S')}_{strategy}_{tf}.png"
     path = os.path.join("static","plots", out_name)
