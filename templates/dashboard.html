@@ -11,7 +11,6 @@
     }
     html,body{margin:0;padding:0;background:#0a0c10;color:var(--text);font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;}
     a{color:var(--acc);text-decoration:none}
-    code{background:#0f1420;border:1px solid rgba(255,255,255,.08);padding:1px 6px;border-radius:8px}
     .wrap{max-width:1200px;margin:0 auto;padding:20px}
     .grid{display:grid;gap:16px}
     .g-2{grid-template-columns:1fr 1fr}
@@ -19,16 +18,16 @@
     .card{background:var(--card);border-radius:var(--br);padding:16px;border:1px solid rgba(255,255,255,.06)}
     .card h3{margin:0 0 10px 0;font-size:16px}
     label{display:inline-block;margin:6px 0 4px 0;color:#cfd6e7}
-    input[type=text],input[type=number],input[type=password],input[type=time],input[type=datetime-local],input[type=date],
+    input[type=text],input[type=number],input[type=datetime-local],input[type=date],
     select,textarea{
       width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
       background:#0d1117;color:var(--text);outline:none
     }
-    textarea{min-height:80px;max-height:180px;overflow:auto;resize:vertical;overflow-wrap:anywhere;word-break:break-word;white-space:pre-wrap}
+    textarea{min-height:80px}
     .row{display:flex;gap:10px;flex-wrap:wrap}
     .row > *{flex:1}
     .btn{display:inline-block;background:#212838;color:#eaf1ff;border:1px solid rgba(255,255,255,.15);
-      padding:10px 14px;border-radius:10px;cursor:pointer;font-weight:600}
+      padding:10px 14px;border-radius:10px;cursor:pointer}
     .btn:hover{background:#2a3246}
     .btn-acc{background:#1463b8;border-color:#237ad7}
     .btn-acc:hover{background:#1a6ed0}
@@ -50,13 +49,10 @@
     .right-sticky{position:sticky; top:16px}
     .small{font-size:12px}
     .list{display:flex;flex-wrap:wrap;gap:6px}
-    .item{padding:6px 8px;border-radius:10px;background:#0f1420;border:1px solid rgba(255,255,255,.08)}
+    .list .item{padding:6px 8px;border-radius:10px;background:#0f1420;border:1px solid rgba(255,255,255,.08)}
     .note{font-size:12px;color:#9fb0cc}
     .legend{font-size:12px;color:#96a1b8}
     .center{display:flex;align-items:center;justify-content:center}
-    .cap{font-size:12px;color:#9fb0cc}
-    .grid-tight{display:grid;grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px}
-    .send-row{display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap}
   </style>
 </head>
 <body>
@@ -67,9 +63,8 @@
     <div style="flex:1">
       <h2 style="margin:0 0 2px 0">Pocket-Option Signals</h2>
       <div class="muted small">
-        {% if tz %}Local TZ: <b>{{ tz }}</b>{% endif %}
-        {% if now %} • Now: <span id="nowLocal">{{ now }}</span>{% endif %}
-        • PO Time (UTC): <span id="nowUTC">—</span>
+        {% if tz %}Timezone: <b>{{ tz }}</b>{% endif %}
+        {% if now %} • Now: {{ now }}{% endif %}
         {% if within is not none %} • Within window: <span class="pill">{{ 'YES' if within else 'NO' }}</span>{% endif %}
       </div>
     </div>
@@ -102,7 +97,6 @@
         </div>
       </form>
     </div>
-
   {% elif view == 'index' %}
     <div class="grid g-2">
       <div class="card">
@@ -147,7 +141,7 @@
           <div class="row">
             <div>
               <label>Live TF</label>
-              <select name="live_tf" id="live_tf_sel">
+              <select name="live_tf">
                 {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
                   <option value="{{t}}" {{ 'selected' if t==live_tf else '' }}>{{t}}</option>
                 {% endfor %}
@@ -155,19 +149,11 @@
             </div>
             <div>
               <label>Live Expiry</label>
-              <select name="live_expiry" id="live_exp_sel">
+              <select name="live_expiry">
                 {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
                   <option value="{{e}}" {{ 'selected' if e==(live_expiry or '5m') else '' }}>{{e}}</option>
                 {% endfor %}
               </select>
-            </div>
-            <div>
-              <label>Candle Timer</label>
-              <div class="item"><span id="candleTimer">—</span></div>
-            </div>
-            <div>
-              <label>Expiry Timer</label>
-              <div class="item"><span id="expiryTimer">—</span></div>
             </div>
           </div>
           <div style="margin-top:10px">
@@ -231,7 +217,7 @@
                   </div>
                 </div>
                 {% if spec.params %}
-                  <div class="grid-tight" style="margin-top:8px">
+                  <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:8px">
                     {% for p_name, p_def in spec.params.items() %}
                       {% set val = cfg.get(p_name, p_def) %}
                       <div>
@@ -251,14 +237,15 @@
         </form>
       </div>
 
-      <!-- Strategies + Custom rules -->
+      <!-- Strategies + Custom -->
       <div class="card">
         <h3>Strategies & Custom</h3>
         <form method="post" action="{{ url_for('dashboard.update_strategies') }}">
           <div class="list">
             {% for name, entry in strategies_all.items() %}
               <label class="item small">
-                <input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled') or entry.get('enabled')) else '' }}>
+                <!-- FIX: only respect saved state 'strategies', never the default catalog -->
+                <input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled')) else '' }}>
                 {{ name }}
               </label>
             {% endfor %}
@@ -267,7 +254,7 @@
           <div class="row">
             <div>
               <label>Backtest TF</label>
-              <select name="bt_tf" id="bt_tf_sel">
+              <select name="bt_tf">
                 {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
                   <option value="{{t}}" {{ 'selected' if t==(bt.tf if bt else live_tf) else '' }}>{{t}}</option>
                 {% endfor %}
@@ -275,7 +262,7 @@
             </div>
             <div>
               <label>Backtest Expiry</label>
-              <select name="bt_expiry" id="bt_exp_sel">
+              <select name="bt_expiry">
                 {% for e in ['1m','3m','5m','10m','30m','1h','4h'] %}
                   <option value="{{e}}" {{ 'selected' if (bt.expiry if bt else live_expiry)==e else '' }}>{{e}}</option>
                 {% endfor %}
@@ -387,8 +374,8 @@
             {% if users and users|length %}
               <div class="list">
                 {% for u in users %}
-                  <div class="item small" style="display:flex;gap:8px;align-items:center">
-                    <div><b>{{ u.telegram_id }}</b> • {{ u.tier|upper }} {% if u.expires_at %} • exp: {{ u.expires_at }}{% endif %}</div>
+                  <div class="item small">
+                    <b>{{ u.telegram_id }}</b> • {{ u.tier|upper }} {% if u.expires_at %} • exp: {{ u.expires_at }}{% endif %}
                     <form method="post" action="{{ url_for('dashboard.users_delete') }}" style="display:inline">
                       <input type="hidden" name="telegram_id" value="{{ u.telegram_id }}">
                       <button class="btn btn-err small" type="submit">Delete</button>
@@ -445,10 +432,10 @@
               <input type="file" name="bt_csv" accept=".csv">
             </div>
             <div style="flex:0.6">
-              <label class="small"><input type="checkbox" name="use_server" checked> Use Deriv server fetch</label>
+              <label class="small"><input type="checkbox" name="use_server"> Use Deriv server fetch</label>
               <div class="row">
                 <div>
-                  <label>Target candles</label>
+                  <label>Candles</label>
                   <input type="number" name="bt_count" value="300" min="100" max="5000">
                 </div>
               </div>
@@ -487,30 +474,44 @@
         <h3>Telegram</h3>
         <div class="row">
           <form method="post" action="{{ url_for('dashboard.telegram_test') }}">
-            <button class="btn btn-ok" type="submit">Send Test (All Tiers)</button>
+            <button class="btn btn-ok" type="submit">Send Test</button>
           </form>
           <a class="btn" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Open Diagnostics (JSON)</a>
         </div>
-        <div class="row" style="margin-top:8px">
-          <div>
-            <label class="small">Quick message to ALL tiers (uses /api/send under the hood)</label>
-            <textarea id="msgAll" placeholder="Type an info/update to broadcast..."></textarea>
-            <div class="send-row">
-              <button class="btn btn-acc" type="button" onclick="sendAll()">Broadcast to All</button>
-              <span class="note">Per-tier caps enforced: Free=3, Basic=6, Pro=15, VIP=∞</span>
-            </div>
-          </div>
-        </div>
         <p class="note">Set env: <code>TELEGRAM_BOT_TOKEN</code>, and channel IDs:
-          <code>TELEGRAM_CHAT_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code> (or legacy <code>TELEGRAM_CHAT_ID_*</code>).
+          <code>TELEGRAM_CHAT_ID_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code>.
         </p>
       </div>
 
       <!-- Deriv fetch (optional helper) -->
       <div class="card">
         <h3>Deriv: Fetch CSV (optional)</h3>
-        <form method="post" action="#">
-          <p class="note">Use the Backtest form above. This helper is optional.</p>
+        <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
+          <div class="row">
+            <div>
+              <label>Symbols (space/comma)</label>
+              <input type="text" name="fetch_symbols" placeholder="frxEURUSD frxGBPUSD ...">
+              <label class="small"><input type="checkbox" name="convert_po_fetch"> Convert PO→Deriv</label>
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>TF</label>
+              <select name="fetch_tf">
+                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+                  <option>{{ t }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label>Candles</label>
+              <input type="number" name="fetch_count" value="300" min="100" max="5000">
+            </div>
+          </div>
+          <div style="margin-top:10px">
+            <button class="btn" type="submit">Fetch</button>
+          </div>
+          <p class="note">Requires <code>data_fetch.py</code> with <code>fetch_one_symbol()</code> + <code>deriv_csv_path()</code>.</p>
         </form>
       </div>
     </div>
@@ -526,19 +527,16 @@
           <button class="btn" onclick="hit('/live/debug/off')">Debug OFF</button>
         </div>
         <hr>
-        <div class="kvs">
-          <div class="kv"><div class="k">Status</div><div class="v" id="lv">—</div></div>
-          <div class="kv"><div class="k">Free</div><div class="v" id="t_free">0</div><div class="cap" id="cap_free"></div></div>
-          <div class="kv"><div class="k">Basic</div><div class="v" id="t_basic">0</div><div class="cap" id="cap_basic"></div></div>
-          <div class="kv"><div class="k">Pro</div><div class="v" id="t_pro">0</div><div class="cap" id="cap_pro"></div></div>
-          <div class="kv"><div class="k">VIP</div><div class="v" id="t_vip">0</div><div class="cap" id="cap_vip"></div></div>
+        <div class="kvs" id="liveStats">
+          <div class="kv"><div class="k">Status</div><div class="v" id="lv">...</div></div>
+          <div class="kv"><div class="k">Free</div><div class="v" id="t_free">0</div></div>
+          <div class="kv"><div class="k">Basic</div><div class="v" id="t_basic">0</div></div>
+          <div class="kv"><div class="k">Pro</div><div class="v" id="t_pro">0</div></div>
+          <div class="kv"><div class="k">VIP</div><div class="v" id="t_vip">0</div></div>
           <div class="kv"><div class="k">All</div><div class="v" id="t_all">0</div></div>
         </div>
         <p class="note small">Tiers daily caps: Free=3, Basic=6, Pro=15, VIP=∞ (enforced in live engine).</p>
-        <div class="note small" id="cfgChats"></div>
-        <div class="note small" id="lastSendNote"></div>
       </div>
-
       <div class="card">
         <h3>Quick Links</h3>
         <div class="list">
@@ -556,63 +554,6 @@
 </div>
 
 <script>
-function pad(n){return (n<10?'0':'')+n}
-function fmtClock(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())}
-
-function updateClocks(){
-  // Local clock text is server-rendered; just keep ticking client-side
-  const nowLocal = document.getElementById('nowLocal');
-  const nowUTC = document.getElementById('nowUTC');
-  const d = new Date();
-  if (nowLocal) nowLocal.textContent = fmtClock(d);
-  if (nowUTC) {
-    const u = new Date(d.getTime() + d.getTimezoneOffset()*60000);
-    nowUTC.textContent = fmtClock(u);
-  }
-}
-setInterval(updateClocks, 1000); updateClocks();
-
-function tfToSecs(tf){
-  const m=tf.toUpperCase();
-  if (m.startsWith('M')) return parseInt(m.slice(1) || '1',10)*60;
-  if (m.startsWith('H')) return parseInt(m.slice(1) || '1',10)*3600;
-  if (m==='D1') return 86400;
-  return 300;
-}
-function expiryToSecs(e){
-  e = (e||'5m').toLowerCase();
-  if (e.endsWith('m')) return parseInt(e)*60;
-  if (e.endsWith('h')) return parseInt(e)*3600;
-  return 300;
-}
-function fmtHMS(s){
-  s = Math.max(0, Math.floor(s));
-  const h = Math.floor(s/3600); s%=3600;
-  const m = Math.floor(s/60); const sec = s%60;
-  if (h>0) return `${h}h ${pad(m)}m ${pad(sec)}s`;
-  return `${m}m ${pad(sec)}s`;
-}
-function updateTimers(){
-  const tfSel = document.getElementById('live_tf_sel');
-  const expSel = document.getElementById('live_exp_sel');
-  const ct = document.getElementById('candleTimer');
-  const et = document.getElementById('expiryTimer');
-  const now = Date.now()/1000;
-
-  if (tfSel && ct){
-    const tfSecs = tfToSecs(tfSel.value || 'M5');
-    const next = Math.ceil(now / tfSecs) * tfSecs;
-    ct.textContent = fmtHMS(next - now);
-  }
-  if (expSel && et){
-    const ex = expiryToSecs(expSel.value || '5m');
-    // Expiry aligned to candle close (PO-style behavior): countdown within current expiry window
-    const nextE = Math.ceil(now / ex) * ex;
-    et.textContent = fmtHMS(nextE - now);
-  }
-}
-setInterval(updateTimers, 1000); updateTimers();
-
 async function hit(url){
   try{
     const r = await fetch(url);
@@ -621,70 +562,25 @@ async function hit(url){
     refreshLive();
   }catch(e){ console.error(e); }
 }
-
 async function refreshLive(){
   try{
-    // Prefer /api/status if available (from app.py), fallback to /live/status
-    let s;
-    try { s = await fetch('/api/status').then(r=>r.json()); }
-    catch(_){ s = await fetch('/live/status').then(r=>r.json()); s = s.status || s; }
-
+    const s = await fetch('/live/status').then(r=>r.json());
+    const t = await fetch('/live/tally').then(r=>r.json());
     const lv = document.getElementById('lv');
-    const status = (s && s.state) ? s.state.toUpperCase() : (s.running ? 'RUNNING' : 'STOPPED');
-    if (lv) lv.textContent = status;
-
-    const tallies = s.tallies || (s.tally && s.tally.by_tier) || {};
-    setVal('t_free', tallies.free ?? 0);
-    setVal('t_basic', tallies.basic ?? 0);
-    setVal('t_pro', tallies.pro ?? 0);
-    setVal('t_vip', tallies.vip ?? 0);
-    setVal('t_all', tallies.all ?? tallies.total ?? 0);
-
-    const caps = s.caps || {};
-    setVal('cap_free', capText(caps.free));
-    setVal('cap_basic', capText(caps.basic));
-    setVal('cap_pro', capText(caps.pro));
-    setVal('cap_vip', capText(caps.vip));
-
-    const cfgEl = document.getElementById('cfgChats');
-    if (cfgEl && s.configured_chats){
-      cfgEl.textContent = 'Configured Chats: ' + Object.entries(s.configured_chats).map(([k,v])=>`${k}:${v?'✓':'×'}`).join('  ');
-    }
-    const last = document.getElementById('lastSendNote');
-    if (last && s.last_send_result){
-      try{ last.textContent = 'Last send: ' + JSON.stringify(s.last_send_result); }catch(e){ last.textContent=''; }
+    if (lv) lv.textContent = (s && s.status) ? (s.status.state || JSON.stringify(s.status)) : '—';
+    if (t && t.tally){
+      const z=t.tally;
+      setVal('t_free', z.free || 0);
+      setVal('t_basic', z.basic || 0);
+      setVal('t_pro', z.pro || 0);
+      setVal('t_vip', z.vip || 0);
+      setVal('t_all', z.all || 0);
     }
   }catch(e){console.error(e);}
 }
 function setVal(id,v){ const el=document.getElementById(id); if(el) el.textContent = v; }
-function capText(cap){
-  if (cap===null || cap===undefined) return 'cap: ∞';
-  return 'cap: '+cap;
-}
 refreshLive();
-setInterval(refreshLive, 5000);
-
-// Broadcast helper using /api/send
-async function postJSON(url, body){
-  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  return r.json();
-}
-async function sendAll(){
-  const text = (document.getElementById('msgAll').value || '').trim();
-  if (!text){ alert('Type a message to send.'); return; }
-  const tiers = ['free','basic','pro','vip'];
-  let results = [];
-  for (const t of tiers){
-    try{
-      const res = await postJSON('/api/send', {tier: t, text});
-      results.push(`${t}: ${res.result && res.result.ok ? 'sent' : (res.result && res.result.error ? res.result.error : 'error')}`);
-    }catch(e){
-      results.push(`${t}: ${e}`);
-    }
-  }
-  alert(results.join('\n'));
-  refreshLive();
-}
+setInterval(refreshLive, 6000);
 </script>
 </body>
 </html>
