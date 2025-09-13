@@ -1,3 +1,4 @@
+<!-- templates/dashboard.html -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -18,12 +19,11 @@
     .card{background:var(--card);border-radius:var(--br);padding:16px;border:1px solid rgba(255,255,255,.06)}
     .card h3{margin:0 0 10px 0;font-size:16px}
     label{display:inline-block;margin:6px 0 4px 0;color:#cfd6e7}
-    input[type=text],input[type=number],input[type=datetime-local],input[type=date],
-    input[type=time], select, textarea{
+    input[type=text],input[type=password],input[type=number],input[type=time],input[type=date],select,textarea{
       width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
       background:#0d1117;color:var(--text);outline:none
     }
-    textarea{min-height:90px;max-height:200px;overflow:auto;resize:vertical;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
+    textarea{min-height:80px;overflow:auto;overflow-wrap:anywhere;word-break:break-word;white-space:normal;}
     .row{display:flex;gap:10px;flex-wrap:wrap}
     .row > *{flex:1}
     .btn{display:inline-block;background:#212838;color:#eaf1ff;border:1px solid rgba(255,255,255,.15);
@@ -41,7 +41,7 @@
     .flash-err{background:#2a0c0c;border:1px solid #b33; color:#ffc9c9}
     img.plot{max-width:100%;border-radius:12px;border:1px solid rgba(255,255,255,.1)}
     hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:14px 0}
-    .kvs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px}
+    .kvs{display:grid;grid-template-columns:repeat(4, minmax(0,1fr)); gap:8px}
     .kvs .kv{background:#0f1420;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px}
     .kv .k{font-size:12px;color:#aab3c7}
     .kv .v{font-size:16px;margin-top:2px}
@@ -52,11 +52,12 @@
     .list .item{padding:6px 8px;border-radius:10px;background:#0f1420;border:1px solid rgba(255,255,255,.08)}
     .note{font-size:12px;color:#9fb0cc}
     .legend{font-size:12px;color:#96a1b8}
+    .center{display:flex;align-items:center;justify-content:center}
+    .text-box{min-height:80px;max-height:180px}
   </style>
 </head>
 <body>
 <div class="wrap">
-
   <!-- Header -->
   <div class="row" style="align-items:center">
     <div style="flex:1">
@@ -108,7 +109,7 @@
         <p class="note" style="margin-top:10px">Login to configure dashboard, indicators, strategies, users, Telegram and backtests.</p>
         <a class="btn btn-acc" href="{{ url_for('dashboard.login') }}">Go to Login</a>
       </div>
-      <div class="card"><h3>About</h3><p>Signals to Telegram tiers, Deriv/PO symbols, backtesting with screenshots, live engine with daily caps.</p></div>
+      <div class="card"><h3>About</h3><p>Sends binary options signals to Telegram tiers with caps and supports Deriv fetch + backtest + screenshots.</p></div>
     </div>
 
   {% elif view == 'dashboard' %}
@@ -173,7 +174,9 @@
               <label>Free text (comma/space)</label>
               <input type="text" name="symbols_text" placeholder="frxEURUSD EURUSD GBPUSD ..." value="{{ (symbols_raw or [])|join(' ') }}">
             </div>
-            <div style="align-self:flex-end"><label class="small"><input type="checkbox" name="convert_po" /> Convert PO→Deriv</label></div>
+            <div style="align-self:flex-end">
+              <label class="small"><input type="checkbox" name="convert_po" /> Convert PO→Deriv</label>
+            </div>
           </div>
           <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save Symbols</button></div>
         </form>
@@ -184,20 +187,29 @@
         <h3>Indicators</h3>
         <form method="post" action="{{ url_for('dashboard.update_indicators') }}">
           <div class="grid g-3">
+            {% set specs = {
+              'SMA': {'label':'Simple MA','params':{'period':50}},
+              'EMA': {'label':'Exponential MA','params':{'period':20}},
+              'RSI': {'label':'RSI','params':{'period':14}},
+              'STOCH': {'label':'Stochastic','params':{'k':14,'d':3}},
+              'BOLL': {'label':'Bollinger Bands','params':{'period':20,'mult':2}},
+              'PSAR': {'label':'Parabolic SAR','params':{'step':0.02,'max':0.2}},
+              'SUPERTREND': {'label':'Supertrend','params':{'period':10,'mult':3}},
+              'ATR': {'label':'ATR','params':{'period':14}},
+              'ADX': {'label':'ADX','params':{'period':14}},
+              'MACD': {'label':'MACD','params':{'fast':12,'slow':26,'signal':9}}
+            } %}
             {% for key, spec in specs.items() %}
               {% set cfg = (indicators or {}).get(key, {}) %}
               <div class="card" style="padding:12px">
                 <div class="row" style="align-items:center">
                   <div style="flex:0"><input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if cfg.get('enabled') else '' }}></div>
-                  <div style="flex:1">
-                    <b>{{ spec.name or spec.label or key }}</b>
-                    <div class="small legend muted">{{ spec.kind if spec.kind else '' }}</div>
-                  </div>
+                  <div style="flex:1"><b>{{ spec.label }}</b></div>
                 </div>
                 {% if spec.params %}
                   <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:8px">
-                    {% for p_name, p_def in spec.params.items() %}
-                      {% set val = cfg.get(p_name, p_def) %}
+                    {% for p_name, default in spec.params.items() %}
+                      {% set val = cfg.get(p_name, default) %}
                       <div>
                         <label class="small">{{ p_name }}</label>
                         <input type="text" name="ind_{{key}}_{{p_name}}" value="{{ val }}">
@@ -209,17 +221,20 @@
             {% endfor %}
           </div>
           <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save Indicators</button></div>
-          <p class="note" style="margin-top:6px">Only enabled indicators render on screenshots and are respected by strategies.</p>
+          <p class="note" style="margin-top:6px">Enabled indicators are drawn and used by strategies/rules. RSI and Stochastic plot in their own panels.</p>
         </form>
       </div>
 
-      <!-- Strategies -->
+      <!-- Strategies + Custom -->
       <div class="card">
         <h3>Strategies & Custom</h3>
         <form method="post" action="{{ url_for('dashboard.update_strategies') }}">
           <div class="list">
-            {% for name, entry in strategies_all.items() %}
-              <label class="item small"><input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled') or entry.get('enabled')) else '' }}> {{ name }}</label>
+            {% for name in ['BASE','TREND','CHOP','CUSTOM1','CUSTOM2','CUSTOM3'] %}
+              <label class="item small">
+                <input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled')) else '' }}>
+                {{ name }}
+              </label>
             {% endfor %}
           </div>
           <hr>
@@ -260,7 +275,7 @@
           <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save Strategy Toggles & Defaults</button></div>
         </form>
 
-        <!-- Custom slots -->
+        <!-- Custom slots (1–3) -->
         <hr>
         <div class="grid g-3">
           {% for c in customs %}
@@ -277,32 +292,26 @@
                     <option value="JSON" {{ 'selected' if (c.get('mode')=='JSON') else '' }}>JSON</option>
                   </select>
                 </div>
-                <div>
-                  <label>Lookback</label>
-                  <input type="number" name="lookback" value="{{ c.get('lookback',3) }}">
-                </div>
-                <div>
-                  <label>Tolerance %</label>
-                  <input type="text" name="tol_pct" value="{{ c.get('tol_pct',0.1) }}">
-                </div>
+                <div><label>Lookback</label><input type="number" name="lookback" value="{{ c.get('lookback',3) }}"></div>
+                <div><label>Tolerance %</label><input type="text" name="tol_pct" value="{{ c.get('tol_pct',0.1) }}"></div>
               </div>
               <div class="row">
                 <div>
                   <label>Simple BUY (text)</label>
-                  <textarea name="simple_buy" placeholder="e.g. RSI < 30 AND StochK cross up">{{ c.get('simple_buy','') }}</textarea>
+                  <textarea class="text-box" name="simple_buy" placeholder="e.g. RSI < 30 AND %K cross up">{{ c.get('simple_buy','') }}</textarea>
                 </div>
                 <div>
                   <label>Simple SELL (text)</label>
-                  <textarea name="simple_sell" placeholder="e.g. RSI > 70 AND StochK cross down">{{ c.get('simple_sell','') }}</textarea>
+                  <textarea class="text-box" name="simple_sell" placeholder="e.g. RSI > 70 AND %K cross down">{{ c.get('simple_sell','') }}</textarea>
                 </div>
               </div>
               <div>
                 <label>JSON buy_rule</label>
-                <textarea name="buy_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":"<","v":30}]}'>{{ c.get('buy_rule')|tojson if c.get('buy_rule') else '' }}</textarea>
+                <textarea class="text-box small" name="buy_rule_json" placeholder='{"all":[{"ind":"RSI","op":"<","v":30}]}'>{{ c.get('buy_rule')|tojson if c.get('buy_rule') else '' }}</textarea>
               </div>
               <div>
                 <label>JSON sell_rule</label>
-                <textarea name="sell_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":">","v":70}]}'>{{ c.get('sell_rule')|tojson if c.get('sell_rule') else '' }}</textarea>
+                <textarea class="text-box small" name="sell_rule_json" placeholder='{"all":[{"ind":"RSI","op":">","v":70}]}'>{{ c.get('sell_rule')|tojson if c.get('sell_rule') else '' }}</textarea>
               </div>
               <div style="margin-top:8px"><button class="btn btn-acc" type="submit">Save CUSTOM {{ c._idx }}</button></div>
             </form>
@@ -342,9 +351,8 @@
             <div>
               <label>Strategy</label>
               <select name="bt_strategy">
-                <option {{ 'selected' if (bt.strategy if bt else 'BASE')=='BASE' else '' }}>BASE</option>
-                <option {{ 'selected' if (bt.strategy if bt else '')=='TREND' else '' }}>TREND</option>
-                <option {{ 'selected' if (bt.strategy if bt else '')=='CHOP' else '' }}>CHOP</option>
+                <option>BASE</option><option>TREND</option><option>CHOP</option>
+                <option>CUSTOM1</option><option>CUSTOM2</option><option>CUSTOM3</option>
               </select>
             </div>
           </div>
@@ -362,7 +370,7 @@
           </div>
           <div style="margin-top:10px">
             <button class="btn btn-acc" type="submit">Run Backtest & Show Screenshot</button>
-            <span class="note">Plot shows enabled indicators + BUY/SELL markers.</span>
+            <span class="note">Plots include markers + selected overlays; RSI and Stochastic each in separate panels.</span>
           </div>
         </form>
 
@@ -376,6 +384,7 @@
                 <div class="kv"><div class="k">Strategy</div><div class="v">{{ bt.strategy }}</div></div>
               </div>
               <p class="note" style="margin-top:6px">Summary: {{ bt.summary }}{% if bt.warnings %} • <span class="warn">{{ bt.warnings|join('; ') }}</span>{% endif %}</p>
+              <p><a href="{{ url_for('dashboard.backtest_last_json') }}">Last JSON</a> • <a href="{{ url_for('dashboard.backtest_last_csv') }}">Last CSV</a></p>
             </div>
           </div>
           <img class="plot" src="{{ url_for('dashboard.plot_file', name=bt.plot_name) }}" alt="Backtest plot">
@@ -384,9 +393,29 @@
         {% endif %}
       </div>
 
-      <!-- Deriv fetch helper (placeholder to avoid 500) -->
+      <!-- Telegram (global) -->
       <div class="card">
-        <h3>Deriv: Fetch CSV (helper)</h3>
+        <h3>Telegram</h3>
+        <div class="row">
+          <form method="post" action="{{ url_for('dashboard.telegram_test') }}">
+            <button class="btn btn-ok" type="submit">Send VIP Test</button>
+          </form>
+          <a class="btn" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Open Diagnostics (JSON)</a>
+        </div>
+        <p class="note">Env needed: <code>TELEGRAM_BOT_TOKEN</code>, channel IDs: <code>TELEGRAM_CHAT_ID_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code>.</p>
+
+        <div style="margin-top:10px">
+          <label>Send info message to all tiers</label>
+          <textarea id="allText" class="text-box" placeholder="Type a message for all tiers..."></textarea>
+          <div style="margin-top:8px">
+            <button class="btn btn-acc" onclick="sendAll()">Send To All</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Deriv fetch (placeholder so url_for exists) -->
+      <div class="card">
+        <h3>Deriv: Fetch CSV (optional)</h3>
         <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
           <div class="row">
             <div>
@@ -409,8 +438,8 @@
               <input type="number" name="fetch_count" value="300" min="100" max="5000">
             </div>
           </div>
-          <div style="margin-top:10px"><button class="btn" type="submit">Fetch</button></div>
-          <p class="note">This build does not write CSV; use Backtest above for previews.</p>
+          <div style="margin-top:10px"><button class="btn" type="submit">Fetch (placeholder)</button></div>
+          <p class="note">Use Backtest with "Use Deriv server fetch" or upload CSV. This button is a non-breaking placeholder.</p>
         </form>
       </div>
     </div>
@@ -427,25 +456,15 @@
         </div>
         <hr>
         <div class="kvs" id="liveStats">
-          <div class="kv"><div class="k">Status</div><div class="v" id="lv">—</div></div>
+          <div class="kv"><div class="k">Status</div><div class="v" id="lv">...</div></div>
           <div class="kv"><div class="k">Free</div><div class="v" id="t_free">0</div></div>
           <div class="kv"><div class="k">Basic</div><div class="v" id="t_basic">0</div></div>
           <div class="kv"><div class="k">Pro</div><div class="v" id="t_pro">0</div></div>
           <div class="kv"><div class="k">VIP</div><div class="v" id="t_vip">0</div></div>
           <div class="kv"><div class="k">All</div><div class="v" id="t_all">0</div></div>
         </div>
-        <p class="note small">Tiers daily caps: Free=3, Basic=6, Pro=15, VIP=∞.</p>
+        <p class="note small">Daily caps: Free=3, Basic=6, Pro=15, VIP=∞. Sends permitted only Mon–Fri 08:00–17:00 (local).</p>
       </div>
-
-      <div class="card">
-        <h3>Telegram — Broadcast</h3>
-        <textarea id="broadcastText" placeholder="Message to send to all tiers..."></textarea>
-        <div class="row" style="margin-top:8px">
-          <button class="btn btn-acc" onclick="sendBroadcast()">Send to Free/Basic/Pro/VIP</button>
-        </div>
-        <p class="note small">Respects daily caps by tier.</p>
-      </div>
-
       <div class="card">
         <h3>Quick Links</h3>
         <div class="list">
@@ -454,6 +473,7 @@
           <a class="item" href="{{ url_for('dashboard.live_tally') }}" target="_blank">/live/tally</a>
           <a class="item" href="{{ url_for('dashboard.backtest_last_json') }}" target="_blank">/backtest/last.json</a>
           <a class="item" href="{{ url_for('dashboard.backtest_last_csv') }}" target="_blank">/backtest/last.csv</a>
+          <a class="item" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">/telegram/diag</a>
         </div>
       </div>
     </div>
@@ -463,44 +483,37 @@
 
 <script>
 async function hit(url){
-  try{
-    const r = await fetch(url);
-    const js = await r.json().catch(()=>({}));
-    console.log(url, js);
-    refreshLive();
-  }catch(e){ console.error(e); }
+  try{ const r = await fetch(url); const js = await r.json().catch(()=>({})); console.log(url, js); refreshLive(); }
+  catch(e){ console.error(e); }
 }
-
 async function refreshLive(){
   try{
-    const s = await fetch('/api/status').then(r=>r.json());
+    const s = await fetch('/live/status').then(r=>r.json());
+    const t = await fetch('/live/tally').then(r=>r.json());
     const lv = document.getElementById('lv');
-    if (lv) {
-      const status = s.running ? 'RUNNING' : 'STOPPED';
-      const dbg = s.debug ? ' • DEBUG' : '';
-      lv.textContent = status + dbg;
+    if (lv) lv.textContent = (s && s.status) ? ((s.status.running ? 'RUNNING' : 'STOPPED') + (s.status.debug ? ' · DEBUG' : '')) : '—';
+    if (t && t.tally){
+      const z=t.tally;
+      setVal('t_free', z.free || 0);
+      setVal('t_basic', z.basic || 0);
+      setVal('t_pro', z.pro || 0);
+      setVal('t_vip', z.vip || 0);
+      setVal('t_all', z.all || 0);
     }
-    const t = s.tallies || {};
-    setVal('t_free', t.free || 0);
-    setVal('t_basic', t.basic || 0);
-    setVal('t_pro', t.pro || 0);
-    setVal('t_vip', t.vip || 0);
-    setVal('t_all', t.total || 0);
   }catch(e){console.error(e);}
 }
 function setVal(id,v){ const el=document.getElementById(id); if(el) el.textContent = v; }
 
-async function sendBroadcast(){
-  const text = document.getElementById('broadcastText').value.trim();
-  if(!text){ alert('Enter a message'); return; }
-  const r = await fetch('/api/broadcast', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+async function sendAll(){
+  const text = document.getElementById('allText').value.trim();
+  if (!text) return alert("Type a message first.");
+  const r = await fetch('/api/send_all', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
   const js = await r.json().catch(()=>({}));
-  if(!js.ok){ alert('Some tiers failed: ' + JSON.stringify(js.results||js)); }
+  console.log(js);
   refreshLive();
 }
 
-refreshLive();
-setInterval(refreshLive, 6000);
+refreshLive(); setInterval(refreshLive, 6000);
 </script>
 </body>
 </html>
