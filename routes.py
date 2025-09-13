@@ -1,532 +1,535 @@
-# routes.py — Dashboard blueprint: config, indicators, strategies, users, backtest, Telegram, Live engine
-from __future__ import annotations
+# routes.py
+# Flask routes + dashboard for Pocket-Option Signals
 
+from __future__ import annotations
 import os
 import io
-import csv
 import json
-from functools import wraps
-from typing import Dict, Any, List, Tuple
+import time
+from datetime import datetime
+from typing import Dict, Any, List, Tuple, Optional
 
 from flask import (
-    Blueprint, render_template, request, redirect, url_for, flash,
-    session, send_from_directory, jsonify, Response
+    Blueprint, render_template, request, redirect, url_for, flash, session,
+    send_from_directory, jsonify, current_app
 )
 
-from datetime import datetime, timezone
-
-# App deps
+# ---- Local modules -----------------------------------------------------------
 from utils import (
-    TZ, TIMEZONE, get_config, set_config, within_window,
+    TIMEZONE as UTZ, TZ, within_window,
+    get_config, set_config,
     convert_po_to_deriv, load_csv, fetch_deriv_history,
-    backtest_run, plot_signals, exec_sql
+    compute_indicators, simple_rule_engine, evaluate_signals_outcomes,
+    plot_signals, backtest_run
 )
-from live_engine import ENGINE, DAILY_CAPS, TIER_TO_CHAT, tg_test_all
+from live_engine import ENGINE, tg_test, BOT_TOKEN, TIER_TO_CHAT, DAILY_CAPS
 
+# -----------------------------------------------------------------------------
 bp = Blueprint("dashboard", __name__)
 
-# ---------------------------- Auth helpers -----------------------------------
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 
-def require_login(fn):
-    @wraps(fn)
+# ---------- helpers -----------------------------------------------------------
+def _now_str() -> str:
+    try:
+        return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+def admin_required(fn):
     def wrap(*a, **kw):
         if not session.get("admin"):
-            flash("Please login.", "error")
+            flash("Login required", "error")
             return redirect(url_for("dashboard.login"))
         return fn(*a, **kw)
+    wrap.__name__ = fn.__name__
+    wrap.__doc__ = fn.__doc__
     return wrap
 
-# ---------------------------- Users storage ----------------------------------
-# Create a simple table for users (telegram_id, tier, expires_at)
-exec_sql("""CREATE TABLE IF NOT EXISTS users(
-  telegram_id TEXT PRIMARY KEY,
-  tier TEXT,
-  expires_at TEXT
-)""")
+# ---------- basic / auth ------------------------------------------------------
+@bp.get("/_up")
+def up_check():
+    return jsonify({"ok": True, "ts": int(time.time())})
 
-def list_users() -> List[Dict[str, Any]]:
-    rows = exec_sql("SELECT telegram_id, tier, expires_at FROM users ORDER BY telegram_id", fetch=True) or []
-    return [{"telegram_id": r[0], "tier": r[1], "expires_at": r[2]} for r in rows]
+@bp.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        pw = request.form.get("password", "")
+        if pw == ADMIN_PASSWORD:
+            session["admin"] = True
+            return redirect(url_for("dashboard.view"))
+        flash("Bad password", "error")
+    ctx = _ctx_base()
+    ctx["view"] = "login"
+    return render_template("dashboard.html", **ctx)
 
-def upsert_user(telegram_id: str, tier: str, expires_at: str | None):
-    exec_sql("""INSERT INTO users(telegram_id, tier, expires_at) VALUES(?,?,?)
-                ON CONFLICT(telegram_id) DO UPDATE SET tier=excluded.tier, expires_at=excluded.expires_at""",
-             (telegram_id, tier, expires_at or None))
+@bp.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("dashboard.index"))
 
-def delete_user(telegram_id: str):
-    exec_sql("DELETE FROM users WHERE telegram_id=?", (telegram_id,))
-
-# ---------------------------- Indicator specs --------------------------------
-# Keys must match compute_indicators() in utils.py
-INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
-    "SMA": {"name":"Simple MA","kind":"overlay","params":{"period":20}},
-    "EMA": {"name":"Exponential MA","kind":"overlay","params":{"period":20}},
-    "WMA": {"name":"Weighted MA","kind":"overlay","params":{"period":20}},
-    "SMMA":{"name":"Smoothed MA","kind":"overlay","params":{"period":20}},
-    "TMA": {"name":"Triangular MA","kind":"overlay","params":{"period":20}},
-    "RSI": {"name":"RSI","kind":"oscillator","params":{"period":14}},
-    "STOCH":{"name":"Stochastic","kind":"oscillator","params":{"k":14,"d":3}},
-    "ATR": {"name":"ATR","kind":"oscillator","params":{"period":14}},
-    "ADX": {"name":"ADX/+DI/-DI","kind":"oscillator","params":{"period":14}},
-    "BBANDS":{"name":"Bollinger Bands","kind":"overlay","params":{"period":20,"mult":2.0}},
-    "KELTNER":{"name":"Keltner Channel","kind":"overlay","params":{"period":20,"mult":2.0}},
-    "DONCHIAN":{"name":"Donchian","kind":"overlay","params":{"period":20}},
-    "ENVELOPES":{"name":"Envelopes","kind":"overlay","params":{"period":20,"pct":0.02}},
-    "MACD":{"name":"MACD/Signal/Hist","kind":"oscillator","params":{"fast":12,"slow":26,"signal":9}},
-    "MOMENTUM":{"name":"Momentum","kind":"oscillator","params":{"period":10}},
-    "ROC":{"name":"Rate of Change","kind":"oscillator","params":{"period":10}},
-    "WILLR":{"name":"Williams %R","kind":"oscillator","params":{"period":14}},
-    "CCI":{"name":"CCI","kind":"oscillator","params":{"period":20}},
-    "AROON":{"name":"Aroon Up/Down","kind":"oscillator","params":{"period":14}},
-    "VORTEX":{"name":"Vortex +VI/-VI","kind":"oscillator","params":{"period":14}},
-    "AO":{"name":"Awesome Osc","kind":"oscillator","params":{}},
-    "AC":{"name":"Accelerator Osc","kind":"oscillator","params":{}},
-    "ICHIMOKU":{"name":"Ichimoku (basic)","kind":"overlay","params":{"conversion":9,"base":26,"spanb":52}},
-    "PSAR":{"name":"Parabolic SAR","kind":"overlay","params":{"af":0.02,"af_max":0.2}},
-    "SUPERtrend":{"name":"SuperTrend","kind":"overlay","params":{"period":10,"mult":3.0}},
-    "FRACTAL":{"name":"Fractals (markers)","kind":"overlay","params":{}},
-    "FRACTAL_BANDS":{"name":"Fractal Bands","kind":"overlay","params":{"period":20}},
-    "BEARS":{"name":"Bears Power","kind":"oscillator","params":{"period":13}},
-    "BULLS":{"name":"Bulls Power","kind":"oscillator","params":{"period":13}},
-    "SCHAFF":{"name":"Schaff Trend Cycle","kind":"oscillator","params":{"fast":23,"slow":50,"cycle":10}},
-    "ZIGZAG":{"name":"ZigZag (pct)","kind":"overlay","params":{"pct":5.0}},
-}
-
-# Strategy Defaults
-ALL_STRATEGIES = {
-    "BASE": {"enabled": True},
-    "TREND": {"enabled": True},
-    "CHOP": {"enabled": False},
-    "CUSTOM1": {"enabled": False},
-    "CUSTOM2": {"enabled": False},
-    "CUSTOM3": {"enabled": False},
-}
-
-# 3 custom slots default
-def _default_customs():
-    return [
-        {"_idx": 1, "enabled": False, "mode": "SIMPLE", "lookback": 3, "tol_pct": 0.1},
-        {"_idx": 2, "enabled": False, "mode": "SIMPLE", "lookback": 3, "tol_pct": 0.1},
-        {"_idx": 3, "enabled": False, "mode": "SIMPLE", "lookback": 3, "tol_pct": 0.1},
-    ]
-
-# ---------------------------- Utils ------------------------------------------
-def _cfg() -> Dict[str, Any]:
-    cfg = get_config() or {}
-    # defaults
-    cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":TIMEZONE})
-    cfg.setdefault("live_tf", "M5")
-    cfg.setdefault("live_expiry", "5m")
-    cfg.setdefault("indicators", {})
-    cfg.setdefault("strategies", ALL_STRATEGIES.copy())
-    cfg.setdefault("customs", _default_customs())
-    cfg.setdefault("symbols_raw", ["frxEURUSD","frxGBPUSD"])
-    cfg.setdefault("active_symbols", cfg.get("symbols_raw"))
-    cfg.setdefault("bt", {})  # last backtest meta
-    return cfg
-
-def _save_cfg(cfg: Dict[str, Any]):
-    set_config(cfg)
-
-def _to_list(s: str) -> List[str]:
-    if not s: return []
-    parts = []
-    for p in s.replace(",", " ").split():
-        q = p.strip()
-        if q: parts.append(q)
-    return parts
-
-# ---------------------------- Public pages -----------------------------------
-@bp.route("/")
+@bp.get("/")
 def index():
-    cfg = _cfg()
-    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    return render_template("dashboard.html",
-        view="index",
-        tz=TIMEZONE,
-        now=now,
-        within=within_window(cfg),
-    )
+    cfg = get_config() or {}
+    ctx = _ctx_base(cfg)
+    ctx["view"] = "index"
+    return render_template("dashboard.html", **ctx)
 
-@bp.route("/dashboard")
-def dashboard():
-    cfg = _cfg()
-    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+# ---------- main dashboard ----------------------------------------------------
+@bp.get("/dashboard")
+def view():
+    cfg = get_config() or {}
+    ctx = _ctx_base(cfg)
+    ctx["view"] = "dashboard"
+    return render_template("dashboard.html", **ctx)
 
-    # Build available groups for symbols pickers (Deriv + PO)
-    available_groups = [
-        {"name":"Deriv FRX", "items":[
+def _ctx_base(cfg: Optional[dict] = None) -> dict:
+    cfg = cfg or get_config() or {}
+
+    # Indicator specs: if you keep specs elsewhere you can inject here
+    specs = cfg.get("indicator_specs") or {
+        # Minimal defaults; template iterates this structure
+        "SMA":   {"name":"Simple MA",      "kind":"overlay",   "params":{"period":50}},
+        "EMA":   {"name":"Exponential MA", "kind":"overlay",   "params":{"period":20}},
+        "WMA":   {"name":"Weighted MA",    "kind":"overlay",   "params":{"period":20}},
+        "SMMA":  {"name":"Smoothed MA",    "kind":"overlay",   "params":{"period":20}},
+        "TMA":   {"name":"Triangular MA",  "kind":"overlay",   "params":{"period":20}},
+        "RSI":   {"name":"RSI",            "kind":"oscillator","params":{"period":14, "show": True}},
+        "STOCH": {"name":"Stochastic",     "kind":"oscillator","params":{"k":14,"d":3,"show": True}},
+        "ATR":   {"name":"ATR",            "kind":"oscillator","params":{"period":14, "show": False}},
+        "ADX":   {"name":"ADX/+DI/-DI",    "kind":"oscillator","params":{"period":14, "show": False}},
+    }
+
+    strategies_saved = cfg.get("strategies", {})  # SOURCE OF TRUTH
+    strategies_all = {
+        # Catalog only (labels); no defaults that flip boxes on
+        "BASE":    {"label":"BASE"},
+        "TREND":   {"label":"TREND"},
+        "CHOP":    {"label":"CHOP"},
+        "CUSTOM1": {"label":"CUSTOM1"},
+        "CUSTOM2": {"label":"CUSTOM2"},
+        "CUSTOM3": {"label":"CUSTOM3"},
+    }
+
+    available_groups = cfg.get("available_groups") or [
+        {"title": "Deriv (frx*)", "items": [
             "frxEURUSD","frxGBPUSD","frxUSDJPY","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD",
             "frxEURGBP","frxEURJPY","frxGBPJPY","frxEURAUD","frxAUDJPY","frxCADJPY","frxCHFJPY"
         ]},
-        {"name":"PO majors", "items":[
+        {"title": "PO majors", "items": [
             "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD",
             "EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"
         ]},
     ]
 
-    return render_template("dashboard.html",
-        view="dashboard",
-        tz=TIMEZONE,
-        now=now,
-        within=within_window(cfg),
-        window=cfg.get("window"),
-        live_tf=cfg.get("live_tf","M5"),
-        live_expiry=cfg.get("live_expiry","5m"),
-        symbols_raw=cfg.get("symbols_raw"),
-        active_symbols=cfg.get("active_symbols"),
-        available_groups=available_groups,
-        indicators=cfg.get("indicators"),
-        specs=INDICATOR_SPECS,
-        strategies=cfg.get("strategies"),
-        strategies_all=ALL_STRATEGIES,
-        customs=cfg.get("customs") or _default_customs(),
-        users=list_users(),
-        bt=cfg.get("bt") or {},
-        session=session,
-    )
+    ctx = {
+        "tz": str(UTZ),
+        "now": _now_str(),
+        "within": within_window(cfg),
+        "window": cfg.get("window", {}),
+        "live_tf": cfg.get("live_tf", "M1"),
+        "live_expiry": cfg.get("live_expiry", "5m"),
+        "bt": cfg.get("last_bt", {}),
+        "indicators": cfg.get("indicators", {}),
+        "specs": specs,
+        "strategies": strategies_saved,
+        "strategies_all": strategies_all,
+        "active_symbols": cfg.get("active_symbols", []),
+        "symbols_raw": cfg.get("symbols_raw", []),
+        "available_groups": available_groups,
+        "customs": _inflate_customs(cfg.get("customs", [])),
+        "users": cfg.get("users", []),
+        "session": {"admin": bool(session.get("admin"))},
+    }
+    return ctx
 
-# ---------------------------- Auth -------------------------------------------
-@bp.route("/login", methods=["GET","POST"])
-def login():
-    if request.method == "POST":
-        if (request.form.get("password") or "") == ADMIN_PASSWORD:
-            session["admin"] = True
-            flash("Welcome.", "ok")
-            return redirect(url_for("dashboard.dashboard"))
-        flash("Invalid password.", "error")
-    return render_template("dashboard.html", view="login", session=session)
+def _inflate_customs(items: List[dict]) -> List[dict]:
+    out = []
+    for i in range(3):
+        got = items[i] if i < len(items) else {}
+        got = dict(got)
+        got["_idx"] = i + 1
+        out.append(got)
+    return out
 
-@bp.route("/logout")
-def logout():
-    session.clear()
-    flash("Logged out.")
-    return redirect(url_for("dashboard.index"))
-
-# ---------------------------- Window defaults --------------------------------
-@bp.route("/update/window", methods=["POST"])
-@require_login
+# ---------- window defaults ---------------------------------------------------
+@bp.post("/window/save")
+@admin_required
 def update_window():
-    cfg = _cfg()
-    w = cfg.get("window") or {}
-    w["start"] = request.form.get("start") or w.get("start") or "08:00"
-    w["end"] = request.form.get("end") or w.get("end") or "17:00"
-    w["timezone"] = request.form.get("timezone") or w.get("timezone") or TIMEZONE
-    cfg["window"] = w
-    cfg["live_tf"] = request.form.get("live_tf") or cfg.get("live_tf","M5")
-    cfg["live_expiry"] = request.form.get("live_expiry") or cfg.get("live_expiry","5m")
-    _save_cfg(cfg)
-    flash("Window/defaults saved.")
-    return redirect(url_for("dashboard.dashboard"))
+    cfg = get_config() or {}
+    window = cfg.get("window", {})
+    window["start"] = request.form.get("start") or window.get("start","08:00")
+    window["end"] = request.form.get("end") or window.get("end","17:00")
+    window["timezone"] = request.form.get("timezone") or window.get("timezone", str(UTZ))
+    cfg["window"] = window
 
-# ---------------------------- Symbols ----------------------------------------
-@bp.route("/update/symbols", methods=["POST"])
-@require_login
+    cfg["live_tf"] = (request.form.get("live_tf") or cfg.get("live_tf","M1")).upper()
+    cfg["live_expiry"] = (request.form.get("live_expiry") or cfg.get("live_expiry","5m")).lower()
+
+    set_config(cfg)
+    flash("Window/defaults saved", "ok")
+    return redirect(url_for("dashboard.view"))
+
+# ---------- symbols -----------------------------------------------------------
+@bp.post("/symbols/save")
+@admin_required
 def update_symbols():
-    cfg = _cfg()
-    # multi-selects
-    deriv_sel = request.form.getlist("symbols_deriv_multi")
-    po_sel = request.form.getlist("symbols_po_multi")
-    text = _to_list(request.form.get("symbols_text",""))
-    combined = list({*deriv_sel, *po_sel, *text})
-    cfg["symbols_raw"] = combined
-    if request.form.get("convert_po"):
-        cfg["active_symbols"] = convert_po_to_deriv(combined)
-    else:
-        cfg["active_symbols"] = combined
-    _save_cfg(cfg)
-    flash("Symbols updated.")
-    return redirect(url_for("dashboard.dashboard"))
+    cfg = get_config() or {}
+    active = set(cfg.get("active_symbols", []))
+    raw = set(cfg.get("symbols_raw", []))
 
-# ---------------------------- Indicators -------------------------------------
-@bp.route("/update/indicators", methods=["POST"])
-@require_login
+    deriv_multi = request.form.getlist("symbols_deriv_multi")
+    po_multi = request.form.getlist("symbols_po_multi")
+    text = (request.form.get("symbols_text") or "").replace(",", " ").split()
+    convert = bool(request.form.get("convert_po"))
+
+    chosen = list(set(deriv_multi + po_multi + text))
+    raw = chosen[:]  # keep what user typed/selected for display
+
+    # Normalize to Deriv symbols if requested
+    if convert:
+        chosen = convert_po_to_deriv(chosen)
+
+    cfg["active_symbols"] = chosen
+    cfg["symbols_raw"] = raw
+    set_config(cfg)
+    flash(f"Saved {len(chosen)} symbol(s).", "ok")
+    return redirect(url_for("dashboard.view"))
+
+# ---------- indicators --------------------------------------------------------
+@bp.post("/indicators/save")
+@admin_required
 def update_indicators():
-    cfg = _cfg()
-    out = {}
-    for key, spec in INDICATOR_SPECS.items():
+    cfg = get_config() or {}
+    specs = cfg.get("indicator_specs") or {}   # leave existing descriptions
+
+    # Derive enabled + params from form
+    result: Dict[str, dict] = {}
+    def upd(key: str, params: List[str]):
         enabled = bool(request.form.get(f"ind_{key}_enabled"))
-        entry: Dict[str, Any] = {"enabled": enabled}
-        for p_name, p_def in spec.get("params", {}).items():
-            val = request.form.get(f"ind_{key}_{p_name}", p_def)
-            # cast numbers if possible
-            try:
-                if isinstance(p_def, int): val = int(val)
-                elif isinstance(p_def, float): val = float(val)
-            except Exception:
-                pass
-            entry[p_name] = val
-        out[key] = entry
-    cfg["indicators"] = out
-    _save_cfg(cfg)
-    flash("Indicators saved.")
-    return redirect(url_for("dashboard.dashboard"))
+        entry = {"enabled": enabled}
+        for p in params:
+            form_key = f"ind_{key}_{p}"
+            if form_key in request.form:
+                val = request.form.get(form_key)
+                # cast numerics when possible
+                try:
+                    if val is None: pass
+                    elif val.strip() == "": pass
+                    elif "." in val: val = float(val)
+                    else: val = int(val)
+                except Exception:
+                    pass
+                entry[p] = val
+        result[key] = entry
 
-# ---------------------------- Strategies & defaults --------------------------
-@bp.route("/update/strategies", methods=["POST"])
-@require_login
+    # Accept keys known in specs or from a default list
+    keys = list((specs or {}).keys()) or ["SMA","EMA","WMA","SMMA","TMA","RSI","STOCH","ATR","ADX"]
+    for k in keys:
+        # collect param names if present in specs
+        params = list(((specs.get(k) or {}).get("params") or {}).keys())
+        # if specs absent, fall back to common fields
+        if not params:
+            if k == "RSI": params = ["period","show"]
+            elif k == "STOCH": params = ["k","d","show"]
+            elif k in ("ATR","ADX"): params = ["period","show"]
+            else: params = ["period"]
+        upd(k, params)
+
+    cfg["indicators"] = result
+    set_config(cfg)
+    flash("Indicators saved.", "ok")
+    return redirect(url_for("dashboard.view"))
+
+# ---------- strategies (FIX: no default re-enable) ---------------------------
+@bp.post("/strategies/save")
+@admin_required
 def update_strategies():
-    cfg = _cfg()
-    # toggles
-    st = {}
-    for name in ALL_STRATEGIES.keys():
-        st[name] = {"enabled": bool(request.form.get(f"s_{name}"))}
-    cfg["strategies"] = st
-    # defaults for backtest/live
-    cfg["bt"] = cfg.get("bt") or {}
-    cfg["bt"]["tf"] = request.form.get("bt_tf") or cfg.get("bt",{}).get("tf") or cfg.get("live_tf","M5")
-    cfg["bt"]["expiry"] = request.form.get("bt_expiry") or cfg.get("bt",{}).get("expiry") or cfg.get("live_expiry","5m")
-    cfg["live_tf"] = request.form.get("live_tf") or cfg.get("live_tf","M5")
-    cfg["live_expiry"] = request.form.get("live_expiry") or cfg.get("live_expiry","5m")
-    _save_cfg(cfg)
-    flash("Strategy toggles/defaults saved.")
-    return redirect(url_for("dashboard.dashboard"))
+    cfg = get_config() or {}
+    names = ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"]
 
-# ---------------------------- Custom rules -----------------------------------
-@bp.route("/update/custom", methods=["POST"])
-@require_login
+    new_state = {}
+    for n in names:
+        new_state[n] = {"enabled": bool(request.form.get(f"s_{n}"))}
+    cfg["strategies"] = new_state
+
+    # Also allow defaults on this form
+    if "bt_tf" in request.form:     cfg["bt_tf"] = (request.form.get("bt_tf") or cfg.get("bt_tf","M1")).upper()
+    if "bt_expiry" in request.form: cfg["bt_expiry"] = (request.form.get("bt_expiry") or cfg.get("bt_expiry","5m")).lower()
+    if "live_tf" in request.form:   cfg["live_tf"] = (request.form.get("live_tf") or cfg.get("live_tf","M1")).upper()
+    if "live_expiry" in request.form: cfg["live_expiry"] = (request.form.get("live_expiry") or cfg.get("live_expiry","5m")).lower()
+
+    set_config(cfg)
+    flash("Strategy toggles saved.", "ok")
+    return redirect(url_for("dashboard.view"))
+
+# ---------- custom rule slots -------------------------------------------------
+@bp.post("/custom/save")
+@admin_required
 def update_custom():
-    cfg = _cfg()
-    customs = cfg.get("customs") or _default_customs()
+    slot = int(request.form.get("slot", "1"))
+    cfg = get_config() or {}
+    customs = cfg.get("customs", [])
+    while len(customs) < 3:
+        customs.append({})
+
+    enabled = bool(request.form.get("enabled"))
+    mode = request.form.get("mode","SIMPLE").upper()
+    lookback = int(request.form.get("lookback") or 3)
+    tol_pct = float(request.form.get("tol_pct") or 0.1)
+    simple_buy = request.form.get("simple_buy","")
+    simple_sell = request.form.get("simple_sell","")
+    buy_rule_json = request.form.get("buy_rule_json","")
+    sell_rule_json = request.form.get("sell_rule_json","")
+
+    entry = {
+        "enabled": enabled, "mode": mode, "lookback": lookback, "tol_pct": tol_pct,
+        "simple_buy": simple_buy, "simple_sell": simple_sell
+    }
     try:
-        slot = int(request.form.get("slot") or 1)
+        if buy_rule_json.strip():
+            entry["buy_rule"] = json.loads(buy_rule_json)
+        else:
+            entry.pop("buy_rule", None)
     except Exception:
-        slot = 1
-    idx = max(1, min(3, slot)) - 1
-
-    entry = customs[idx] if idx < len(customs) else {"_idx": idx+1}
-    entry["enabled"] = bool(request.form.get("enabled"))
-    entry["mode"] = request.form.get("mode") or entry.get("mode","SIMPLE")
-    entry["lookback"] = int(request.form.get("lookback") or entry.get("lookback",3))
+        flash(f"CUSTOM{slot} buy_rule JSON invalid; ignored", "error")
     try:
-        entry["tol_pct"] = float(request.form.get("tol_pct") or entry.get("tol_pct",0.1))
+        if sell_rule_json.strip():
+            entry["sell_rule"] = json.loads(sell_rule_json)
+        else:
+            entry.pop("sell_rule", None)
     except Exception:
-        entry["tol_pct"] = entry.get("tol_pct", 0.1)
+        flash(f"CUSTOM{slot} sell_rule JSON invalid; ignored", "error")
 
-    sb = (request.form.get("simple_buy") or "").strip()
-    ss = (request.form.get("simple_sell") or "").strip()
-    if sb: entry["simple_buy"] = sb
-    if ss: entry["simple_sell"] = ss
-
-    # JSON rules if provided
-    bj = (request.form.get("buy_rule_json") or "").strip()
-    sj = (request.form.get("sell_rule_json") or "").strip()
-    try:
-        entry["buy_rule"] = json.loads(bj) if bj else entry.get("buy_rule")
-    except Exception:
-        flash(f"CUSTOM {idx+1}: invalid buy_rule JSON ignored", "error")
-    try:
-        entry["sell_rule"] = json.loads(sj) if sj else entry.get("sell_rule")
-    except Exception:
-        flash(f"CUSTOM {idx+1}: invalid sell_rule JSON ignored", "error")
-
-    if idx >= len(customs):
-        customs.append(entry)
-    else:
-        customs[idx] = entry
-
+    customs[slot-1] = entry
     cfg["customs"] = customs
-    _save_cfg(cfg)
-    flash(f"CUSTOM {idx+1} saved.")
-    return redirect(url_for("dashboard.dashboard"))
+    set_config(cfg)
+    flash(f"CUSTOM {slot} saved.", "ok")
+    return redirect(url_for("dashboard.view"))
 
-# ---------------------------- Users ------------------------------------------
-@bp.route("/users/add", methods=["POST"])
-@require_login
+# ---------- users -------------------------------------------------------------
+@bp.post("/users/add")
+@admin_required
 def users_add():
-    telegram_id = (request.form.get("telegram_id") or "").strip()
-    tier = (request.form.get("tier") or "free").strip().lower()
-    expires_at = (request.form.get("expires_at") or "").strip() or None
-    if not telegram_id:
-        flash("Telegram ID required.", "error")
-        return redirect(url_for("dashboard.dashboard"))
-    upsert_user(telegram_id, tier, expires_at)
-    flash("User saved.")
-    return redirect(url_for("dashboard.dashboard"))
+    cfg = get_config() or {}
+    users = cfg.get("users", [])
+    tid = (request.form.get("telegram_id") or "").strip()
+    tier = (request.form.get("tier") or "free").lower()
+    exp = request.form.get("expires_at") or ""
 
-@bp.route("/users/delete", methods=["POST"])
-@require_login
+    if not tid:
+        flash("Telegram ID required", "error")
+        return redirect(url_for("dashboard.view"))
+
+    # upsert
+    found = None
+    for u in users:
+        if str(u.get("telegram_id")) == str(tid):
+            found = u; break
+    if found:
+        found["tier"] = tier; found["expires_at"] = exp
+    else:
+        users.append({"telegram_id": tid, "tier": tier, "expires_at": exp})
+    cfg["users"] = users
+    set_config(cfg)
+    flash("User saved.", "ok")
+    return redirect(url_for("dashboard.view"))
+
+@bp.post("/users/delete")
+@admin_required
 def users_delete():
-    telegram_id = (request.form.get("telegram_id") or "").strip()
-    if telegram_id:
-        delete_user(telegram_id)
-        flash("User deleted.")
-    return redirect(url_for("dashboard.dashboard"))
+    cfg = get_config() or {}
+    users = cfg.get("users", [])
+    tid = (request.form.get("telegram_id") or "").strip()
+    users = [u for u in users if str(u.get("telegram_id")) != str(tid)]
+    cfg["users"] = users
+    set_config(cfg)
+    flash("User deleted.", "ok")
+    return redirect(url_for("dashboard.view"))
 
-# ---------------------------- Backtest & screenshot --------------------------
-_LAST_JSON = "static/plots/last.json"
-_LAST_CSV  = "static/plots/last.csv"
-
-@bp.route("/backtest", methods=["POST"])
-@require_login
+# ---------- backtest ----------------------------------------------------------
+@bp.post("/backtest")
+@admin_required
 def backtest():
-    cfg = _cfg()
-
-    # Symbols (with optional PO -> Deriv conversion)
-    raw = _to_list(request.form.get("bt_symbols",""))
-    symbols = convert_po_to_deriv(raw) if request.form.get("convert_po_bt") else raw
-    sym = (symbols[0] if symbols else (cfg.get("active_symbols") or ["frxEURUSD"])[0])
-
-    # TF / expiry / strategy
-    tf = (request.form.get("bt_tf") or cfg.get("bt",{}).get("tf") or cfg.get("live_tf") or "M5").upper()
-    expiry = request.form.get("bt_expiry") or cfg.get("bt",{}).get("expiry") or cfg.get("live_expiry") or "5m"
-    strat = (request.form.get("bt_strategy") or "BASE").upper()
-
-    # Inputs
-    up = request.files.get("bt_csv")
+    cfg = get_config() or {}
     use_server = bool(request.form.get("use_server"))
+    tf = (request.form.get("bt_tf") or cfg.get("bt_tf") or cfg.get("live_tf","M1")).upper()
+    expiry = (request.form.get("bt_expiry") or cfg.get("bt_expiry") or cfg.get("live_expiry","5m")).lower()
+    strategy = (request.form.get("bt_strategy") or "BASE").upper()
     count = int(request.form.get("bt_count") or 300)
 
-    df = None
-    warnings: List[str] = []
+    syms_raw = (request.form.get("bt_symbols") or "frxEURUSD").replace(",", " ").split()
+    if bool(request.form.get("convert_po_bt")):
+        syms = convert_po_to_deriv(syms_raw)
+    else:
+        syms = syms_raw[:]
+
+    # Only the first symbol is plotted per-run (simple dashboard UX)
+    sym = syms[0] if syms else "frxEURUSD"
+
+    # Map TF -> seconds
+    tf_map = {
+        "M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,
+        "H1":3600,"H4":14400,"D1":86400
+    }
+    gran = tf_map.get(tf, 60)
 
     try:
-        if up and up.filename:
-            df = load_csv(up)
+        # Load data
+        df = None
+        file = request.files.get("bt_csv")
+        if file and file.filename:
+            # CSV upload
+            df = load_csv(io.BytesIO(file.read()))
+        elif use_server:
+            df = fetch_deriv_history(sym, granularity_sec=gran, days=5)
         else:
-            if not use_server:
-                raise RuntimeError("No CSV uploaded. Tick “Use Deriv server fetch” to fetch candles automatically.")
-            # Map TF → seconds
-            gmap = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
-            gran = gmap.get(tf, 300)
-            # Rough days estimate from requested count so charts look good
-            est_days = max(1, min(10, int((count * gran) / 86400) + 1))
-            df = fetch_deriv_history(sym, granularity_sec=gran, days=est_days)
-            if df is None or df.empty:
-                raise RuntimeError("Empty candle response from Deriv.")
+            raise RuntimeError("No data source selected. Upload CSV or tick 'Use Deriv server fetch'.")
 
-        # Backtest run (indicators are taken from cfg["indicators"])
-        signals, stats = backtest_run(df, strat, cfg.get("indicators") or {}, expiry)
-        plot_name = plot_signals(df, signals, cfg.get("indicators") or {}, strat, tf, expiry)
+        # Indicators config
+        indicators = cfg.get("indicators", {})
+        # Backtest engine
+        signals, stats = backtest_run(df, strategy, indicators, expiry)
 
-        # Persist “last.*” for download links
-        os.makedirs("static/plots", exist_ok=True)
-        with open(_LAST_JSON, "w") as f:
-            json.dump({
-                "symbol": sym, "tf": tf, "expiry": expiry, "strategy": strat,
-                "stats": stats, "signals": [
-                    {"time": s["index"].isoformat(), "dir": s["direction"], "expiry": s["expiry_idx"].isoformat()}
-                    for s in signals
-                ]
-            }, f, indent=2)
-        # CSV: dump the dataframe used
-        df.reset_index().rename(columns={"index":"time"}).to_csv(_LAST_CSV, index=False)
+        # Plot
+        plot_name = plot_signals(df, signals, indicators, strategy, tf, expiry)
 
-        cfg["bt"] = {
-            "tf": tf, "expiry": expiry, "strategy": strat, "plot_name": plot_name,
-            "summary": f"{stats['wins']}W {stats['loss']}L {stats['draw']}D • WR={stats['win_rate']:.1f}%",
-            "warnings": warnings
+        summary = f"W:{stats['wins']} L:{stats['loss']} D:{stats['draw']} | Win%={stats['win_rate']:.1f}%"
+        result = {
+            "tf": tf, "expiry": expiry, "strategy": strategy,
+            "plot_name": plot_name, "summary": summary, "warnings": []
         }
-        _save_cfg(cfg)
-        flash("Backtest complete.")
+        cfg["last_bt"] = result
+        set_config(cfg)
+        flash("Backtest complete.", "ok")
+        return redirect(url_for("dashboard.view"))
     except Exception as e:
-        cfg["bt"] = {"error": str(e)}
-        _save_cfg(cfg)
+        cfg["last_bt"] = {"error": str(e), "tf": tf, "expiry": expiry, "strategy": strategy}
+        set_config(cfg)
         flash(f"Backtest error: {e}", "error")
+        return redirect(url_for("dashboard.view"))
 
-    return redirect(url_for("dashboard.dashboard"))
-
-@bp.route("/backtest/last.json")
-def backtest_last_json():
-    if not os.path.exists(_LAST_JSON):
-        return jsonify({"ok": False, "error": "No backtest yet"}), 404
-    with open(_LAST_JSON, "r") as f:
-        js = json.load(f)
-    return jsonify(js)
-
-@bp.route("/backtest/last.csv")
-def backtest_last_csv():
-    if not os.path.exists(_LAST_CSV):
-        return Response("No backtest yet", status=404)
-    return send_from_directory("static/plots", "last.csv", as_attachment=True, download_name="backtest_last.csv")
-
-@bp.route("/plot/<path:name>")
+@bp.get("/plot/<name>")
 def plot_file(name: str):
-    return send_from_directory("static/plots", name)
+    return send_from_directory("static/plots", name, as_attachment=False)
 
-# ---------------------------- Telegram ---------------------------------------
-@bp.route("/telegram/test", methods=["POST"])
-@require_login
-def telegram_test():
-    # Optional: send custom text to all configured groups
-    text = (request.form.get("text") or "🧪 Test message from dashboard").strip()
-    ok, info = tg_test_all()
-    if ok:
-        flash("Sent test messages (see last send status on live panel).")
-    else:
-        flash(f"Telegram test error: {info}", "error")
-    return redirect(url_for("dashboard.dashboard"))
+@bp.get("/backtest/last.json")
+def backtest_last_json():
+    cfg = get_config() or {}
+    return jsonify(cfg.get("last_bt") or {})
 
-@bp.route("/telegram/diag")
-def telegram_diag():
-    import requests
-    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    out = {
-        "ok": False,
-        "configured_chats": TIER_TO_CHAT,
-        "caps": DAILY_CAPS,
-    }
-    if token:
-        try:
-            r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-            out["getMe"] = r.json()
-            out["ok"] = bool(out["getMe"].get("ok"))
-        except Exception as e:
-            out["getMe"] = {"ok": False, "error": str(e)}
-    return jsonify(out)
+@bp.get("/backtest/last.csv")
+def backtest_last_csv():
+    # stub: you can persist the last df if you want
+    return jsonify({"ok": False, "error": "Not implemented"})
 
-# ---------------------------- Live Engine ------------------------------------
-@bp.route("/live/start")
-@require_login
-def live_start():
-    ok, msg = ENGINE.start()
-    flash(f"Live engine: {msg}")
-    return jsonify({"ok": ok, "status": ENGINE.status()})
-
-@bp.route("/live/stop")
-@require_login
-def live_stop():
-    ok, msg = ENGINE.stop()
-    flash(f"Live engine: {msg}")
-    return jsonify({"ok": ok, "status": ENGINE.status()})
-
-@bp.route("/live/debug/on")
-@require_login
-def live_dbg_on():
-    ENGINE.set_debug(True)
-    return jsonify({"ok": True, "status": ENGINE.status()})
-
-@bp.route("/live/debug/off")
-@require_login
-def live_dbg_off():
-    ENGINE.set_debug(False)
-    return jsonify({"ok": True, "status": ENGINE.status()})
-
-@bp.route("/live/status")
+# ---------- Live engine (UI uses /live/*) ------------------------------------
+@bp.get("/live/status")
 def live_status():
-    return jsonify({"status": ENGINE.status()})
-
-@bp.route("/live/tally")
-def live_tally():
     s = ENGINE.status()
-    # Match the right-column card IDs in your template
-    tallies = s.get("tallies") or s.get("tally", {}).get("by_tier") or {}
-    out = {
-        "tally": {
-            "free": tallies.get("free", 0),
-            "basic": tallies.get("basic", 0),
-            "pro": tallies.get("pro", 0),
-            "vip": tallies.get("vip", 0),
-            "all": tallies.get("all", tallies.get("total", 0)),
-        }
-    }
-    return jsonify(out)
+    return jsonify({"status": {"running": s["running"], "debug": s["debug"], "loop_sleep": s["loop_sleep"]}})
 
-# ---------------------------- Misc -------------------------------------------
-@bp.route("/_up")
-def up_check():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat()+"Z"})
+@bp.get("/live/tally")
+def live_tally():
+    t = ENGINE.tally()
+    by = t["by_tier"]
+    return jsonify({"tally": {
+        "free": by.get("free",0), "basic": by.get("basic",0),
+        "pro": by.get("pro",0), "vip": by.get("vip",0),
+        "all": t.get("total",0)
+    }})
 
-# ---------------------------- Static helpers for template --------------------
-# (the template uses url_for('dashboard.plot_file', name=...))
+@bp.get("/live/start")
+@admin_required
+def live_start():
+    ok, info = ENGINE.start()
+    return jsonify({"ok": ok, "info": info})
+
+@bp.get("/live/stop")
+@admin_required
+def live_stop():
+    ok, info = ENGINE.stop()
+    return jsonify({"ok": ok, "info": info})
+
+@bp.get("/live/debug/on")
+@admin_required
+def live_debug_on():
+    ENGINE.debug = True
+    return jsonify({"ok": True, "debug": True})
+
+@bp.get("/live/debug/off")
+@admin_required
+def live_debug_off():
+    ENGINE.debug = False
+    return jsonify({"ok": True, "debug": False})
+
+# ---------- API used by alternative front-end (kept for compatibility) -------
+@bp.get("/api/status")
+def api_status():
+    t = ENGINE.tally()
+    by = t["by_tier"]
+    s = ENGINE.status()
+    return jsonify({
+        "running": s["running"],
+        "debug": s["debug"],
+        "loop_sleep": s["loop_sleep"],
+        "tallies": {
+            "free": by.get("free",0), "basic": by.get("basic",0),
+            "pro": by.get("pro",0), "vip": by.get("vip",0),
+            "total": t.get("total",0)
+        },
+        "caps": {
+            "free": DAILY_CAPS["free"],
+            "basic": DAILY_CAPS["basic"],
+            "pro": DAILY_CAPS["pro"],
+            "vip": float("inf") if DAILY_CAPS["vip"] is None else DAILY_CAPS["vip"],
+        },
+        "configured_chats": {
+            "free": bool(TIER_TO_CHAT.get("free")),
+            "basic": bool(TIER_TO_CHAT.get("basic")),
+            "pro": bool(TIER_TO_CHAT.get("pro")),
+            "vip": bool(TIER_TO_CHAT.get("vip")),
+        },
+        "last_send_result": s.get("last_send_result", {}),
+        "day": s.get("day","")
+    })
+
+@bp.post("/api/send")
+@admin_required
+def api_send():
+    data = request.get_json(force=True, silent=True) or {}
+    tier = (data.get("tier") or "vip").lower()
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "empty text"}), 400
+    ok, info = ENGINE.send_signal(tier, text)
+    return jsonify({"ok": ok, "result": {"ok": ok, "info": info}, "status": ENGINE.status()})
+
+@bp.get("/api/check_bot")
+def api_check_bot():
+    # Minimal getMe/diag
+    info = {"ok": bool(BOT_TOKEN), "configured_chats": {k: bool(v) for k,v in TIER_TO_CHAT.items()}}
+    return jsonify(info)
+
+@bp.post("/api/test/vip")
+@admin_required
+def api_test_vip():
+    text = (request.get_json(force=True, silent=True) or {}).get("text") or "Test VIP"
+    ok, info = ENGINE.send_signal("vip", text)
+    return jsonify({"ok": ok, "result": {"ok": ok, "info": info}, "status": ENGINE.status()})
+
+# ---------- Telegram diag / test-all -----------------------------------------
+@bp.post("/telegram/test")
+@admin_required
+def telegram_test():
+    ok, info_json = tg_test()   # sends a short message to each configured tier respecting their chat ids
+    flash(f"Telegram test: {info_json}", "ok" if ok else "error")
+    return redirect(url_for("dashboard.view"))
+
+@bp.get("/telegram/diag")
+def telegram_diag():
+    return jsonify({
+        "token_present": bool(BOT_TOKEN),
+        "configured_chats": TIER_TO_CHAT,
+        "caps": DAILY_CAPS
+    })
