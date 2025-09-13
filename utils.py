@@ -106,8 +106,7 @@ def load_csv(csv_file) -> pd.DataFrame:
 
 def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: str|None=None):
     """
-    Only Deriv endpoints (no Yahoo). Tries v4 -> v3 -> explore.
-    Returns pandas DataFrame or raises RuntimeError with info.
+    Deriv-only. Try v4 -> v3 -> explore/candles. Normalize to Open/High/Low/Close (caps).
     """
     import requests
     attempts = []
@@ -125,7 +124,6 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: 
                 candles = js.get("candles") or js.get("history")
                 if candles:
                     d = pd.DataFrame(candles)
-                    # normalize
                     epoch = d.get("epoch") if "epoch" in d else d.get("time")
                     out = pd.DataFrame({
                         "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
@@ -139,10 +137,10 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: 
         except Exception:
             attempts.append((base, "EXC"))
 
-    # Explore (undocumented) fallback
+    # Explore fallback
     try:
         url = "https://api.deriv.com/api/explore/candles"
-        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": count}, timeout=15)
+        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": count, **({"app_id": app_id} if app_id else {})}, timeout=15)
         attempts.append((url, r.status_code))
         if r.ok:
             js = r.json()
