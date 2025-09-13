@@ -1,6 +1,6 @@
 # utils.py — config store, TZ, sqlite, Deriv fetch, symbols, indicator toolkit, backtest & plotting
 import os, json, sqlite3, math
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, time as dtime, timezone
 
 # --------------------------- Timezone ----------------------------------------
 TIMEZONE = os.getenv("APP_TZ", "America/Port_of_Spain")
@@ -74,10 +74,15 @@ DERIV2PO = {v:k for k,v in PO2DERIV.items()}
 def convert_po_to_deriv(symbols):
     out = []
     for s in symbols:
-        s = (s or "").strip().upper()
-        if s.startswith("FRX"): out.append(s if s.startswith("frx") else "frx"+s[3:])
-        elif s.startswith("frx"): out.append(s)
-        else: out.append(PO2DERIV.get(s, s))
+        s = (s or "").strip()
+        if not s:
+            continue
+        u = s.upper()
+        if u.startswith("FRX"):
+            # normalize any FRX* to frx*
+            out.append("frx" + u[3:])
+        else:
+            out.append(PO2DERIV.get(u, s))
     return out
 
 # ============================== Data loading/fetch ============================
@@ -93,69 +98,71 @@ def load_csv(csv_file) -> pd.DataFrame:
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
     return df
 
-def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: str|None=None):
+def _deriv_price_history(symbol: str, granularity: int, count: int = 300, app_id: str | None = None):
     """
-    Only Deriv endpoints (no Yahoo). Tries v4 -> v3 -> explore.
-    Returns pandas DataFrame or raises RuntimeError with info.
+    Deriv-only OHLC fetch. Tries v4 -> v3 -> explore.
+    Correct params: symbol=<frxPAIR>, style=OHLC, granularity, count, app_id (optional).
+    Returns a pandas DataFrame indexed by UTC time or raises RuntimeError with attempts.
     """
     import requests
     attempts = []
-    qs = {"ticks_history": symbol, "style": "candles", "granularity": granularity, "count": count}
+
+    # Correct param is "symbol" (NOT ticks_history)
+    qs = {"symbol": symbol, "style": "OHLC", "granularity": int(granularity), "count": int(count)}
     if app_id:
         qs["app_id"] = app_id
 
-    for base in ("https://api.deriv.com/api/v4/price_history",
-                 "https://api.deriv.com/api/v3/price_history"):
+    def _normalize(js: dict) -> pd.DataFrame:
+        candles = js.get("candles") or js.get("history") or []
+        if not candles:
+            raise ValueError("empty")
+        d = pd.DataFrame(candles)
+        epoch = d["epoch"] if "epoch" in d else d.get("time")
+        out = pd.DataFrame({
+            "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
+            "Open": pd.to_numeric(d.get("open"), errors="coerce"),
+            "High": pd.to_numeric(d.get("high"), errors="coerce"),
+            "Low" : pd.to_numeric(d.get("low"),  errors="coerce"),
+            "Close":pd.to_numeric(d.get("close"),errors="coerce"),
+        }).dropna()
+        if out.empty:
+            raise ValueError("no rows")
+        return out.set_index("time").sort_index()
+
+    for base in (
+        "https://api.deriv.com/api/v4/price_history",
+        "https://api.deriv.com/api/v3/price_history",
+    ):
         try:
             r = requests.get(base, params=qs, timeout=15)
             attempts.append((base, r.status_code))
-            if r.ok and r.headers.get("content-type","").startswith("application/json"):
-                js = r.json()
-                candles = js.get("candles") or js.get("history")
-                if candles:
-                    d = pd.DataFrame(candles)
-                    # normalize
-                    epoch = d.get("epoch") if "epoch" in d else d.get("time")
-                    out = pd.DataFrame({
-                        "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
-                        "Open": pd.to_numeric(d.get("open"), errors="coerce"),
-                        "High": pd.to_numeric(d.get("high"), errors="coerce"),
-                        "Low" : pd.to_numeric(d.get("low"), errors="coerce"),
-                        "Close": pd.to_numeric(d.get("close"), errors="coerce"),
-                    }).dropna()
-                    if not out.empty:
-                        return out.set_index("time").sort_index()
+            if r.ok and "application/json" in r.headers.get("content-type", ""):
+                return _normalize(r.json())
         except Exception:
             attempts.append((base, "EXC"))
 
-    # Explore (undocumented) fallback
+    # Explorer fallback (best-effort)
     try:
         url = "https://api.deriv.com/api/explore/candles"
-        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": count}, timeout=15)
+        r = requests.get(url, params={"symbol": symbol, "granularity": int(granularity), "count": int(count)}, timeout=15)
         attempts.append((url, r.status_code))
-        if r.ok:
-            js = r.json()
-            rows = js.get("candles") or js.get("history") or []
-            d = pd.DataFrame(rows)
-            epoch = d.get("epoch") if "epoch" in d else d.get("time")
-            out = pd.DataFrame({
-                "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
-                "Open": pd.to_numeric(d.get("open"), errors="coerce"),
-                "High": pd.to_numeric(d.get("high"), errors="coerce"),
-                "Low" : pd.to_numeric(d.get("low"), errors="coerce"),
-                "Close": pd.to_numeric(d.get("close"), errors="coerce"),
-            }).dropna()
-            if not out.empty:
-                return out.set_index("time").sort_index()
+        if r.ok and "application/json" in r.headers.get("content-type", ""):
+            return _normalize(r.json())
     except Exception:
         attempts.append(("explore/candles", "EXC"))
 
     app = f" (DERIV_APP_ID={app_id})" if app_id else ""
     raise RuntimeError(f"Deriv fetch failed for symbol={symbol}, granularity={granularity}. Attempts: {attempts}{app}")
 
-def fetch_deriv_history(symbol: str, granularity_sec: int, count: int=300) -> pd.DataFrame:
+def fetch_deriv_history(symbol: str, granularity_sec: int, count: int = 300) -> pd.DataFrame:
+    """
+    Public helper that also allows PO majors and normalizes to Deriv frx*.
+    """
     app_id = os.getenv("DERIV_APP_ID") or os.getenv("DERIV_APPID") or os.getenv("DERIV_APP")
-    return _deriv_price_history(symbol, granularity_sec, count=count, app_id=app_id)
+    sym = (symbol or "").strip()
+    if not sym.lower().startswith("frx"):
+        sym = PO2DERIV.get(sym.upper(), sym)
+    return _deriv_price_history(sym, int(granularity_sec), count=int(count), app_id=app_id)
 
 # ============================== Indicator helpers ============================
 def _sma(s: pd.Series, p: int): return s.rolling(p).mean()
@@ -358,19 +365,20 @@ def _zigzag(close, pct=1.0):
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
     out = {}
     if df is None or df.empty: return out
+    ind_cfg = ind_cfg or {}
     close = df["Close"]
 
-    # Overlays (MAs, bands, etc.)
+    # Overlays (MAs, bands, etc.) — only if explicitly enabled
     if (cfg := ind_cfg.get("SMA", {})).get("enabled"):
-        p = int(cfg.get("period", 50)); out[f"SMA"] = _sma(close, p)
+        p = int(cfg.get("period", 50)); out["SMA"] = _sma(close, p)
     if (cfg := ind_cfg.get("EMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out[f"EMA"] = _ema(close, p)
+        p = int(cfg.get("period", 20)); out["EMA"] = _ema(close, p)
     if (cfg := ind_cfg.get("WMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out[f"WMA"] = _wma(close, p)
+        p = int(cfg.get("period", 20)); out["WMA"] = _wma(close, p)
     if (cfg := ind_cfg.get("SMMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out[f"SMMA"] = _smma(close, p)
+        p = int(cfg.get("period", 20)); out["SMMA"] = _smma(close, p)
     if (cfg := ind_cfg.get("TMA", {})).get("enabled"):
-        p = int(cfg.get("period", 20)); out[f"TMA"] = _tma(close, p)
+        p = int(cfg.get("period", 20)); out["TMA"] = _tma(close, p)
 
     if (cfg := ind_cfg.get("BOLL", {})).get("enabled"):
         p = int(cfg.get("period",20)); mult=float(cfg.get("mult",2))
@@ -403,56 +411,56 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
         st, up, dn = _supertrend(df, p, mult)
         out["ST"]=st; out["ST_UP"]=up; out["ST_DN"]=dn
 
-    # Oscillators (separate panels where appropriate)
-    if (cfg := ind_cfg.get("RSI", {})).get("enabled", cfg.get("show", True)):
-        p=int(cfg.get("period",14)); out["RSI"]=_rsi(close,p)
+    # Oscillators (separate panels where appropriate) — only if enabled
+    if (cfg := ind_cfg.get("RSI", {})).get("enabled") or (ind_cfg.get("RSI", {}).get("show", False)):
+        p=int(ind_cfg.get("RSI", {}).get("period",14)); out["RSI"]=_rsi(close,p)
 
-    if (cfg := ind_cfg.get("STOCH", {})).get("enabled", cfg.get("show", True)):
-        k=int(cfg.get("k",14)); d=int(cfg.get("d",3))
+    if (cfg := ind_cfg.get("STOCH", {})).get("enabled") or (ind_cfg.get("STOCH", {}).get("show", False)):
+        k=int(ind_cfg.get("STOCH", {}).get("k",14)); d=int(ind_cfg.get("STOCH", {}).get("d",3))
         kline,dline = _stoch(df,k,d); out["STOCH_K"]=kline; out["STOCH_D"]=dline
 
-    if (cfg := ind_cfg.get("ATR", {})).get("enabled", cfg.get("show", False)):
+    if (cfg := ind_cfg.get("ATR", {})).get("enabled"):
         p=int(cfg.get("period",14)); out["ATR"]=_atr(df,p)
 
-    if (cfg := ind_cfg.get("ADX", {})).get("enabled", cfg.get("show", False)):
+    if (cfg := ind_cfg.get("ADX", {})).get("enabled"):
         p=int(cfg.get("period",14)); adx, pdm, ndm = _adx(df,p); out["ADX"]=adx; out["+DI"]=pdm; out["-DI"]=ndm
 
-    if (cfg := ind_cfg.get("CCI", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("CCI", {})).get("enabled"):
         p=int(cfg.get("period",20)); out["CCI"]=_cci(df,p)
 
-    if (cfg := ind_cfg.get("MOMENTUM", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("MOMENTUM", {})).get("enabled"):
         p=int(cfg.get("period",10)); out["MOM"]=_momentum(close,p)
 
-    if (cfg := ind_cfg.get("ROC", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("ROC", {})).get("enabled"):
         p=int(cfg.get("period",10)); out["ROC"]=_roc(close,p)
 
-    if (cfg := ind_cfg.get("WILLR", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("WILLR", {})).get("enabled"):
         p=int(cfg.get("period",14)); out["WILLR"]=_willr(df,p)
 
-    if (cfg := ind_cfg.get("VORTEX", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("VORTEX", {})).get("enabled"):
         p=int(cfg.get("period",14)); vip, vin = _vortex(df,p); out["VI+"]=vip; out["VI-"]=vin
 
-    if (cfg := ind_cfg.get("MACD", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("MACD", {})).get("enabled"):
         f=int(cfg.get("fast",12)); s=int(cfg.get("slow",26)); g=int(cfg.get("signal",9))
         macd, sig, hist = _macd(close,f,s,g); out["MACD"]=macd; out["MACD_SIG"]=sig; out["MACD_HIST"]=hist
 
-    if (cfg := ind_cfg.get("AO", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("AO", {})).get("enabled"):
         out["AO"]=_ao(df)
-    if (cfg := ind_cfg.get("AC", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("AC", {})).get("enabled"):
         out["AC"]=_ac(df)
 
-    if (cfg := ind_cfg.get("BEARS", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("BEARS", {})).get("enabled"):
         p=int(cfg.get("period",13)); out["BEARS"]=_bears_power(df,p)
-    if (cfg := ind_cfg.get("BULLS", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("BULLS", {})).get("enabled"):
         p=int(cfg.get("period",13)); out["BULLS"]=_bulls_power(df,p)
 
-    if (cfg := ind_cfg.get("DEMARKER", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("DEMARKER", {})).get("enabled"):
         p=int(cfg.get("period",14)); out["DEMARKER"]=_demarker(df,p)
 
-    if (cfg := ind_cfg.get("OSMA", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("OSMA", {})).get("enabled"):
         out["OSMA"]=_osma(close)
 
-    if (cfg := ind_cfg.get("ZIGZAG", {})).get("enabled", False):
+    if (cfg := ind_cfg.get("ZIGZAG", {})).get("enabled"):
         pct=float(cfg.get("pct",1.0)); out["ZZ"]=_zigzag(close,pct)
 
     return out
@@ -460,6 +468,8 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
 # ============================== Simple strategy / signals ====================
 def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
     signals = []
+    if df is None or df.empty:
+        return signals
     close = df["Close"]
 
     def add(sig_idx, direction, bars):
@@ -471,7 +481,10 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
     rule = (rule_name or "BASE").upper()
 
     if rule == "TREND":
-        sma = ind.get("SMA") or _sma(close,50)
+        sma = ind.get("SMA")
+        if sma is None:
+            # If user didn't enable SMA, don't fabricate one: no signals for TREND
+            return signals
         cross_up = (close.shift(1) <= sma.shift(1)) & (close > sma)
         cross_dn = (close.shift(1) >= sma.shift(1)) & (close < sma)
         for ts in close.index[cross_up.fillna(False)]: add(ts,"BUY",5)
@@ -479,7 +492,10 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         return signals
 
     if rule == "CHOP":
-        rsi = ind.get("RSI") or _rsi(close,14)
+        rsi = ind.get("RSI")
+        if rsi is None:
+            # Respect user toggle; no RSI → no CHOP signals
+            return signals
         bounce_up = (rsi.shift(1) < 50) & (rsi >= 50)
         bounce_dn = (rsi.shift(1) > 50) & (rsi <= 50)
         for ts in rsi.index[bounce_up.fillna(False)]: add(ts,"BUY",3)
@@ -520,7 +536,7 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
     Clear, dark chart:
       - Panel 1: Candles + overlays + markers
       - Panel 2: RSI (if enabled)
-      - Panel 3: Stochastic (if enabled) + a few extra oscillators (MACD hist line, AO) to verify rules
+      - Panel 3: Stochastic (if enabled)
     """
     os.makedirs("static/plots", exist_ok=True)
     if df is None or df.empty:
@@ -554,9 +570,6 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
     ax_price.set_ylabel("Price", color="#e8edf7")
 
     # --- Overlays ---
-    def plot_line(name, col):
-        if name in ind:
-            ax_price.plot(ts, ind[name], col, linewidth=1.2, alpha=.95, label=name)
     overlay_colors = {
         "SMA":"#ffd166", "EMA":"#60a5fa", "WMA":"#f59e0b", "SMMA":"#a78bfa","TMA":"#ef4444",
         "BB_MA":"#9ca3af","BB_UP":"#374151","BB_DN":"#374151",
@@ -598,7 +611,7 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         ax_rsi.legend(loc="upper left", fontsize=9)
         cur_row += 1
 
-    # --- Stochastic panel (separate) + a few extra oscillators for verification
+    # --- Stochastic panel (separate) ---
     if want_sto:
         ax_st = axes[cur_row]
         ax_st.set_facecolor("#0b0f17")
@@ -607,18 +620,12 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         ax_st.axhline(80, color="#6b7280", linewidth=.8, linestyle="--")
         ax_st.axhline(20, color="#6b7280", linewidth=.8, linestyle="--")
         ax_st.set_ylim(0,100); ax_st.set_yticks([0,20,50,80,100])
-        # Add MACD hist line and AO lightly to verify rules (optional)
-        if "MACD_HIST" in ind:
-            ax_st.plot(ts, (ind["MACD_HIST"]*50)+50, color="#93c5fd", linewidth=.8, alpha=.6, label="MACDhist(n)")
-        if "AO" in ind:
-            ao_norm = (ind["AO"] - ind["AO"].rolling(50).min()) / (ind["AO"].rolling(50).max() - ind["AO"].rolling(50).min())
-            ax_st.plot(ts, (ao_norm*100).clip(0,100), color="#a78bfa", linewidth=.8, alpha=.6, label="AO(n)")
         ax_st.legend(loc="upper left", fontsize=9)
 
     # --- Cosmetics ---
     ax_price.grid(color="#111827", linestyle="--", linewidth=0.5)
     axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    for ax in axes: 
+    for ax in axes:
         ax.tick_params(colors="#cbd5e1")
         for spine in ax.spines.values(): spine.set_color("#1f2937")
 
