@@ -18,13 +18,14 @@
     .card{background:var(--card);border-radius:var(--br);padding:16px;border:1px solid rgba(255,255,255,.06)}
     .card h3{margin:0 0 10px 0;font-size:16px}
     label{display:inline-block;margin:6px 0 4px 0;color:#cfd6e7}
-    input[type=text],input[type=number],input[type=time],input[type=date],select,textarea{
+    input[type=text],input[type=number],input[type=datetime-local],input[type=date],
+    input[type=time], select, textarea{
       width:100%;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
-      background:#0d1117;color:var(--text);outline:none;overflow-wrap:anywhere;word-break:break-word;
+      background:#0d1117;color:var(--text);outline:none
     }
-    textarea{min-height:80px}
+    textarea{min-height:90px;max-height:200px;overflow:auto;resize:vertical;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
     .row{display:flex;gap:10px;flex-wrap:wrap}
-    .row > *{flex:1; min-width: 140px}
+    .row > *{flex:1}
     .btn{display:inline-block;background:#212838;color:#eaf1ff;border:1px solid rgba(255,255,255,.15);
       padding:10px 14px;border-radius:10px;cursor:pointer}
     .btn:hover{background:#2a3246}
@@ -40,10 +41,10 @@
     .flash-err{background:#2a0c0c;border:1px solid #b33; color:#ffc9c9}
     img.plot{max-width:100%;border-radius:12px;border:1px solid rgba(255,255,255,.1)}
     hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:14px 0}
-    .kvs{display:grid;grid-template-columns:repeat(4, minmax(0,1fr)); gap:8px}
-    .kvs .kv{background:#0f1420;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px; min-width: 0}
+    .kvs{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px}
+    .kvs .kv{background:#0f1420;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px}
     .kv .k{font-size:12px;color:#aab3c7}
-    .kv .v{font-size:16px;margin-top:2px; overflow-wrap:anywhere}
+    .kv .v{font-size:16px;margin-top:2px}
     .split{display:grid;grid-template-columns:2fr 1fr; gap:16px}
     .right-sticky{position:sticky; top:16px}
     .small{font-size:12px}
@@ -51,7 +52,6 @@
     .list .item{padding:6px 8px;border-radius:10px;background:#0f1420;border:1px solid rgba(255,255,255,.08)}
     .note{font-size:12px;color:#9fb0cc}
     .legend{font-size:12px;color:#96a1b8}
-    .center{display:flex;align-items:center;justify-content:center}
   </style>
 </head>
 <body>
@@ -59,7 +59,7 @@
 
   <!-- Header -->
   <div class="row" style="align-items:center">
-    <div style="flex:1; min-width: 240px">
+    <div style="flex:1">
       <h2 style="margin:0 0 2px 0">Pocket-Option Signals</h2>
       <div class="muted small">
         {% if tz %}Timezone: <b>{{ tz }}</b>{% endif %}
@@ -91,9 +91,7 @@
       <form method="post">
         <label>Password</label>
         <input type="password" name="password" placeholder="••••••••">
-        <div style="margin-top:10px">
-          <button class="btn btn-acc" type="submit">Login</button>
-        </div>
+        <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Login</button></div>
       </form>
     </div>
 
@@ -110,10 +108,7 @@
         <p class="note" style="margin-top:10px">Login to configure dashboard, indicators, strategies, users, Telegram and backtests.</p>
         <a class="btn btn-acc" href="{{ url_for('dashboard.login') }}">Go to Login</a>
       </div>
-      <div class="card">
-        <h3>About</h3>
-        <p>This service sends binary options signals to Telegram channels, supports Deriv/Pocket-Option symbols, backtesting with screenshots, and a live engine with daily caps per tier.</p>
-      </div>
+      <div class="card"><h3>About</h3><p>Signals to Telegram tiers, Deriv/PO symbols, backtesting with screenshots, live engine with daily caps.</p></div>
     </div>
 
   {% elif view == 'dashboard' %}
@@ -124,18 +119,9 @@
         <h3>Trading Window & Defaults</h3>
         <form method="post" action="{{ url_for('dashboard.update_window') }}">
           <div class="row">
-            <div>
-              <label>Start</label>
-              <input type="time" name="start" value="{{ (window or {}).get('start','08:00') }}">
-            </div>
-            <div>
-              <label>End</label>
-              <input type="time" name="end" value="{{ (window or {}).get('end','17:00') }}">
-            </div>
-            <div>
-              <label>Timezone</label>
-              <input type="text" name="timezone" value="{{ (window or {}).get('timezone', tz or 'UTC') }}">
-            </div>
+            <div><label>Start</label><input type="time" name="start" value="{{ (window or {}).get('start','08:00') }}"></div>
+            <div><label>End</label><input type="time" name="end" value="{{ (window or {}).get('end','17:00') }}"></div>
+            <div><label>Timezone</label><input type="text" name="timezone" value="{{ (window or {}).get('timezone', tz or 'UTC') }}"></div>
           </div>
           <hr>
           <div class="row">
@@ -156,9 +142,7 @@
               </select>
             </div>
           </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save</button>
-          </div>
+          <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save</button></div>
         </form>
       </div>
 
@@ -189,13 +173,9 @@
               <label>Free text (comma/space)</label>
               <input type="text" name="symbols_text" placeholder="frxEURUSD EURUSD GBPUSD ..." value="{{ (symbols_raw or [])|join(' ') }}">
             </div>
-            <div style="align-self:flex-end">
-              <label class="small"><input type="checkbox" name="convert_po" /> Convert PO→Deriv</label>
-            </div>
+            <div style="align-self:flex-end"><label class="small"><input type="checkbox" name="convert_po" /> Convert PO→Deriv</label></div>
           </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save Symbols</button>
-          </div>
+          <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save Symbols</button></div>
         </form>
       </div>
 
@@ -208,10 +188,8 @@
               {% set cfg = (indicators or {}).get(key, {}) %}
               <div class="card" style="padding:12px">
                 <div class="row" style="align-items:center">
-                  <div style="flex:0">
-                    <input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if cfg.get('enabled') else '' }}>
-                  </div>
-                  <div style="flex:1; min-width: 120px">
+                  <div style="flex:0"><input type="checkbox" name="ind_{{key}}_enabled" {{ 'checked' if cfg.get('enabled') else '' }}></div>
+                  <div style="flex:1">
                     <b>{{ spec.name or spec.label or key }}</b>
                     <div class="small legend muted">{{ spec.kind if spec.kind else '' }}</div>
                   </div>
@@ -230,23 +208,18 @@
               </div>
             {% endfor %}
           </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save Indicators</button>
-          </div>
-          <p class="note" style="margin-top:6px">Only <u>enabled</u> indicators render on screenshots and are respected by strategies/custom rules.</p>
+          <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save Indicators</button></div>
+          <p class="note" style="margin-top:6px">Only enabled indicators render on screenshots and are respected by strategies.</p>
         </form>
       </div>
 
-      <!-- Strategies + Custom rules -->
+      <!-- Strategies -->
       <div class="card">
         <h3>Strategies & Custom</h3>
         <form method="post" action="{{ url_for('dashboard.update_strategies') }}">
           <div class="list">
             {% for name, entry in strategies_all.items() %}
-              <label class="item small">
-                <input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled')) else '' }}>
-                {{ name }}
-              </label>
+              <label class="item small"><input type="checkbox" name="s_{{name}}" {{ 'checked' if (strategies.get(name,{}).get('enabled') or entry.get('enabled')) else '' }}> {{ name }}</label>
             {% endfor %}
           </div>
           <hr>
@@ -284,10 +257,58 @@
               </select>
             </div>
           </div>
-          <div style="margin-top:10px">
-            <button class="btn btn-acc" type="submit">Save Strategy Toggles & Defaults</button>
-          </div>
+          <div style="margin-top:10px"><button class="btn btn-acc" type="submit">Save Strategy Toggles & Defaults</button></div>
         </form>
+
+        <!-- Custom slots -->
+        <hr>
+        <div class="grid g-3">
+          {% for c in customs %}
+          <div class="card" style="padding:12px">
+            <h3 style="margin-bottom:8px">CUSTOM {{ c._idx }}</h3>
+            <form method="post" action="{{ url_for('dashboard.update_custom') }}">
+              <input type="hidden" name="slot" value="{{ c._idx }}">
+              <label class="small"><input type="checkbox" name="enabled" {{ 'checked' if c.get('enabled') else '' }}> Enabled</label>
+              <div class="row">
+                <div>
+                  <label>Mode</label>
+                  <select name="mode">
+                    <option value="SIMPLE" {{ 'selected' if (c.get('mode','SIMPLE')=='SIMPLE') else '' }}>SIMPLE</option>
+                    <option value="JSON" {{ 'selected' if (c.get('mode')=='JSON') else '' }}>JSON</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Lookback</label>
+                  <input type="number" name="lookback" value="{{ c.get('lookback',3) }}">
+                </div>
+                <div>
+                  <label>Tolerance %</label>
+                  <input type="text" name="tol_pct" value="{{ c.get('tol_pct',0.1) }}">
+                </div>
+              </div>
+              <div class="row">
+                <div>
+                  <label>Simple BUY (text)</label>
+                  <textarea name="simple_buy" placeholder="e.g. RSI < 30 AND StochK cross up">{{ c.get('simple_buy','') }}</textarea>
+                </div>
+                <div>
+                  <label>Simple SELL (text)</label>
+                  <textarea name="simple_sell" placeholder="e.g. RSI > 70 AND StochK cross down">{{ c.get('simple_sell','') }}</textarea>
+                </div>
+              </div>
+              <div>
+                <label>JSON buy_rule</label>
+                <textarea name="buy_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":"<","v":30}]}'>{{ c.get('buy_rule')|tojson if c.get('buy_rule') else '' }}</textarea>
+              </div>
+              <div>
+                <label>JSON sell_rule</label>
+                <textarea name="sell_rule_json" class="small" placeholder='{"all":[{"ind":"RSI","op":">","v":70}]}'>{{ c.get('sell_rule')|tojson if c.get('sell_rule') else '' }}</textarea>
+              </div>
+              <div style="margin-top:8px"><button class="btn btn-acc" type="submit">Save CUSTOM {{ c._idx }}</button></div>
+            </form>
+          </div>
+          {% endfor %}
+        </div>
       </div>
 
       <!-- Backtest + Screenshot -->
@@ -321,8 +342,9 @@
             <div>
               <label>Strategy</label>
               <select name="bt_strategy">
-                <option>BASE</option><option>TREND</option><option>CHOP</option>
-                <option>CUSTOM1</option><option>CUSTOM2</option><option>CUSTOM3</option>
+                <option {{ 'selected' if (bt.strategy if bt else 'BASE')=='BASE' else '' }}>BASE</option>
+                <option {{ 'selected' if (bt.strategy if bt else '')=='TREND' else '' }}>TREND</option>
+                <option {{ 'selected' if (bt.strategy if bt else '')=='CHOP' else '' }}>CHOP</option>
               </select>
             </div>
           </div>
@@ -334,16 +356,13 @@
             <div style="flex:0.6">
               <label class="small"><input type="checkbox" name="use_server"> Use Deriv server fetch</label>
               <div class="row">
-                <div>
-                  <label>Target candles</label>
-                  <input type="number" name="bt_count" value="300" min="100" max="5000">
-                </div>
+                <div><label>Candles</label><input type="number" name="bt_count" value="300" min="100" max="5000"></div>
               </div>
             </div>
           </div>
           <div style="margin-top:10px">
             <button class="btn btn-acc" type="submit">Run Backtest & Show Screenshot</button>
-            <span class="note">Plot shows ONLY enabled indicators + BUY/SELL markers + shaded expiry.</span>
+            <span class="note">Plot shows enabled indicators + BUY/SELL markers.</span>
           </div>
         </form>
 
@@ -356,11 +375,7 @@
                 <div class="kv"><div class="k">Expiry</div><div class="v">{{ bt.expiry }}</div></div>
                 <div class="kv"><div class="k">Strategy</div><div class="v">{{ bt.strategy }}</div></div>
               </div>
-              <p class="note" style="margin-top:6px">
-                Summary: {{ bt.summary }}{% if bt.warnings %} • <span class="warn">{{ bt.warnings|join('; ') }}</span>{% endif %}
-              </p>
-              <p><a href="{{ url_for('dashboard.backtest_last_json') }}">Last JSON</a> •
-                 <a href="{{ url_for('dashboard.backtest_last_csv') }}">Last CSV</a></p>
+              <p class="note" style="margin-top:6px">Summary: {{ bt.summary }}{% if bt.warnings %} • <span class="warn">{{ bt.warnings|join('; ') }}</span>{% endif %}</p>
             </div>
           </div>
           <img class="plot" src="{{ url_for('dashboard.plot_file', name=bt.plot_name) }}" alt="Backtest plot">
@@ -369,19 +384,35 @@
         {% endif %}
       </div>
 
-      <!-- Telegram -->
+      <!-- Deriv fetch helper (placeholder to avoid 500) -->
       <div class="card">
-        <h3>Telegram</h3>
-        <div class="row">
-          <form method="post" action="{{ url_for('dashboard.telegram_test') }}">
-            <button class="btn btn-ok" type="submit">Send Test</button>
-          </form>
-          <a class="btn" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">Open Diagnostics (JSON)</a>
-        </div>
-        <p class="note">Env needed: <code>TELEGRAM_BOT_TOKEN</code>, channels:
-          <code>TELEGRAM_CHAT_FREE</code>, <code>_BASIC</code>, <code>_PRO</code>, <code>_VIP</code>.</p>
+        <h3>Deriv: Fetch CSV (helper)</h3>
+        <form method="post" action="{{ url_for('dashboard.deriv_fetch') }}">
+          <div class="row">
+            <div>
+              <label>Symbols (space/comma)</label>
+              <input type="text" name="fetch_symbols" placeholder="frxEURUSD frxGBPUSD ...">
+              <label class="small"><input type="checkbox" name="convert_po_fetch"> Convert PO→Deriv</label>
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>TF</label>
+              <select name="fetch_tf">
+                {% for t in ['M1','M2','M3','M5','M10','M15','M30','H1','H4','D1'] %}
+                  <option>{{ t }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div>
+              <label>Candles</label>
+              <input type="number" name="fetch_count" value="300" min="100" max="5000">
+            </div>
+          </div>
+          <div style="margin-top:10px"><button class="btn" type="submit">Fetch</button></div>
+          <p class="note">This build does not write CSV; use Backtest above for previews.</p>
+        </form>
       </div>
-
     </div>
 
     <!-- Right column -->
@@ -396,23 +427,33 @@
         </div>
         <hr>
         <div class="kvs" id="liveStats">
-          <div class="kv"><div class="k">Status</div><div class="v" id="lv">...</div></div>
+          <div class="kv"><div class="k">Status</div><div class="v" id="lv">—</div></div>
           <div class="kv"><div class="k">Free</div><div class="v" id="t_free">0</div></div>
           <div class="kv"><div class="k">Basic</div><div class="v" id="t_basic">0</div></div>
           <div class="kv"><div class="k">Pro</div><div class="v" id="t_pro">0</div></div>
           <div class="kv"><div class="k">VIP</div><div class="v" id="t_vip">0</div></div>
           <div class="kv"><div class="k">All</div><div class="v" id="t_all">0</div></div>
         </div>
-        <p class="note small">Tiers daily caps: Free=3, Basic=6, Pro=15, VIP=∞ (enforced in live engine).</p>
+        <p class="note small">Tiers daily caps: Free=3, Basic=6, Pro=15, VIP=∞.</p>
       </div>
+
+      <div class="card">
+        <h3>Telegram — Broadcast</h3>
+        <textarea id="broadcastText" placeholder="Message to send to all tiers..."></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="btn btn-acc" onclick="sendBroadcast()">Send to Free/Basic/Pro/VIP</button>
+        </div>
+        <p class="note small">Respects daily caps by tier.</p>
+      </div>
+
       <div class="card">
         <h3>Quick Links</h3>
         <div class="list">
+          <a class="item" href="{{ url_for('dashboard.up_check') }}" target="_blank">/_up</a>
           <a class="item" href="{{ url_for('dashboard.live_status') }}" target="_blank">/live/status</a>
           <a class="item" href="{{ url_for('dashboard.live_tally') }}" target="_blank">/live/tally</a>
           <a class="item" href="{{ url_for('dashboard.backtest_last_json') }}" target="_blank">/backtest/last.json</a>
           <a class="item" href="{{ url_for('dashboard.backtest_last_csv') }}" target="_blank">/backtest/last.csv</a>
-          <a class="item" href="{{ url_for('dashboard.telegram_diag') }}" target="_blank">/telegram/diag</a>
         </div>
       </div>
     </div>
@@ -429,23 +470,35 @@ async function hit(url){
     refreshLive();
   }catch(e){ console.error(e); }
 }
+
 async function refreshLive(){
   try{
-    const s = await fetch('/live/status').then(r=>r.json());
-    const t = await fetch('/live/tally').then(r=>r.json());
+    const s = await fetch('/api/status').then(r=>r.json());
     const lv = document.getElementById('lv');
-    if (lv) lv.textContent = (s && s.status) ? (s.status.running ? 'RUNNING' : 'STOPPED') : '—';
-    if (t && t.tally){
-      const z=t.tally;
-      setVal('t_free', z.free || 0);
-      setVal('t_basic', z.basic || 0);
-      setVal('t_pro', z.pro || 0);
-      setVal('t_vip', z.vip || 0);
-      setVal('t_all', z.all || 0);
+    if (lv) {
+      const status = s.running ? 'RUNNING' : 'STOPPED';
+      const dbg = s.debug ? ' • DEBUG' : '';
+      lv.textContent = status + dbg;
     }
+    const t = s.tallies || {};
+    setVal('t_free', t.free || 0);
+    setVal('t_basic', t.basic || 0);
+    setVal('t_pro', t.pro || 0);
+    setVal('t_vip', t.vip || 0);
+    setVal('t_all', t.total || 0);
   }catch(e){console.error(e);}
 }
 function setVal(id,v){ const el=document.getElementById(id); if(el) el.textContent = v; }
+
+async function sendBroadcast(){
+  const text = document.getElementById('broadcastText').value.trim();
+  if(!text){ alert('Enter a message'); return; }
+  const r = await fetch('/api/broadcast', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+  const js = await r.json().catch(()=>({}));
+  if(!js.ok){ alert('Some tiers failed: ' + JSON.stringify(js.results||js)); }
+  refreshLive();
+}
+
 refreshLive();
 setInterval(refreshLive, 6000);
 </script>
