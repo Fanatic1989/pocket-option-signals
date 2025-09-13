@@ -1,5 +1,5 @@
 # utils.py — config store, TZ, sqlite, Deriv fetch (REST + WebSocket fallback),
-# symbols, backtest helpers, plotting (clear markers + shaded expiry)
+# symbols, backtest helpers, plotting (separate RSI & Stochastic panels)
 import os, json, sqlite3
 from datetime import datetime, time as dtime, timezone
 import pandas as pd
@@ -60,41 +60,28 @@ def set_config(cfg: dict):
     )
 
 # -----------------------------------------------------------------------------
-# Safe coercion helpers (avoid int(dict) crashes)
+# Safe coercion helpers
 # -----------------------------------------------------------------------------
 def safe_int(x, default=0):
-    """Coerce possibly dict/str/float to int; supports {'sec':60}, {'granularity':300}, etc."""
-    if x is None:
-        return int(default)
-    if isinstance(x, (int, np.integer)):
-        return int(x)
-    if isinstance(x, (float, np.floating)):
-        return int(x)
+    if x is None: return int(default)
+    if isinstance(x, (int, np.integer)): return int(x)
+    if isinstance(x, (float, np.floating)): return int(x)
     if isinstance(x, str):
-        try:
-            return int(float(x.strip()))
-        except Exception:
-            return int(default)
+        try: return int(float(x.strip()))
+        except Exception: return int(default)
     if isinstance(x, dict):
         for k in ("sec","secs","seconds","granularity","value","v"):
-            if k in x:
-                return safe_int(x[k], default)
+            if k in x: return safe_int(x[k], default)
         for v in x.values():
-            try:
-                return safe_int(v, default)
-            except Exception:
-                pass
+            try: return safe_int(v, default)
+            except Exception: pass
         return int(default)
-    try:
-        return int(x)
-    except Exception:
-        return int(default)
+    try: return int(x)
+    except Exception: return int(default)
 
 def safe_app_id(s):
-    if not s:
-        return "99185"
-    if isinstance(s, (int, np.integer)):
-        return str(int(s))
+    if not s: return "99185"
+    if isinstance(s, (int, np.integer)): return str(int(s))
     if isinstance(s, str):
         digits = "".join(ch for ch in s if ch.isdigit())
         return digits or "99185"
@@ -302,7 +289,6 @@ def _fetch_deriv_ws(symbol: str, granularity_sec, days, attempts_log: list) -> p
         return None
 
 def fetch_deriv_history(symbol: str, granularity_sec, days=5) -> pd.DataFrame:
-    """Deriv-only fetch: REST first, then WebSocket fallback."""
     attempts = []
     df = _fetch_deriv_rest(symbol, granularity_sec, days, attempts)
     if df is None or df.empty:
@@ -321,40 +307,30 @@ def fetch_deriv_history(symbol: str, granularity_sec, days=5) -> pd.DataFrame:
 EXPIRY_TO_BARS = {"1m":1,"3m":3,"5m":5,"10m":10,"30m":30,"1h":60,"4h":240}
 
 def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
-    """Robust indicator builder (numbers/strings/lists/tuples/dicts)."""
     out = {}
     close = df["Close"]
 
     def _to_period_list(v):
-        if v is None:
-            return []
+        if v is None: return []
         if isinstance(v, (int, float, np.integer, np.floating, str)):
-            try:
-                return [int(float(str(v)))]
-            except Exception:
-                return []
+            try: return [int(float(str(v)))]
+            except Exception: return []
         if isinstance(v, (list, tuple)):
             outv = []
             for x in v:
-                try:
-                    outv.append(int(float(str(x))))
-                except Exception:
-                    pass
+                try: outv.append(int(float(str(x))))
+                except Exception: pass
             return outv
         if isinstance(v, dict):
             outv = []
             for x in v.values():
-                try:
-                    outv.append(int(float(str(x))))
-                except Exception:
-                    pass
+                try: outv.append(int(float(str(x))))
+                except Exception: pass
             return outv
-        try:
-            return [int(v)]
-        except Exception:
-            return []
+        try: return [int(v)]
+        except Exception: return []
 
-    # MAs
+    # MAs (only draw what’s enabled)
     if "SMA" in ind_cfg:
         for p in _to_period_list(ind_cfg["SMA"]):
             if p > 0:
@@ -381,12 +357,8 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
 
     # Oscillators
     if "RSI" in ind_cfg and isinstance(ind_cfg["RSI"], dict) and ind_cfg["RSI"].get("show", True):
-        pr = 14
-        try:
-            pr_list = _to_period_list(ind_cfg["RSI"].get("period", 14))
-            pr = max(1, pr_list[0]) if pr_list else 14
-        except Exception:
-            pr = 14
+        pr_list = _to_period_list(ind_cfg["RSI"].get("period", 14)) or [14]
+        pr = max(1, pr_list[0])
         delta = close.diff()
         up = delta.clip(lower=0).ewm(alpha=1 / pr, adjust=False).mean()
         down = (-delta.clip(upper=0)).ewm(alpha=1 / pr, adjust=False).mean()
@@ -414,9 +386,9 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         exp_pos = min(pos + max(1,bars), len(all_idx)-1)
         signals.append({"index": sig_idx, "direction": direction, "expiry_idx": all_idx[exp_pos]})
 
-    rule = (rule_name or "").upper()
+    r = (rule_name or "").upper()
 
-    if rule == "TREND":
+    if r == "TREND":
         sma50 = ind.get("SMA(50)")
         if sma50 is None: return signals
         above = close > sma50
@@ -426,7 +398,7 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         for ts, _ in cross_dn[cross_dn].items(): add(ts, "SELL", 5)
         return signals
 
-    if rule == "CHOP":
+    if r == "CHOP":
         rsi = ind.get("RSI")
         if rsi is None: return signals
         bounce_up = (rsi.shift(1) < 50) & (rsi >= 50)
@@ -435,7 +407,7 @@ def simple_rule_engine(df: pd.DataFrame, ind: dict, rule_name: str):
         for ts in rsi.index[bounce_dn.fillna(False)]: add(ts, "SELL", 3)
         return signals
 
-    # BASE / CUSTOM: Stochastic cross
+    # BASE / CUSTOM: stochastic cross
     k = ind.get("STOCH_K"); d = ind.get("STOCH_D")
     if k is not None and d is not None:
         cross_up = (k.shift(1) < d.shift(1)) & (k >= d)
@@ -464,7 +436,7 @@ def evaluate_signals_outcomes(df: pd.DataFrame, signals: list) -> dict:
             "win_rate": (wins*100.0/max(1,wins+loss))}
 
 # -----------------------------------------------------------------------------
-# Plotting — clear, high-contrast (last 180 candles, markers + shaded expiry)
+# Plotting — separate panels (RSI panel and Stochastic panel)
 # -----------------------------------------------------------------------------
 def _limit_df(df: pd.DataFrame, last_n: int = 180) -> pd.DataFrame:
     if df is None or df.empty: return df
@@ -473,11 +445,10 @@ def _limit_df(df: pd.DataFrame, last_n: int = 180) -> pd.DataFrame:
 
 def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
     """
-    Clean plot:
-      • last 180 candles
-      • BUY(▲)/SELL(▼) markers (large, white edge)
-      • shaded entry→expiry region
-      • RSI/Stochastic lower panel (only if enabled)
+    • last 180 candles
+    • BUY(▲)/SELL(▼) markers + shaded expiry
+    • MA overlays only for indicators enabled in config
+    • RSI and Stochastic each get their own panel if present
     """
     import matplotlib.dates as mdates
     os.makedirs("static/plots", exist_ok=True)
@@ -495,20 +466,45 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
     out_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{strategy}_{tf}.png"
     path = os.path.join("static","plots", out_name)
 
-    # Prefer mplfinance
+    has_rsi = "RSI" in ind
+    has_sto = ("STOCH_K" in ind) and ("STOCH_D" in ind)
+
+    # ---------- mplfinance path ----------
     if HAVE_MPLFIN:
         addplots = []
+
+        # Overlays on price panel only for enabled MAs
         for name, series in ind.items():
             if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
                 addplots.append(mpf.make_addplot(series, panel=0, width=1.15, alpha=0.95))
 
-        use_osc = ("RSI" in ind) or ("STOCH_K" in ind and "STOCH_D" in ind)
-        if "RSI" in ind:
-            addplots.append(mpf.make_addplot(ind["RSI"], panel=1, ylim=(0,100),
-                                             width=1.1, secondary_y=False, color="#60a5fa"))
-        if "STOCH_K" in ind and "STOCH_D" in ind:
-            addplots.append(mpf.make_addplot(ind["STOCH_K"], panel=1, width=1.0, color="#22c55e"))
-            addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=1, width=1.0, color="#f59e0b"))
+        # Decide panel indices
+        panels = [3]  # price panel ratio fixed later
+        panel_map = {}
+        panel_ratios = [4]  # price height
+
+        next_panel_idx = 1
+        if has_rsi:
+            panel_map["RSI"] = next_panel_idx
+            panel_ratios.append(1)   # RSI panel
+            next_panel_idx += 1
+        if has_sto:
+            panel_map["STOCH"] = next_panel_idx
+            panel_ratios.append(1)   # Stoch panel
+            next_panel_idx += 1
+
+        # Add RSI in its own panel
+        if has_rsi:
+            addplots.append(
+                mpf.make_addplot(ind["RSI"], panel=panel_map["RSI"],
+                                 ylim=(0,100), width=1.1, secondary_y=False, color="#60a5fa")
+            )
+
+        # Add Stochastic in its own panel
+        if has_sto:
+            pidx = panel_map["STOCH"]
+            addplots.append(mpf.make_addplot(ind["STOCH_K"], panel=pidx, width=1.0, color="#22c55e"))
+            addplots.append(mpf.make_addplot(ind["STOCH_D"], panel=pidx, width=1.0, color="#f59e0b"))
 
         style = mpf.make_mpf_style(
             base_mpf_style="yahoo",
@@ -520,12 +516,13 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
 
         fig, axlist = mpf.plot(
             df, type="candle", style=style, addplot=addplots, returnfig=True,
-            volume=False, figsize=(15, 9 if use_osc else 7),
-            panel_ratios=(3,1) if use_osc else None,
+            volume=False, figsize=(15, 8 + (2 if has_rsi else 0) + (2 if has_sto else 0)),
+            panel_ratios=tuple(panel_ratios) if len(panel_ratios) > 1 else None,
             tight_layout=True, title=f"{strategy} • TF={tf} • Exp={expiry}"
         )
         ax_price = axlist[0]
 
+        # BUY/SELL markers + shaded expiry
         if signals:
             buy_x, buy_y, sell_x, sell_y = [], [], [], []
             for s in signals:
@@ -553,46 +550,69 @@ def plot_signals(df, signals, indicators, strategy, tf, expiry) -> str:
         plt.close(fig)
         return out_name
 
-    # Fallback matplotlib
-    fig, ax = plt.subplots(1,1,figsize=(15,7), dpi=200)
+    # ---------- Fallback matplotlib ----------
+    panels = 1 + int(has_rsi) + int(has_sto)
+    heights = [4] + ([1] if has_rsi else []) + ([1] if has_sto else [])
+    fig, axes = plt.subplots(
+        panels, 1, figsize=(15, 8 + (2 if has_rsi else 0) + (2 if has_sto else 0)),
+        dpi=200, sharex=True, gridspec_kw={"height_ratios": heights}
+    )
+    if panels == 1: axes = [axes]
+    ax_price = axes[0]
+
+    # candles
     import matplotlib.dates as mdates
     ts = mdates.date2num(df.index.to_pydatetime())
     for t,(o,h,l,c) in enumerate(zip(df["Open"], df["High"], df["Low"], df["Close"])):
         x = ts[t]
         color = "#16a34a" if c>=o else "#ef4444"
-        ax.vlines(x, l, h, color=color, linewidth=1.0, alpha=.95)
-        ax.add_patch(plt.Rectangle((x-0.0022, min(o,c)), 0.0044, max(abs(c-o),1e-6),
-                                   facecolor=color, edgecolor=color, linewidth=.9, alpha=.95))
+        ax_price.vlines(x, l, h, color=color, linewidth=1.0, alpha=.95)
+        ax_price.add_patch(plt.Rectangle((x-0.0022, min(o,c)), 0.0044, max(abs(c-o),1e-6),
+                                         facecolor=color, edgecolor=color, linewidth=.9, alpha=.95))
+
+    # MA overlays only
     for name, series in ind.items():
         if name.startswith(("SMA(","EMA(","WMA(","SMMA(","TMA(")):
-            ax.plot(series.index, series.values, linewidth=1.25, alpha=.95)
+            ax_price.plot(series.index, series.values, linewidth=1.25, alpha=.95)
+
+    # markers + expiry
     if signals:
         for s in signals:
             idx = s["index"]
             if idx in df.index:
                 y = float(df.loc[idx,"Close"])
-                ax.scatter([mdates.date2num(idx)], [y],
-                           marker="^" if s["direction"]=="BUY" else "v",
-                           s=140, color="#22c55e" if s["direction"]=="BUY" else "#ef4444",
-                           edgecolors="white", linewidths=.6, zorder=5)
+                ax_price.scatter([mdates.date2num(idx)], [y],
+                                 marker="^" if s["direction"]=="BUY" else "v",
+                                 s=140, color="#22c55e" if s["direction"]=="BUY" else "#ef4444",
+                                 edgecolors="white", linewidths=.6, zorder=5)
                 ex = s.get("expiry_idx")
                 if ex in df.index:
-                    ax.axvspan(mdates.date2num(idx), mdates.date2num(ex),
-                               alpha=.15, color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
-    ax.set_title(f"{strategy} • TF={tf} • Exp={expiry}")
-    ax.set_ylabel("Price"); ax.grid(alpha=.25)
+                    ax_price.axvspan(mdates.date2num(idx), mdates.date2num(ex),
+                                     alpha=.15, color="#22c55e" if s["direction"]=="BUY" else "#ef4444")
+
+    cur_row = 1
+    if has_rsi:
+        ax_rsi = axes[cur_row]; cur_row += 1
+        ax_rsi.plot(ind["RSI"].index, ind["RSI"].values, color="#60a5fa", linewidth=1.1)
+        ax_rsi.set_ylim(0,100); ax_rsi.grid(alpha=.25); ax_rsi.set_ylabel("RSI")
+        ax_rsi.axhline(50, color="#9aa4", linewidth=.8)
+    if has_sto:
+        ax_sto = axes[cur_row]
+        ax_sto.plot(ind["STOCH_K"].index, ind["STOCH_K"].values, color="#22c55e", linewidth=1.0, label="K")
+        ax_sto.plot(ind["STOCH_D"].index, ind["STOCH_D"].values, color="#f59e0b", linewidth=1.0, label="D")
+        ax_sto.set_ylim(0,100); ax_sto.grid(alpha=.25); ax_sto.set_ylabel("Stoch")
+        ax_sto.legend(loc="upper left", frameon=False)
+
+    ax_price.set_title(f"{strategy} • TF={tf} • Exp={expiry}")
+    ax_price.set_ylabel("Price"); ax_price.grid(alpha=.25)
     fig.autofmt_xdate(); fig.tight_layout(); fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return out_name
 
 # -----------------------------------------------------------------------------
-# Strategy requirements → always generate entries/exits for chosen strategy
+# Strategy requirements → always generate entries/exits
 # -----------------------------------------------------------------------------
 def ensure_strategy_requirements(ind_cfg: dict, strategy: str) -> dict:
-    """
-    Ensure the minimal indicators required by a strategy are present
-    for the current run (does not mutate persisted config).
-    """
     cfg = {k: (v.copy() if isinstance(v, dict) else v) for k, v in (ind_cfg or {}).items()}
     s = (strategy or "").upper()
 
@@ -601,9 +621,7 @@ def ensure_strategy_requirements(ind_cfg: dict, strategy: str) -> dict:
         if not isinstance(st, dict):
             st = {"show": True, "k": 14, "d": 3}
         else:
-            st.setdefault("show", True)
-            st.setdefault("k", 14)
-            st.setdefault("d", 3)
+            st.setdefault("show", True); st.setdefault("k", 14); st.setdefault("d", 3)
         cfg["STOCH"] = st
 
     if s == "TREND":
@@ -611,8 +629,7 @@ def ensure_strategy_requirements(ind_cfg: dict, strategy: str) -> dict:
         if sma is None:
             cfg["SMA"] = [50]
         elif isinstance(sma, (int, float, str)):
-            p = int(float(str(sma)))
-            cfg["SMA"] = sorted({p, 50})
+            p = int(float(str(sma))); cfg["SMA"] = sorted({p, 50})
         elif isinstance(sma, (list, tuple, set)):
             cfg["SMA"] = sorted({int(float(str(x))) for x in sma} | {50})
         elif isinstance(sma, dict):
@@ -627,14 +644,13 @@ def ensure_strategy_requirements(ind_cfg: dict, strategy: str) -> dict:
         if not isinstance(rsi, dict):
             rsi = {"show": True, "period": 14}
         else:
-            rsi.setdefault("show", True)
-            rsi.setdefault("period", 14)
+            rsi.setdefault("show", True); rsi.setdefault("period", 14)
         cfg["RSI"] = rsi
 
     return cfg
 
 # -----------------------------------------------------------------------------
-# Backtest run (uses ensure_strategy_requirements)
+# Backtest run
 # -----------------------------------------------------------------------------
 def backtest_run(df: pd.DataFrame, strategy: str, indicators: dict, expiry: str):
     ind_cfg = ensure_strategy_requirements(indicators or {}, strategy)
