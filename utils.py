@@ -1,5 +1,6 @@
-# utils.py — config store, TZ, sqlite, Deriv fetch (+ optional fallback), symbols, indicators, backtest & plotting
-import os, json, sqlite3, math, time
+# utils.py — config store, TZ, sqlite, Deriv fetch (with Stooq fallback), symbols,
+# indicator toolkit, backtest & plotting
+import os, json, sqlite3, math
 from datetime import datetime, time as dtime, timezone
 
 # --------------------------- Timezone ----------------------------------------
@@ -84,11 +85,11 @@ def convert_po_to_deriv(symbols):
     for s in symbols:
         s = (s or "").strip()
         if not s: continue
-        if s.startswith("frx"): out.append(s)
-        elif s.startswith("FRX"): out.append("frx"+s[3:])
+        # keep any explicit frx... as-is (case-normalize to frx)
+        if s.lower().startswith("frx"):
+            out.append("frx"+s[3:].upper())
         else:
-            up = s.upper()
-            out.append(PO2DERIV.get(up, s))
+            out.append(PO2DERIV.get(s.upper(), s))
     return out
 
 # ============================== Data loading/fetch ============================
@@ -100,66 +101,17 @@ def load_csv(csv_file) -> pd.DataFrame:
     if not all([o,h,l,c,t]): raise ValueError("CSV missing OHLC/time columns")
     df = df[[t,o,h,l,c]].copy()
     df.columns = ["time","Open","High","Low","Close"]
-    # epoch (int sec) or iso datetime
-    if df["time"].dtype.kind in ("i","u","f"):
-        df["time"] = pd.to_datetime(df["time"].astype(int), unit="s", utc=True, errors="coerce")
+    # detect epoch seconds
+    if str(df["time"].iloc[0]).isdigit() and len(str(int(df["time"].iloc[0]))) in (10,13):
+        unit = "ms" if len(str(int(df["time"].iloc[0])))==13 else "s"
+        df["time"] = pd.to_datetime(df["time"].astype(int), unit=unit, utc=True, errors="coerce")
     else:
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
     return df
 
-# ----- Optional fallback (Stooq) for major FX if Deriv 404s -------------------
-_FX_FALLBACK = (os.getenv("FX_FALLBACK","").lower() == "stooq")
-
-_STOOQ_MAP = {
-    # Stooq tickers are lowercase pair + .i (intraday) OR daily with interval
-    "frxEURUSD":"eurusd", "frxGBPUSD":"gbpusd", "frxUSDJPY":"usdjpy", "frxUSDCHF":"usdchf",
-    "frxUSDCAD":"usdcad", "frxAUDUSD":"audusd", "frxNZDUSD":"nzdusd",
-    "frxEURGBP":"eurgbp", "frxEURJPY":"eurjpy", "frxGBPJPY":"gbpjpy",
-    "frxEURAUD":"euraud", "frxAUDJPY":"audjpy", "frxCADJPY":"cadjpy", "frxCHFJPY":"chfjpy",
-}
-
-def _fetch_stooq(symbol: str, granularity: int=60, count: int=300) -> pd.DataFrame|None:
-    """
-    Best-effort simple downloader for Stooq CSV (intraday minutes).
-    Not guaranteed; returns None on any error.
-    """
-    import requests
-    key = _STOOQ_MAP.get(symbol)
-    if not key: return None
-    # Stooq intraday CSV (i=5,10,15,60). Choose closest step to granularity.
-    step = 60
-    if granularity <= 60:
-        # pick from {5,10,15,60}
-        step = min([5,10,15,60], key=lambda v: abs(v - max(1,granularity)))
-    url = f"https://stooq.com/q/l/?s={key}.i&i={step}"
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200 or "No data" in r.text:
-            return None
-        df = pd.read_csv(pd.compat.StringIO(r.text))
-        # Expect columns: Date, Time, Open, High, Low, Close, Volume
-        if not {"Date","Time","Open","High","Low","Close"}.issubset(df.columns):
-            return None
-        dt = pd.to_datetime(df["Date"] + " " + df["Time"], utc=True, errors="coerce")
-        out = pd.DataFrame({
-            "time": dt,
-            "Open": pd.to_numeric(df["Open"], errors="coerce"),
-            "High": pd.to_numeric(df["High"], errors="coerce"),
-            "Low":  pd.to_numeric(df["Low"],  errors="coerce"),
-            "Close":pd.to_numeric(df["Close"],errors="coerce"),
-        }).dropna()
-        out = out.drop_duplicates(subset=["time"]).set_index("time").sort_index()
-        if len(out) > count:
-            out = out.iloc[-count:]
-        return out
-    except Exception:
-        return None
-
+# -------- Deriv HTTP (may 404) ----------
 def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: str|None=None):
-    """
-    Deriv HTTP price_history (v4->v3) then 'explore/candles'. Raises on failure.
-    """
     import requests
     attempts = []
     qs = {"ticks_history": symbol, "style": "candles", "granularity": granularity, "count": count}
@@ -185,7 +137,7 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: 
                         "Close": pd.to_numeric(d.get("close"), errors="coerce"),
                     }).dropna()
                     if not out.empty:
-                        return out.set_index("time").sort_index()
+                        return out.set_index("time").sort_index(), attempts
         except Exception:
             attempts.append((base, "EXC"))
 
@@ -198,42 +150,86 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: 
             js = r.json()
             rows = js.get("candles") or js.get("history") or []
             d = pd.DataFrame(rows)
-            epoch = d.get("epoch") if "epoch" in d else d.get("time")
-            out = pd.DataFrame({
-                "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
-                "Open": pd.to_numeric(d.get("open"), errors="coerce"),
-                "High": pd.to_numeric(d.get("high"), errors="coerce"),
-                "Low" : pd.to_numeric(d.get("low"), errors="coerce"),
-                "Close": pd.to_numeric(d.get("close"), errors="coerce"),
-            }).dropna()
-            if not out.empty:
-                return out.set_index("time").sort_index()
+            if not d.empty:
+                epoch = d.get("epoch") if "epoch" in d else d.get("time")
+                out = pd.DataFrame({
+                    "time": pd.to_datetime(epoch.astype(int), unit="s", utc=True),
+                    "Open": pd.to_numeric(d.get("open"), errors="coerce"),
+                    "High": pd.to_numeric(d.get("high"), errors="coerce"),
+                    "Low" : pd.to_numeric(d.get("low"), errors="coerce"),
+                    "Close": pd.to_numeric(d.get("close"), errors="coerce"),
+                }).dropna()
+                if not out.empty:
+                    return out.set_index("time").sort_index(), attempts
     except Exception:
         attempts.append(("explore/candles", "EXC"))
 
-    app = f" (DERIV_APP_ID={app_id})" if app_id else ""
-    msg = f"Deriv fetch failed for symbol={symbol}, granularity={granularity}. Attempts: {attempts}{app}"
-    raise RuntimeError(msg)
+    return None, attempts
+
+# -------- Stooq fallback (no API key) ----------
+def _to_stooq_pair(symbol: str) -> str:
+    """
+    Convert 'frxEURUSD' or 'EURUSD' -> 'eurusd'
+    """
+    s = symbol.strip()
+    if s.lower().startswith("frx"):
+        s = s[3:]
+    return s.replace("_","").lower()
+
+def _stooq_history(symbol: str, granularity: int, count: int=300) -> pd.DataFrame|None:
+    """
+    Stooq supports intraday CSV: https://stooq.com/q/d/l/?s=eurusd&i=60
+    Valid i: 5,10,15,60 (minute granularity). We'll map others to the nearest.
+    """
+    import requests
+    pair = _to_stooq_pair(symbol)
+    if not pair or len(pair)<6:
+        return None
+    # map granularity to nearest allowed
+    mins = max(1, int(granularity/60))
+    if mins <= 7: i = 5
+    elif mins <= 12: i = 10
+    elif mins <= 22: i = 15
+    else: i = 60
+    url = "https://stooq.com/q/d/l/"
+    params = {"s": pair, "i": i}
+    r = requests.get(url, params=params, timeout=15)
+    if r.ok and r.text and "Date,Time,Open,High,Low,Close,Volume" in r.text.splitlines()[0]:
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        # Combine Date & Time -> UTC
+        df["time"] = pd.to_datetime(df["Date"].astype(str)+" "+df["Time"].astype(str), utc=True, errors="coerce")
+        df = df.dropna(subset=["time"])
+        df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close"})
+        df = df[["time","Open","High","Low","Close"]].set_index("time").sort_index()
+        if count and len(df)>count:
+            df = df.iloc[-count:]
+        return df
+    return None
 
 def fetch_deriv_history(symbol: str, granularity_sec: int, count: int=300) -> pd.DataFrame:
     """
-    Normalizes symbol and tries Deriv; if 404 and FX_FALLBACK=stooq, tries Stooq for majors.
+    Backward-compatible fetch that tries:
+    1) Deriv HTTP (v4/v3/explore)
+    2) Stooq intraday CSV (EURUSD, etc.) — graceful fallback
+    Raises RuntimeError if all fail.
     """
-    # Normalize common inputs
-    s = (symbol or "").strip()
-    if not s: raise RuntimeError("Empty symbol")
-    if s.upper() in PO2DERIV: s = PO2DERIV[s.upper()]
-    if s.startswith("FRX"): s = "frx"+s[3:]
     app_id = os.getenv("DERIV_APP_ID") or os.getenv("DERIV_APPID") or os.getenv("DERIV_APP")
-    try:
-        return _deriv_price_history(s, granularity_sec, count=count, app_id=app_id)
-    except Exception as e:
-        # If Deriv 404 and fallback enabled, try Stooq for majors
-        if _FX_FALLBACK:
-            df = _fetch_stooq(s, granularity=granularity_sec, count=count)
-            if df is not None and not df.empty:
-                return df
-        raise
+    df, attempts = _deriv_price_history(symbol, granularity_sec, count=count, app_id=app_id)
+    if df is not None and not df.empty:
+        return df
+
+    # Fallback to Stooq (only if looks like FX)
+    stq = _stooq_history(symbol, granularity_sec, count=count)
+    if stq is not None and not stq.empty:
+        return stq
+
+    app = f" (DERIV_APP_ID={app_id})" if app_id else ""
+    raise RuntimeError(
+        "Deriv fetch failed for symbol={s}, granularity={g}. Attempts: {a}{app}. "
+        "Fallback also failed. Tip: upload a CSV on Backtest, or try another symbol/timeframe."
+        .format(s=symbol, g=granularity_sec, a=attempts, app=app)
+    )
 
 # ============================== Indicator helpers ============================
 def _sma(s: pd.Series, p: int): return s.rolling(p).mean()
@@ -418,7 +414,6 @@ def _osma(close, fast=12, slow=26, signal=9):
     return macd - sig
 
 def _zigzag(close, pct=1.0):
-    """Very simple ZigZag with percentage threshold."""
     zz = pd.Series(index=close.index, dtype=float)
     if close.empty: return zz
     last_pivot = close.iloc[0]; last_dir = 0; zz.iloc[0]=last_pivot
@@ -480,7 +475,7 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
     if df is None or df.empty: return out
     close = df["Close"]
 
-    # Overlays (MAs, bands, etc.)
+    # Overlays
     if (cfg := ind_cfg.get("SMA", {})).get("enabled"):
         p = int(cfg.get("period", 50)); out[f"SMA"] = _sma(close, p)
     if (cfg := ind_cfg.get("EMA", {})).get("enabled"):
@@ -675,7 +670,7 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
     Clear, dark chart:
       - Panel 1: Candles + overlays + markers
       - Panel 2: RSI (if enabled)
-      - Panel 3: Stochastic (if enabled) + optional Aroon/STC overlays on that oscillator pane
+      - Panel 3: Stochastic (if enabled) + optional Aroon/STC overlays
     """
     os.makedirs("static/plots", exist_ok=True)
     if df is None or df.empty:
@@ -686,7 +681,6 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
     ind = compute_indicators(df, indicators_cfg or {})
     ts = df.index
 
-    # Figure layout
     want_rsi = "RSI" in ind
     want_sto = ("STOCH_K" in ind and "STOCH_D" in ind) or ("AROON_UP" in ind) or ("STC" in ind)
     rows = 1 + (1 if want_rsi else 0) + (1 if want_sto else 0)
@@ -716,12 +710,8 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         "ENV_MA":"#9ca3af","ENV_UP":"#52525b","ENV_DN":"#52525b",
         "ICH_CONV":"#10b981","ICH_BASE":"#ef4444","ICH_SA":"#22d3ee","ICH_SB":"#fb7185",
         "PSAR":"#f472b6","ST":"#22c55e",
-        # New overlays
-        "ALLIG_JAW":"#60a5fa",
-        "ALLIG_TEETH":"#ef4444",
-        "ALLIG_LIPS":"#22c55e",
-        "FRACTAL_UP":"#94a3b8",
-        "FRACTAL_DN":"#94a3b8",
+        "ALLIG_JAW":"#60a5fa","ALLIG_TEETH":"#ef4444","ALLIG_LIPS":"#22c55e",
+        "FRACTAL_UP":"#94a3b8","FRACTAL_DN":"#94a3b8",
     }
     for key, col in overlay_colors.items():
         if key in ind:
@@ -755,7 +745,7 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         ax_rsi.legend(loc="upper left", fontsize=9)
         cur_row += 1
 
-    # --- Stochastic panel (+ optional Aroon/STC) ---
+    # --- Stochastic / Aroon / STC panel ---
     if want_sto:
         ax_st = axes[cur_row]
         ax_st.set_facecolor("#0b0f17")
