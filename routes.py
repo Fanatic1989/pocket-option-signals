@@ -1,8 +1,10 @@
-# routes.py — Dashboard, config, backtest, Telegram + Live APIs (everything wired)
+# routes.py — Full dashboard (all features), indicators live-wired (toggle/params/toggle_all),
+# Telegram users, Live Engine controls, Backtest with CSV fallback, Quick API JSON.
+
 from __future__ import annotations
-import os, io
+import os, io, json
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for, flash,
@@ -12,112 +14,126 @@ from flask import (
 from utils import (
     TZ, get_config, set_config, within_window,
     convert_po_to_deriv, fetch_deriv_history, load_csv,
-    backtest_run, plot_signals, exec_sql
+    backtest_run, plot_signals,
 )
+
+# Optional DB util (Telegram users). If missing, we no-op but keep UI working.
+try:
+    from utils import exec_sql
+except Exception:
+    def exec_sql(*a, **kw):
+        return []
 
 # ---------- Live engine (tolerant import) ----------
 try:
     from live_engine import ENGINE, TIER_TO_CHAT, DAILY_CAPS
 except Exception:
     class _Stub:
-        def status(self): return {"running": False, "debug": False, "loop_sleep": 4,
-                                  "tally": {"total": 0, "by_tier": {"free":0,"basic":0,"pro":0,"vip":0}},
-                                  "tallies": {"all":0,"free":0,"basic":0,"pro":0,"vip":0}}
+        def status(self): return {"running": False, "debug": False, "loop_sleep": 4, "tally": {"total":0,"by_tier":{}}}
         def start(self):  return False, "ENGINE not wired"
         def stop(self):   return False, "ENGINE not wired"
         def set_debug(self, v): pass
         def send_to_tier(self, tier, text): return {"ok": False, "error": "ENGINE not wired"}
     ENGINE = _Stub()
     TIER_TO_CHAT = {"free": None, "basic": None, "pro": None, "vip": None}
-    DAILY_CAPS = {"free":3, "basic":6, "pro":15, "vip": None}
+    DAILY_CAPS = {}
 
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
 
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin")
 
 # ---------------------------- Indicator specs (forms) -------------------------
-# Keys must match utils.compute_indicators(); we’ll also accept a few aliases below.
+# Keys **must** match compute_indicators() in utils.
 INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
     # MAs (overlays)
-    "SMA":      {"title":"Simple MA",       "panel":"overlay", "fields":{"period":50}},
-    "EMA":      {"title":"Exponential MA",  "panel":"overlay", "fields":{"period":20}},
-    "WMA":      {"title":"Weighted MA",     "panel":"overlay", "fields":{"period":20}},
-    "SMMA":     {"title":"Smoothed MA",     "panel":"overlay", "fields":{"period":20}},
-    "TMA":      {"title":"Triangular MA",   "panel":"overlay", "fields":{"period":20}},
+    "SMA":      {"title": "Simple MA",       "panel": "overlay",   "fields": {"period": 50}},
+    "EMA":      {"title": "Exponential MA",  "panel": "overlay",   "fields": {"period": 20}},
+    "WMA":      {"title": "Weighted MA",     "panel": "overlay",   "fields": {"period": 20}},
+    "SMMA":     {"title": "Smoothed MA",     "panel": "overlay",   "fields": {"period": 20}},
+    "TMA":      {"title": "Triangular MA",   "panel": "overlay",   "fields": {"period": 20}},
 
     # Bands / Channels (overlays)
-    "BOLL":     {"title":"Bollinger Bands", "panel":"overlay", "fields":{"period":20,"mult":2}},
-    "KELTNER":  {"title":"Keltner Channel", "panel":"overlay", "fields":{"period":20,"mult":2}},
-    "DONCHIAN": {"title":"Donchian Channels","panel":"overlay","fields":{"period":20}},
-    "ENVELOPES":{"title":"Envelopes",       "panel":"overlay", "fields":{"period":20,"pct":2.0}},
+    "BOLL":     {"title": "Bollinger Bands", "panel": "overlay",   "fields": {"period": 20, "mult": 2}},
+    "KELTNER":  {"title": "Keltner Channel", "panel": "overlay",   "fields": {"period": 20, "mult": 2}},
+    "DONCHIAN": {"title": "Donchian Channels","panel": "overlay",  "fields": {"period": 20}},
+    "ENVELOPES":{"title": "Envelopes",       "panel": "overlay",   "fields": {"period": 20, "pct": 2.0}},
 
     # Ichimoku / PSAR / Supertrend (overlays)
-    "ICHIMOKU": {"title":"Ichimoku",        "panel":"overlay", "fields":{}},
-    "PSAR":     {"title":"Parabolic SAR",   "panel":"overlay", "fields":{"step":0.02,"max":0.2}},
-    "SUPERTREND":{"title":"Supertrend",     "panel":"overlay", "fields":{"period":10,"mult":3}},
+    "ICHIMOKU": {"title": "Ichimoku",        "panel":"overlay",    "fields": {}},
+    "PSAR":     {"title": "Parabolic SAR",   "panel":"overlay",    "fields": {"step": 0.02, "max": 0.2}},
+    "SUPERTREND":{"title":"Supertrend",      "panel":"overlay",    "fields": {"period": 10, "mult": 3}},
 
-    # New overlays
-    "ALLIGATOR":{"title":"Alligator",       "panel":"overlay",
+    # NEW overlays
+    "ALLIGATOR":{"title":"Alligator",        "panel":"overlay",
                  "fields":{"jaw":13,"teeth":8,"lips":5,"jaw_shift":8,"teeth_shift":5,"lips_shift":3}},
-    "FRACTAL":  {"title":"Fractal Chaos Bands","panel":"overlay","fields":{"lookback":2,"smooth":5}},
+    "FRACTAL":  {"title":"Fractal Chaos Bands","panel":"overlay",  "fields":{"lookback":2,"smooth":5}},
 
     # Oscillators (separate panels)
-    "RSI":      {"title":"RSI",             "panel":"osc",     "fields":{"period":14}},
-    "STOCH":    {"title":"Stochastic",      "panel":"osc",     "fields":{"k":14,"d":3}},
-    "ATR":      {"title":"ATR",             "panel":"osc",     "fields":{"period":14}},
-    "ADX":      {"title":"ADX/+DI/-DI",     "panel":"osc",     "fields":{"period":14}},
-    "CCI":      {"title":"CCI",             "panel":"osc",     "fields":{"period":20}},
-    "MOMENTUM": {"title":"Momentum",        "panel":"osc",     "fields":{"period":10}},
-    "ROC":      {"title":"Rate of Change",  "panel":"osc",     "fields":{"period":10}},
-    "WILLR":    {"title":"Williams %R",     "panel":"osc",     "fields":{"period":14}},
-    "VORTEX":   {"title":"Vortex",          "panel":"osc",     "fields":{"period":14}},
-    "MACD":     {"title":"MACD",            "panel":"osc",     "fields":{"fast":12,"slow":26,"signal":9}},
-    "AO":       {"title":"Awesome Osc.",    "panel":"osc",     "fields":{}},
-    "AC":       {"title":"Accelerator Osc.","panel":"osc",     "fields":{}},
-    "BEARS":    {"title":"Bears Power",     "panel":"osc",     "fields":{"period":13}},
-    "BULLS":    {"title":"Bulls Power",     "panel":"osc",     "fields":{"period":13}},
-    "DEMARKER": {"title":"DeMarker",        "panel":"osc",     "fields":{"period":14}},
-    "OSMA":     {"title":"OsMA",            "panel":"osc",     "fields":{}},
-    "ZIGZAG":   {"title":"ZigZag",          "panel":"osc",     "fields":{"pct":1.0}},
+    "RSI":      {"title":"RSI",              "panel":"osc",        "fields":{"period":14}},
+    "STOCH":    {"title":"Stochastic",       "panel":"osc",        "fields":{"k":14,"d":3}},
+    "ATR":      {"title":"ATR",              "panel":"osc",        "fields":{"period":14}},
+    "ADX":      {"title":"ADX/+DI/-DI",      "panel":"osc",        "fields":{"period":14}},
+    "CCI":      {"title":"CCI",              "panel":"osc",        "fields":{"period":20}},
+    "MOMENTUM": {"title":"Momentum",         "panel":"osc",        "fields":{"period":10}},
+    "ROC":      {"title":"Rate of Change",   "panel":"osc",        "fields":{"period":10}},
+    "WILLR":    {"title":"Williams %R",      "panel":"osc",        "fields":{"period":14}},
+    "VORTEX":   {"title":"Vortex",           "panel":"osc",        "fields":{"period":14}},
+    "MACD":     {"title":"MACD",             "panel":"osc",        "fields":{"fast":12,"slow":26,"signal":9}},
+    "AO":       {"title":"Awesome Osc.",     "panel":"osc",        "fields":{}},
+    "AC":       {"title":"Accelerator Osc.", "panel":"osc",        "fields":{}},
+    "BEARS":    {"title":"Bears Power",      "panel":"osc",        "fields":{"period":13}},
+    "BULLS":    {"title":"Bulls Power",      "panel":"osc",        "fields":{"period":13}},
+    "DEMARKER": {"title":"DeMarker",         "panel":"osc",        "fields":{"period":14}},
+    "OSMA":     {"title":"OsMA",             "panel":"osc",        "fields":{}},
+    "ZIGZAG":   {"title":"ZigZag",           "panel":"osc",        "fields":{"pct": 1.0}},
 
-    # New oscillators
-    "AROON":    {"title":"Aroon",           "panel":"osc",     "fields":{"period":14}},
-    "STC":      {"title":"Schaff Trend Cycle","panel":"osc",   "fields":{"fast":23,"slow":50,"cycle":10}},
+    # NEW oscillators
+    "AROON":    {"title":"Aroon",            "panel":"osc",        "fields":{"period":14}},
+    "STC":      {"title":"Schaff Trend Cycle","panel":"osc",       "fields":{"fast":23,"slow":50,"cycle":10}},
 }
 
-# Accept some friendly names coming from UI or external sources
+# Aliases accepted by API (e.g. STOCHASTIC → STOCH)
 INDICATOR_ALIASES = {
     "STOCHASTIC": "STOCH",
-    "WILLIAMS%R": "WILLR",
-    "WILLIAMS":   "WILLR",
-    "SIMPLEMA":   "SMA",
-    "EXPMA":      "EMA",
+    "STOCHS": "STOCH",
+    "W%R": "WILLR",
+    "ALLIGATOR_INDICATOR": "ALLIGATOR",
+    "BOLLINGER": "BOLL",
+    "SCHAFF": "STC",
 }
 
 TF_TO_GRAN = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
 
-# --------------------------- DB for Telegram users ---------------------------
-exec_sql("""CREATE TABLE IF NOT EXISTS tg_users(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tier   TEXT NOT NULL,
-  chat_id TEXT NOT NULL UNIQUE,
-  label  TEXT
-)""")
+# --------------------------- Telegram users table (if exec_sql exists) -------
+try:
+    exec_sql("""CREATE TABLE IF NOT EXISTS tg_users(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tier TEXT NOT NULL,
+      chat_id TEXT NOT NULL UNIQUE,
+      label TEXT
+    )""")
+except Exception:
+    pass
 
 # --------------------------- Helpers -----------------------------------------
 def _ensure_cfg_defaults(cfg: dict | None) -> dict:
     cfg = dict(cfg or {})
-    # Window
+    # Window / Live defaults
     cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":str(TZ)})
-    # Live defaults
-    cfg.setdefault("live_tf","M1")
-    cfg.setdefault("live_expiry","5m")
+    cfg.setdefault("live_tf", "M1")
+    cfg.setdefault("live_expiry", "5m")
     cfg.setdefault("deriv_count", 300)
     cfg.setdefault("use_deriv_fetch", True)
     # Indicators
     if "indicators" not in cfg or not isinstance(cfg["indicators"], dict):
         cfg["indicators"] = {k: {"enabled": False, **spec["fields"]} for k, spec in INDICATOR_SPECS.items()}
-    # Strategies
+    else:
+        # fill any new indicators/fields added over time
+        for k, spec in INDICATOR_SPECS.items():
+            cfg["indicators"].setdefault(k, {"enabled": False, **spec["fields"]})
+            for f, dv in spec["fields"].items():
+                cfg["indicators"][k].setdefault(f, dv)
+    # Strategies (kept for backtest selector)
     cfg.setdefault("strategies", {
         "BASE":{"enabled": True},
         "TREND":{"enabled": False},
@@ -126,7 +142,7 @@ def _ensure_cfg_defaults(cfg: dict | None) -> dict:
         "CUSTOM2":{"enabled": False},
         "CUSTOM3":{"enabled": False},
     })
-    # Custom rules
+    # Custom rule text boxes
     cfg.setdefault("custom1_rules","")
     cfg.setdefault("custom2_rules","")
     cfg.setdefault("custom3_rules","")
@@ -135,8 +151,8 @@ def _ensure_cfg_defaults(cfg: dict | None) -> dict:
     set_config(cfg)
     return cfg
 
-def _normalize_ind_key(k: str) -> str:
-    k = (k or "").strip().upper()
+def _resolve_key(key: str) -> str:
+    k = (key or "").upper().strip()
     return INDICATOR_ALIASES.get(k, k)
 
 def _save_indicators_from_form(cfg: dict, form) -> None:
@@ -160,7 +176,11 @@ def _save_indicators_from_form(cfg: dict, form) -> None:
 
 def _ctx_base(view: str="dashboard") -> Dict[str, Any]:
     cfg = _ensure_cfg_defaults(get_config())
-    users = exec_sql("SELECT id,tier,chat_id,label FROM tg_users ORDER BY tier,id", fetch=True) or []
+    # Users for Telegram panel
+    try:
+        users = exec_sql("SELECT id,tier,chat_id,label FROM tg_users ORDER BY tier, id", fetch=True) or []
+    except Exception:
+        users = []
     return {
         "view": view,
         "cfg": cfg,
@@ -169,9 +189,10 @@ def _ctx_base(view: str="dashboard") -> Dict[str, Any]:
         "now_local": datetime.now(TZ).strftime("%b %d, %Y %H:%M"),
         "window_ok": within_window(cfg),
         "tz": str(TZ),
-        "tier_to_chat": {k: bool(v) for k, v in (TIER_TO_CHAT or {}).items()},
+        "tier_to_chat": TIER_TO_CHAT,
         "daily_caps": DAILY_CAPS,
         "users": users,
+        "session": {"admin": session.get("admin", False)},
     }
 
 def _admin_required(fn):
@@ -182,7 +203,7 @@ def _admin_required(fn):
     wrap.__name__ = fn.__name__
     return wrap
 
-# ------------------------------ Routes: basic --------------------------------
+# ------------------------------ Routes — basic --------------------------------
 @bp.route("/")
 def root():
     return redirect(url_for("dashboard.view"))
@@ -217,16 +238,19 @@ def view():
         cfg["live_expiry"] = request.form.get("live_expiry", cfg.get("live_expiry","5m"))
 
         # Symbols (pairs selector + free text)
-        majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD",
-                  "EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"]
+        majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"]
         chosen = [m for m in majors if request.form.get(f"pair_{m}")]
         typed = (request.form.get("symbols_text","") or "").replace(",", " ").split()
         symbols = chosen + [t for t in typed if t]
         if request.form.get("convert_po"):
             symbols = convert_po_to_deriv(symbols)
         if symbols:
-            # dedupe keep order
-            cfg["symbols_raw"] = list(dict.fromkeys(symbols))
+            # de-dup preserve order
+            seen, final = set(), []
+            for s in symbols:
+                if s not in seen:
+                    seen.add(s); final.append(s)
+            cfg["symbols_raw"] = final
 
         # Deriv fetch settings
         cfg["use_deriv_fetch"] = bool(request.form.get("use_deriv_fetch"))
@@ -235,7 +259,7 @@ def view():
         except Exception:
             cfg["deriv_count"] = 300
 
-        # Strategies toggles
+        # Strategies (kept for backtest selector)
         st = cfg.get("strategies", {})
         for name in ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"]:
             st[name] = {"enabled": bool(request.form.get(f"s_{name}"))}
@@ -255,58 +279,147 @@ def view():
 
     return render_template("dashboard.html", **_ctx_base("dashboard"))
 
-# ---------------- AJAX: live-wired indicator toggles ----------------
-@bp.post("/api/indicators/toggle")
-@_admin_required
-def api_ind_toggle():
-    data = request.get_json(silent=True) or {}
-    key = _normalize_ind_key(data.get("key"))
-    enabled = bool(data.get("enabled"))
-    cfg = _ensure_cfg_defaults(get_config())
-    if key not in INDICATOR_SPECS:
-        return jsonify({"ok": False, "error": f"Unknown indicator '{data.get('key')}'"}), 400
-    cur = cfg["indicators"].get(key, {"enabled": False, **INDICATOR_SPECS[key]["fields"]})
-    cur["enabled"] = enabled
-    cfg["indicators"][key] = cur
-    set_config(cfg)
-    return jsonify({"ok": True, "indicator": {key: cfg["indicators"][key]}})
-
-@bp.post("/api/indicators/params")
-@_admin_required
-def api_ind_params():
-    data = request.get_json(silent=True) or {}
-    key = _normalize_ind_key(data.get("key"))
-    params = data.get("params") or {}
-    cfg = _ensure_cfg_defaults(get_config())
-    if key not in INDICATOR_SPECS:
-        return jsonify({"ok": False, "error": f"Unknown indicator '{data.get('key')}'"}), 400
-    spec = INDICATOR_SPECS[key]
-    cur = cfg["indicators"].get(key, {"enabled": False, **spec["fields"]})
-    # cast by field type
-    for fname, default in spec["fields"].items():
-        if fname in params:
-            val = params[fname]
-            try:
-                if isinstance(default, int):
-                    cur[fname] = int(float(val))
-                elif isinstance(default, float):
-                    cur[fname] = float(val)
-                else:
-                    cur[fname] = val
-            except Exception:
-                cur[fname] = default
-    cfg["indicators"][key] = cur
-    set_config(cfg)
-    return jsonify({"ok": True, "indicator": {key: cfg["indicators"][key]}})
-
-@bp.get("/api/indicators")
-@_admin_required
+# ------------------------------ Indicators API (LIVE) -------------------------
+@bp.route("/api/indicators", methods=["GET"])
 def api_indicators():
     cfg = _ensure_cfg_defaults(get_config())
     return jsonify({"specs": INDICATOR_SPECS, "state": cfg.get("indicators", {})})
 
+@bp.route("/api/indicators/toggle", methods=["POST"])
+def api_ind_toggle():
+    """
+    Accepts:
+      - JSON: {"key":"RSI","enabled":true}
+      - OR text forms like: key=STOCH&enabled=on
+      - Friendly texts via query/body: "RSI:ON", "STOCHASTIC:OFF"
+    """
+    cfg = _ensure_cfg_defaults(get_config())
+    data = request.get_json(silent=True) or {}
+    key = data.get("key")
+    enabled = data.get("enabled")
+    # Allow plain-text command styles
+    if not key and isinstance(data, str) and ":" in data:
+        k, v = data.split(":", 1)
+        key, enabled = k, v.strip().lower() in ("1","true","on","yes","y","enable","enabled")
+    if not key and request.values.get("key"):
+        key = request.values.get("key")
+    if enabled is None:
+        v = request.values.get("enabled", "")
+        if v != "":
+            enabled = str(v).lower() in ("1","true","on","yes","y","enable","enabled")
+    if enabled is None:
+        # last resort: try to parse raw text body
+        raw = (request.data or b"").decode("utf-8", "ignore")
+        if ":" in raw:
+            k, v = raw.split(":", 1)
+            key, enabled = k, v.strip().lower() in ("1","true","on","yes","y","enable","enabled")
+
+    if not key:
+        return jsonify({"ok": False, "error": "Missing 'key'"}), 400
+
+    key = _resolve_key(key)
+    if key not in INDICATOR_SPECS:
+        return jsonify({"ok": False, "error": f"Unknown indicator '{key}'"}), 400
+
+    if enabled is None:
+        enabled = True  # default toggle on
+
+    ind = cfg["indicators"].get(key, {"enabled": False, **INDICATOR_SPECS[key]["fields"]})
+    ind["enabled"] = bool(enabled)
+    cfg["indicators"][key] = ind
+    set_config(cfg)
+    return jsonify({"ok": True, "key": key, "state": cfg["indicators"][key]})
+
+@bp.route("/api/indicators/params", methods=["POST"])
+def api_ind_params():
+    """
+    Accepts:
+      - JSON: {"key":"RSI","params":{"period":7}}
+      - OR form fields: key=RSI&period=7
+      - OR raw: "RSI:period=7"
+    """
+    cfg = _ensure_cfg_defaults(get_config())
+    data = request.get_json(silent=True) or {}
+
+    key = _resolve_key(data.get("key") or request.values.get("key") or "")
+    params = data.get("params")
+
+    if not key:
+        # try raw body "RSI:period=7"
+        raw = (request.data or b"").decode("utf-8","ignore").strip()
+        if ":" in raw:
+            k, rhs = raw.split(":", 1)
+            key = _resolve_key(k)
+            # parse simple k=v list
+            p: Dict[str, Any] = {}
+            for chunk in rhs.split(","):
+                if "=" in chunk:
+                    f, v = chunk.split("=", 1)
+                    p[f.strip()] = v.strip()
+            params = p
+
+    if key not in INDICATOR_SPECS:
+        return jsonify({"ok": False, "error": f"Unknown indicator '{key}'"}), 400
+
+    if params is None:
+        # build from form fields (any matching spec fields)
+        params = {}
+        for fname in INDICATOR_SPECS[key]["fields"].keys():
+            if fname in request.values:
+                params[fname] = request.values.get(fname)
+
+    # cast types
+    block = cfg["indicators"].get(key, {"enabled": False, **INDICATOR_SPECS[key]["fields"]})
+    for fname, default in INDICATOR_SPECS[key]["fields"].items():
+        if fname in (params or {}):
+            val = params[fname]
+            try:
+                if isinstance(default, int):
+                    block[fname] = int(float(val))
+                elif isinstance(default, float):
+                    block[fname] = float(val)
+                else:
+                    block[fname] = val
+            except Exception:
+                block[fname] = default
+    cfg["indicators"][key] = block
+    set_config(cfg)
+    return jsonify({"ok": True, "key": key, "state": cfg["indicators"][key]})
+
+@bp.route("/api/indicators/toggle_all", methods=["POST"])
+def api_ind_toggle_all():
+    """
+    Accepts:
+      - JSON: {"enabled":true}  -> all ON
+      - JSON: {"enabled":false} -> all OFF
+      - Optional list filter: {"keys":["RSI","MACD"],"enabled":true}
+    """
+    cfg = _ensure_cfg_defaults(get_config())
+    data = request.get_json(silent=True) or {}
+    keys = data.get("keys")
+    enabled = data.get("enabled")
+    if enabled is None:
+        enabled = str(request.values.get("enabled","")).lower() in ("1","true","on","yes","y","enable","enabled")
+
+    if keys:
+        keys = [_resolve_key(k) for k in keys]
+        unknown = [k for k in keys if k not in INDICATOR_SPECS]
+        if unknown:
+            return jsonify({"ok": False, "error": f"Unknown: {', '.join(unknown)}"}), 400
+        target = keys
+    else:
+        target = list(INDICATOR_SPECS.keys())
+
+    for k in target:
+        block = cfg["indicators"].get(k, {"enabled": False, **INDICATOR_SPECS[k]["fields"]})
+        block["enabled"] = bool(enabled)
+        cfg["indicators"][k] = block
+
+    set_config(cfg)
+    return jsonify({"ok": True, "updated": target, "enabled": bool(enabled)})
+
 # ------------------------------ Backtest -------------------------------------
-@bp.post("/backtest")
+@bp.route("/backtest", methods=["POST"])
 @_admin_required
 def backtest():
     cfg = _ensure_cfg_defaults(get_config())
@@ -315,6 +428,7 @@ def backtest():
     # Symbols: provided or from saved config
     symbols_raw = (request.form.get("bt_symbols") or "").replace(";", ",").replace(" ", ",")
     symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()] or cfg.get("symbols_raw", [])
+
     if request.form.get("convert_po_bt"):
         symbols = convert_po_to_deriv(symbols)
 
@@ -337,21 +451,30 @@ def backtest():
     else:
         if not use_deriv:
             return jsonify({"ok": False, "error": "Deriv fetch disabled; upload CSV or enable Deriv fetch."}), 400
+
         errs = []
+        # Try each symbol until one succeeds
         for sym in symbols:
             try:
                 df = fetch_deriv_history(sym, granularity_sec=gran, count=target)
                 if df is not None and not df.empty:
                     break
             except Exception as e:
-                errs.append(str(e))
+                errs.append(f"{sym}: {e}")
         if df is None or df.empty:
-            tip = "Tip: upload a CSV on Backtest, or try another symbol/timeframe."
-            return jsonify({"ok": False, "error": "Deriv fetch failed. " + "; ".join(errs)[:900] + " " + tip}), 400
+            return jsonify({"ok": False, "error": "Deriv fetch failed. " + "; ".join(errs)[:900] + ". Fallback also failed. Tip: upload a CSV on Backtest, or try another symbol/timeframe."}), 400
 
+    # Run strategy & plot
     strategy = request.form.get("bt_strategy", "BASE").upper()
     sigs, stats = backtest_run(df, strategy, ind_cfg, expiry)
     png_name = plot_signals(df, sigs, ind_cfg, strategy=strategy, tf=tf, expiry=expiry)
+
+    # small session cache if you want a sidebar summary later
+    session["bt_state"] = {
+        "tf": tf, "expiry": expiry, "strategy": strategy,
+        "plot_name": png_name,
+        "summary": f"{stats.get('wins',0)}W / {stats.get('loss',0)}L / {stats.get('draw',0)}D — WR {stats.get('win_rate',0):.1f}%"
+    }
 
     return jsonify({
         "ok": True,
@@ -360,17 +483,18 @@ def backtest():
         "stats": stats
     })
 
-@bp.get("/backtest/last.json")
+@bp.route("/backtest/last.json")
 @_admin_required
 def backtest_last_json():
-    return jsonify({"ok": True, **(session.get("bt_state") or {})})
+    return jsonify(session.get("bt_state") or {})
 
-@bp.get("/plots/<name>")
+@bp.route("/plots/<name>")
 def plot_file(name: str):
+    # static helper to serve generated PNGs
     return send_file(os.path.join("static","plots", name))
 
 # ------------------------------ Telegram -------------------------------------
-@bp.post("/telegram/send")
+@bp.route("/telegram/send", methods=["POST"])
 @_admin_required
 def telegram_send():
     data = request.form.to_dict() or {}
@@ -384,7 +508,7 @@ def telegram_send():
         results[t] = ENGINE.send_to_tier(t, text)
     return jsonify({"ok": True, "results": results, "status": ENGINE.status()})
 
-@bp.post("/telegram/test")
+@bp.route("/telegram/test", methods=["POST"])
 @_admin_required
 def telegram_test():
     msg = request.form.get("text") or "🧪 Broadcast test"
@@ -393,60 +517,56 @@ def telegram_test():
         results[t] = ENGINE.send_to_tier(t, f"{msg} ({t.upper()})")
     return jsonify({"ok": True, "results": results})
 
-@bp.get("/api/check_bot")
+@bp.route("/api/check_bot")
 def api_check_bot():
+    ok = True
+    diag = {"configured_chats": {k: bool(v) for k, v in (TIER_TO_CHAT or {}).items()},
+            "caps": DAILY_CAPS}
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    out = {
-        "configured_chats": {k: bool(v) for k, v in (TIER_TO_CHAT or {}).items()},
-        "caps": DAILY_CAPS,
-        "running": ENGINE.status().get("running", False),
-    }
     if token:
         try:
             import requests
             r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-            out["getMe"] = r.json()
+            diag["getMe"] = r.json()
         except Exception as e:
-            out["getMe"] = {"ok": False, "error": str(e)}
+            ok = False
+            diag["getMe"] = {"ok": False, "error": str(e)}
     else:
-        out["getMe"] = {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
-    return jsonify(out)
+        ok = False
+        diag["getMe"] = {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
+    return jsonify({"ok": ok, "diag": diag})
 
 # ------------------------------ Live Engine ----------------------------------
-@bp.post("/live/start")
-@_admin_required
+@bp.route("/live/start", methods=["POST"])
 def live_start():
     ok, msg = ENGINE.start()
     return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
 
-@bp.post("/live/stop")
-@_admin_required
+@bp.route("/live/stop", methods=["POST"])
 def live_stop():
     ok, msg = ENGINE.stop()
     return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
 
-@bp.post("/live/debug/on")
-@_admin_required
+@bp.route("/live/debug/on", methods=["POST"])
 def live_debug_on():
     ENGINE.set_debug(True); return jsonify({"ok": True})
 
-@bp.post("/live/debug/off")
-@_admin_required
+@bp.route("/live/debug/off", methods=["POST"])
 def live_debug_off():
     ENGINE.set_debug(False); return jsonify({"ok": True})
 
-@bp.get("/live/status")
+@bp.route("/live/status")
 def live_status():
     return jsonify(ENGINE.status())
 
-@bp.get("/live/tally")
+@bp.route("/live/tally")
 def live_tally():
     st = ENGINE.status()
     tally = st.get("tally") or st.get("tallies") or {}
     return jsonify(tally)
 
 # ------------------------------ Users (Telegram) -----------------------------
-@bp.post("/users/add")
+@bp.route("/users/add", methods=["POST"])
 @_admin_required
 def users_add():
     tier = (request.form.get("tier") or "").lower().strip()
@@ -464,7 +584,7 @@ def users_add():
         flash(f"DB error: {e}", "error")
     return redirect(url_for("dashboard.view"))
 
-@bp.post("/users/delete")
+@bp.route("/users/delete", methods=["POST"])
 @_admin_required
 def users_delete():
     try:
@@ -475,18 +595,14 @@ def users_delete():
         flash(f"DB error: {e}", "error")
     return redirect(url_for("dashboard.view"))
 
-@bp.get("/api/users")
+@bp.route("/api/users")
 @_admin_required
 def api_users():
     rows = exec_sql("SELECT id,tier,chat_id,label FROM tg_users ORDER BY tier,id", fetch=True) or []
     return jsonify([{"id":r[0],"tier":r[1],"chat_id":r[2],"label":r[3]} for r in rows])
 
 # ------------------------------ API echoes / health --------------------------
-@bp.get("/api/indicators/specs")
-def api_ind_specs():
-    return jsonify(INDICATOR_SPECS)
-
-@bp.get("/api/status")
+@bp.route("/api/status")
 def api_status_dup():
     s = ENGINE.status()
     out = {
@@ -504,6 +620,6 @@ def api_status_dup():
     }
     return jsonify(out)
 
-@bp.get("/_up")
+@bp.route("/_up")
 def up_check():
     return jsonify({"ok": True, "ts": datetime.now(timezone.utc).isoformat()+"Z"})
