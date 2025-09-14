@@ -1,6 +1,6 @@
-# utils.py — config store, TZ, sqlite, Deriv fetch, symbols, indicator toolkit, backtest & plotting
-import os, json, sqlite3, math
-from datetime import datetime, time as dtime, timedelta, timezone
+# utils.py — config store, TZ, sqlite, Deriv fetch (+ optional fallback), symbols, indicators, backtest & plotting
+import os, json, sqlite3, math, time
+from datetime import datetime, time as dtime, timezone
 
 # --------------------------- Timezone ----------------------------------------
 TIMEZONE = os.getenv("APP_TZ", "America/Port_of_Spain")
@@ -82,13 +82,13 @@ DERIV2PO = {v:k for k,v in PO2DERIV.items()}
 def convert_po_to_deriv(symbols):
     out = []
     for s in symbols:
-        s = (s or "").strip().upper()
-        if s.startswith("FRX"):
-            out.append(s if s.startswith("frx") else "frx"+s[3:])
-        elif s.startswith("frx"):
-            out.append(s)
+        s = (s or "").strip()
+        if not s: continue
+        if s.startswith("frx"): out.append(s)
+        elif s.startswith("FRX"): out.append("frx"+s[3:])
         else:
-            out.append(PO2DERIV.get(s, s))
+            up = s.upper()
+            out.append(PO2DERIV.get(up, s))
     return out
 
 # ============================== Data loading/fetch ============================
@@ -96,17 +96,69 @@ def load_csv(csv_file) -> pd.DataFrame:
     df = pd.read_csv(csv_file)
     cols = {c.lower(): c for c in df.columns}
     o = cols.get("open"); h = cols.get("high"); l = cols.get("low"); c = cols.get("close")
-    t = cols.get("time") or cols.get("timestamp") or cols.get("date")
+    t = cols.get("time") or cols.get("timestamp") or cols.get("date") or cols.get("epoch")
     if not all([o,h,l,c,t]): raise ValueError("CSV missing OHLC/time columns")
     df = df[[t,o,h,l,c]].copy()
     df.columns = ["time","Open","High","Low","Close"]
-    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    # epoch (int sec) or iso datetime
+    if df["time"].dtype.kind in ("i","u","f"):
+        df["time"] = pd.to_datetime(df["time"].astype(int), unit="s", utc=True, errors="coerce")
+    else:
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
     df = df.dropna(subset=["time"]).set_index("time").sort_index()
     return df
 
+# ----- Optional fallback (Stooq) for major FX if Deriv 404s -------------------
+_FX_FALLBACK = (os.getenv("FX_FALLBACK","").lower() == "stooq")
+
+_STOOQ_MAP = {
+    # Stooq tickers are lowercase pair + .i (intraday) OR daily with interval
+    "frxEURUSD":"eurusd", "frxGBPUSD":"gbpusd", "frxUSDJPY":"usdjpy", "frxUSDCHF":"usdchf",
+    "frxUSDCAD":"usdcad", "frxAUDUSD":"audusd", "frxNZDUSD":"nzdusd",
+    "frxEURGBP":"eurgbp", "frxEURJPY":"eurjpy", "frxGBPJPY":"gbpjpy",
+    "frxEURAUD":"euraud", "frxAUDJPY":"audjpy", "frxCADJPY":"cadjpy", "frxCHFJPY":"chfjpy",
+}
+
+def _fetch_stooq(symbol: str, granularity: int=60, count: int=300) -> pd.DataFrame|None:
+    """
+    Best-effort simple downloader for Stooq CSV (intraday minutes).
+    Not guaranteed; returns None on any error.
+    """
+    import requests
+    key = _STOOQ_MAP.get(symbol)
+    if not key: return None
+    # Stooq intraday CSV (i=5,10,15,60). Choose closest step to granularity.
+    step = 60
+    if granularity <= 60:
+        # pick from {5,10,15,60}
+        step = min([5,10,15,60], key=lambda v: abs(v - max(1,granularity)))
+    url = f"https://stooq.com/q/l/?s={key}.i&i={step}"
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200 or "No data" in r.text:
+            return None
+        df = pd.read_csv(pd.compat.StringIO(r.text))
+        # Expect columns: Date, Time, Open, High, Low, Close, Volume
+        if not {"Date","Time","Open","High","Low","Close"}.issubset(df.columns):
+            return None
+        dt = pd.to_datetime(df["Date"] + " " + df["Time"], utc=True, errors="coerce")
+        out = pd.DataFrame({
+            "time": dt,
+            "Open": pd.to_numeric(df["Open"], errors="coerce"),
+            "High": pd.to_numeric(df["High"], errors="coerce"),
+            "Low":  pd.to_numeric(df["Low"],  errors="coerce"),
+            "Close":pd.to_numeric(df["Close"],errors="coerce"),
+        }).dropna()
+        out = out.drop_duplicates(subset=["time"]).set_index("time").sort_index()
+        if len(out) > count:
+            out = out.iloc[-count:]
+        return out
+    except Exception:
+        return None
+
 def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: str|None=None):
     """
-    Deriv-only. Try v4 -> v3 -> explore/candles. Normalize to Open/High/Low/Close (caps).
+    Deriv HTTP price_history (v4->v3) then 'explore/candles'. Raises on failure.
     """
     import requests
     attempts = []
@@ -140,7 +192,7 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: 
     # Explore fallback
     try:
         url = "https://api.deriv.com/api/explore/candles"
-        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": count, **({"app_id": app_id} if app_id else {})}, timeout=15)
+        r = requests.get(url, params={"symbol": symbol, "granularity": granularity, "count": count}, timeout=15)
         attempts.append((url, r.status_code))
         if r.ok:
             js = r.json()
@@ -160,11 +212,28 @@ def _deriv_price_history(symbol: str, granularity: int, count: int=300, app_id: 
         attempts.append(("explore/candles", "EXC"))
 
     app = f" (DERIV_APP_ID={app_id})" if app_id else ""
-    raise RuntimeError(f"Deriv fetch failed for symbol={symbol}, granularity={granularity}. Attempts: {attempts}{app}")
+    msg = f"Deriv fetch failed for symbol={symbol}, granularity={granularity}. Attempts: {attempts}{app}"
+    raise RuntimeError(msg)
 
 def fetch_deriv_history(symbol: str, granularity_sec: int, count: int=300) -> pd.DataFrame:
+    """
+    Normalizes symbol and tries Deriv; if 404 and FX_FALLBACK=stooq, tries Stooq for majors.
+    """
+    # Normalize common inputs
+    s = (symbol or "").strip()
+    if not s: raise RuntimeError("Empty symbol")
+    if s.upper() in PO2DERIV: s = PO2DERIV[s.upper()]
+    if s.startswith("FRX"): s = "frx"+s[3:]
     app_id = os.getenv("DERIV_APP_ID") or os.getenv("DERIV_APPID") or os.getenv("DERIV_APP")
-    return _deriv_price_history(symbol, granularity_sec, count=count, app_id=app_id)
+    try:
+        return _deriv_price_history(s, granularity_sec, count=count, app_id=app_id)
+    except Exception as e:
+        # If Deriv 404 and fallback enabled, try Stooq for majors
+        if _FX_FALLBACK:
+            df = _fetch_stooq(s, granularity=granularity_sec, count=count)
+            if df is not None and not df.empty:
+                return df
+        raise
 
 # ============================== Indicator helpers ============================
 def _sma(s: pd.Series, p: int): return s.rolling(p).mean()
@@ -475,7 +544,7 @@ def compute_indicators(df: pd.DataFrame, ind_cfg: dict) -> dict:
         out["FRACTAL_UP"] = up
         out["FRACTAL_DN"] = dn
 
-    # Oscillators (separate panels where appropriate)
+    # Oscillators
     if (cfg := ind_cfg.get("RSI", {})).get("enabled", cfg.get("show", True)):
         p=int(cfg.get("period",14)); out["RSI"]=_rsi(close,p)
 
@@ -614,7 +683,6 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         plt.figure(figsize=(10,2)); plt.text(0.5,0.5,"No data", ha="center"); plt.savefig("static/plots/"+out); plt.close()
         return out
 
-    # Compute indicators with current config
     ind = compute_indicators(df, indicators_cfg or {})
     ts = df.index
 
@@ -675,7 +743,7 @@ def plot_signals(df, signals, indicators_cfg, strategy, tf, expiry) -> str:
         if sell_x: ax_price.scatter(sell_x, sell_y, marker="v", s=60, color="#ef4444", label="SELL", zorder=6)
         ax_price.legend(loc="upper left", fontsize=9)
 
-    # --- RSI panel (dedicated) ---
+    # --- RSI panel ---
     cur_row = 1
     if want_rsi:
         ax_rsi = axes[cur_row]
