@@ -1,14 +1,17 @@
-# routes.py — full dashboard (pairs, indicators, backtest, Telegram, Live Engine)
+# routes.py — Full dashboard: pairs, indicators (live), backtest (JSON-only),
+# Telegram (broadcast + users), Live Engine controls, Quick API endpoints.
+
 from __future__ import annotations
 import os, io
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for, flash,
     jsonify, session, send_file
 )
 
+# ---------- utils you already have ----------
 from utils import (
     TZ, get_config, set_config, within_window,
     convert_po_to_deriv, fetch_deriv_history, load_csv,
@@ -20,20 +23,24 @@ try:
     from live_engine import ENGINE, TIER_TO_CHAT, DAILY_CAPS
 except Exception:
     class _StubEngine:
-        def status(self): return {"running": False, "debug": False, "loop_sleep": 4, "tally": {"total":0,"by_tier":{}}}
+        def status(self): return {
+            "running": False, "debug": False, "loop_sleep": 4,
+            "tally":{"total":0,"by_tier":{"free":0,"basic":0,"pro":0,"vip":0}},
+            "tallies":{"all":0,"free":0,"basic":0,"pro":0,"vip":0}
+        }
         def start(self):  return False, "ENGINE not wired"
         def stop(self):   return False, "ENGINE not wired"
         def set_debug(self, v): pass
         def send_to_tier(self, tier, text): return {"ok": False, "error": "ENGINE not wired"}
     ENGINE = _StubEngine()
     TIER_TO_CHAT = {"free": None, "basic": None, "pro": None, "vip": None}
-    DAILY_CAPS = {"free": 3, "basic": 6, "pro": 15, "vip": None}
+    DAILY_CAPS   = {"free": 3, "basic": 6, "pro": 15, "vip": None}
 
 bp = Blueprint("dashboard", __name__, template_folder="templates", static_folder="static")
-
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin")
 
 # ---------------------------- Indicator specs (forms) -------------------------
+# Keys must match utils.compute_indicators()
 INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
     # Overlays
     "SMA":      {"title": "Simple MA",       "panel": "overlay", "fields": {"period": 50}},
@@ -53,7 +60,7 @@ INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
     "FRACTAL":  {"title":"Fractal Chaos Bands","panel":"overlay","fields":{"lookback":2,"smooth":5}},
     # Oscillators
     "RSI":      {"title":"RSI",              "panel":"osc",      "fields":{"period":14}},
-    "STOCH":    {"title":"Stochastic",       "panel":"osc",      "fields":{"k":14,"d":3}},
+    "STOCH":    {"title":"Stochastic",       "panel":"osc",      "fields":{"k":14,"d":3}},  # accepts STOCHASTIC
     "ATR":      {"title":"ATR",              "panel":"osc",      "fields":{"period":14}},
     "ADX":      {"title":"ADX/+DI/-DI",      "panel":"osc",      "fields":{"period":14}},
     "CCI":      {"title":"CCI",              "panel":"osc",      "fields":{"period":20}},
@@ -72,28 +79,6 @@ INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
     "AROON":    {"title":"Aroon",            "panel":"osc",      "fields":{"period":14}},
     "STC":      {"title":"Schaff Trend Cycle","panel":"osc",     "fields":{"fast":23,"slow":50,"cycle":10}},
 }
-
-# synonyms (normalize incoming keys)
-_IND_ALIASES = {
-    "STOCHASTIC": "STOCH",
-    "SCHAFF": "STC",
-    "SCHAFF TREND": "STC",
-    "SCHAFF TREND CYCLE": "STC",
-    "WILLIAMS": "WILLR",
-    "WILLIAMS %R": "WILLR",
-    "VORTEX INDICATOR": "VORTEX",
-    "SIMPLE MA": "SMA",
-    "EXPONENTIAL MA": "EMA",
-    "WEIGHTED MA": "WMA",
-    "TRIANGULAR MA": "TMA",
-    "SMOOTHED MA": "SMMA",
-}
-
-def _norm_ind_key(raw: str) -> str:
-    k = (raw or "").strip().upper().replace("-", " ").replace("_", " ")
-    k = " ".join(k.split())  # collapse spaces
-    return _IND_ALIASES.get(k, k)
-
 TF_TO_GRAN = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
 
 # --------------------------- DB for Telegram users ---------------------------
@@ -105,15 +90,31 @@ exec_sql("""CREATE TABLE IF NOT EXISTS tg_users(
 )""")
 
 # --------------------------- Helpers -----------------------------------------
+_IND_ALIASES = {
+    "STOCHASTIC": "STOCH",
+    "SCHAFF": "STC", "SCHAFF TREND": "STC", "SCHAFF TREND CYCLE": "STC",
+    "WILLIAMS": "WILLR", "WILLIAMS %R": "WILLR",
+    "VORTEX INDICATOR": "VORTEX",
+    "SIMPLE MA": "SMA", "EXPONENTIAL MA": "EMA", "WEIGHTED MA": "WMA",
+    "TRIANGULAR MA": "TMA", "SMOOTHED MA": "SMMA",
+}
+def _norm_ind_key(raw: str) -> str:
+    k = (raw or "").strip().upper().replace("-", " ").replace("_", " ")
+    k = " ".join(k.split())
+    return _IND_ALIASES.get(k, k)
+
 def _ensure_cfg_defaults(cfg: dict | None) -> dict:
     cfg = dict(cfg or {})
+    # Window / defaults
     cfg.setdefault("window", {"start":"08:00","end":"17:00","timezone":str(TZ)})
     cfg.setdefault("live_tf","M1")
     cfg.setdefault("live_expiry","5m")
     cfg.setdefault("deriv_count", 300)
     cfg.setdefault("use_deriv_fetch", True)
+    # Indicators default state
     if "indicators" not in cfg or not isinstance(cfg["indicators"], dict):
         cfg["indicators"] = {k: {"enabled": False, **spec["fields"]} for k, spec in INDICATOR_SPECS.items()}
+    # Strategy toggles
     cfg.setdefault("strategies", {
         "BASE":{"enabled": True},
         "TREND":{"enabled": False},
@@ -122,6 +123,7 @@ def _ensure_cfg_defaults(cfg: dict | None) -> dict:
         "CUSTOM2":{"enabled": False},
         "CUSTOM3":{"enabled": False},
     })
+    # Custom rules & symbols
     cfg.setdefault("custom1_rules","")
     cfg.setdefault("custom2_rules","")
     cfg.setdefault("custom3_rules","")
@@ -166,13 +168,12 @@ def _ctx_base(view: str="dashboard") -> Dict[str, Any]:
 
 def _admin_required(fn):
     def wrap(*a, **kw):
-        if not session.get("admin"):
-            return redirect(url_for("dashboard.login"))
+        if not session.get("admin"): return redirect(url_for("dashboard.login"))
         return fn(*a, **kw)
     wrap.__name__ = fn.__name__
     return wrap
 
-# ------------------------------ Routes: pages --------------------------------
+# ------------------------------ Routes ---------------------------------------
 @bp.route("/")
 def root():
     return redirect(url_for("dashboard.view"))
@@ -184,6 +185,7 @@ def login():
             session["admin"] = True
             return redirect(url_for("dashboard.view"))
         flash("Wrong password", "error")
+    # Render login view only; no protected JS endpoints referenced here
     return render_template("dashboard.html", **_ctx_base("login"))
 
 @bp.route("/logout")
@@ -206,7 +208,7 @@ def view():
         cfg["live_tf"] = request.form.get("live_tf", cfg.get("live_tf","M1")).upper()
         cfg["live_expiry"] = request.form.get("live_expiry", cfg.get("live_expiry","5m"))
 
-        # Symbols (pairs selector + manual)
+        # Symbols (pairs selector + free text)
         majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD",
                   "EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"]
         chosen = [m for m in majors if request.form.get(f"pair_{m}")]
@@ -215,7 +217,7 @@ def view():
         if request.form.get("convert_po"):
             symbols = convert_po_to_deriv(symbols)
         if symbols:
-            cfg["symbols_raw"] = list(dict.fromkeys(symbols))  # unique-preserve
+            cfg["symbols_raw"] = list(dict.fromkeys(symbols))  # unique preserve
 
         # Deriv fetch settings
         cfg["use_deriv_fetch"] = bool(request.form.get("use_deriv_fetch"))
@@ -224,13 +226,13 @@ def view():
         except Exception:
             cfg["deriv_count"] = 300
 
-        # Strategies
+        # Strategies toggles
         st = cfg.get("strategies", {})
         for name in ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"]:
             st[name] = {"enabled": bool(request.form.get(f"s_{name}"))}
         cfg["strategies"] = st
 
-        # Custom rule text boxes
+        # Custom rules
         cfg["custom1_rules"] = request.form.get("custom1_rules", cfg.get("custom1_rules",""))
         cfg["custom2_rules"] = request.form.get("custom2_rules", cfg.get("custom2_rules",""))
         cfg["custom3_rules"] = request.form.get("custom3_rules", cfg.get("custom3_rules",""))
@@ -244,7 +246,7 @@ def view():
 
     return render_template("dashboard.html", **_ctx_base("dashboard"))
 
-# ------------------------------ Indicators API -------------------------------
+# ---------------- Indicators API (live) ----------------
 @bp.get("/api/indicators")
 @_admin_required
 def api_indicators():
@@ -269,7 +271,6 @@ def api_ind_toggle():
     enabled = js.get("enabled") if "enabled" in js else enabled
 
     if key is None and not js and request.data:
-        # parse "NAME:ON" or "NAME:OFF"
         line = (request.get_data(as_text=True) or "").strip()
         if ":" in line:
             lhs, rhs = line.split(":", 1)
@@ -308,13 +309,11 @@ def api_ind_params():
     """
     cfg = _ensure_cfg_defaults(get_config())
 
-    # figure key + params from any content type
     js = request.get_json(silent=True) or {}
     key = js.get("key")
     params = js.get("params") if isinstance(js.get("params"), dict) else {}
 
     if not key:
-        # try form
         key = request.form.get("key")
         if not params and request.form:
             params = {k: v for k, v in request.form.items() if k != "key"}
@@ -358,6 +357,7 @@ def api_ind_params():
 def api_ind_toggle_all():
     """
     JSON/text/form with 'enabled' flag (true/false). Applies to ALL indicators.
+    Optional: 'keys': ["RSI","MACD"] to limit the scope.
     """
     cfg = _ensure_cfg_defaults(get_config())
     enabled = None
@@ -373,18 +373,24 @@ def api_ind_toggle_all():
     if enabled is None:
         return jsonify({"ok": False, "error": "Missing 'enabled' boolean"}), 400
 
-    for key, spec in INDICATOR_SPECS.items():
-        cur = cfg["indicators"].get(key, {"enabled": False, **spec["fields"]})
+    keys: List[str] = js.get("keys") or [k for k in INDICATOR_SPECS]
+    updated = {}
+    for rawk in keys:
+        key = _norm_ind_key(rawk)
+        if key not in INDICATOR_SPECS:
+            continue
+        cur = cfg["indicators"].get(key, {"enabled": False, **INDICATOR_SPECS[key]["fields"]})
         cur["enabled"] = enabled
         cfg["indicators"][key] = cur
+        updated[key] = cur
     set_config(cfg)
-    return jsonify({"ok": True, "enabled": enabled, "count": len(INDICATOR_SPECS)})
+    return jsonify({"ok": True, "enabled": enabled, "updated": updated, "count": len(updated)})
 
 @bp.post("/api/indicators/params_all")
 @_admin_required
 def api_ind_params_all():
     """
-    Bulk-update params across ALL indicators (only fields that exist on each indicator are applied).
+    Bulk-update params across ALL indicators (only existing fields on each indicator are applied).
     Supports:
       - JSON: {"params":{"period":14,"mult":2}}
       - Form: period=14&mult=2
@@ -396,9 +402,9 @@ def api_ind_params_all():
     js = request.get_json(silent=True) or {}
     if isinstance(js.get("params"), dict):
         params.update(js["params"])
-    # also accept flat JSON
+    # also accept flat JSON like {"period":14}
     for k, v in js.items():
-        if k not in ("params",):
+        if k != "params":
             params.setdefault(k, v)
     # form/query
     if request.form:
@@ -407,7 +413,7 @@ def api_ind_params_all():
     if request.args:
         for k, v in request.args.items():
             params.setdefault(k, v)
-    # raw lines
+    # raw text lines (if no JSON/form)
     raw = ""
     try:
         raw = request.get_data(as_text=True) or ""
@@ -416,10 +422,9 @@ def api_ind_params_all():
     if raw and not js and not request.form and not request.args:
         for line in raw.splitlines():
             line = line.strip()
-            if not line or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            params.setdefault(k.strip(), v.strip())
+            if "=" in line:
+                k, v = line.split("=", 1)
+                params.setdefault(k.strip(), v.strip())
 
     if not params:
         return jsonify({"ok": False, "error": "No params provided"}), 400
@@ -454,7 +459,7 @@ def api_ind_reset_all():
     set_config(cfg)
     return jsonify({"ok": True, "reset": list(INDICATOR_SPECS.keys())})
 
-# ------------------------------ Backtest -------------------------------------
+# ------------------------------ Backtest (JSON-only) -------------------------
 @bp.post("/backtest")
 @_admin_required
 def backtest():
@@ -467,13 +472,15 @@ def backtest():
     if request.form.get("convert_po_bt"):
         symbols = convert_po_to_deriv(symbols)
 
-    tf = request.form.get("bt_tf", cfg.get("live_tf","M1")).upper()
+    tf = (request.form.get("bt_tf") or cfg.get("live_tf","M1")).upper()
     expiry = request.form.get("bt_expiry", cfg.get("live_expiry","5m"))
     use_deriv = bool(request.form.get("use_deriv_fetch", "1" if cfg.get("use_deriv_fetch") else ""))
+
     try:
         target = max(60, int(request.form.get("bt_count", cfg.get("deriv_count", 300))))
     except Exception:
         target = cfg.get("deriv_count", 300)
+
     gran = TF_TO_GRAN.get(tf, 60)
 
     # CSV overrides fetch
@@ -497,13 +504,30 @@ def backtest():
         if df is None or df.empty:
             return jsonify({"ok": False, "error": "Deriv fetch failed. " + "; ".join(errs)[:900]}), 400
 
-    strategy = request.form.get("bt_strategy", "BASE").upper()
-    sigs, stats = backtest_run(df, strategy, ind_cfg, expiry)
-    png_name = plot_signals(df, sigs, ind_cfg, strategy=strategy, tf=tf, expiry=expiry)
+    strategy = (request.form.get("bt_strategy") or "BASE").upper()
+
+    # Run
+    try:
+        sigs, stats = backtest_run(df, strategy, ind_cfg, expiry)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Backtest error in strategy '{strategy}': {e}"}), 400
+
+    # Plot
+    try:
+        png_name = plot_signals(df, sigs, ind_cfg, strategy=strategy, tf=tf, expiry=expiry)
+        plot_url = f"/plots/{png_name}"
+    except Exception as e:
+        return jsonify({
+            "ok": True,
+            "plot": None,
+            "signals": [{"ts": i["index"].isoformat(), "dir": i["direction"], "exp": i["expiry_idx"].isoformat()} for i in sigs],
+            "stats": stats,
+            "warn": f"Plot error: {e}"
+        })
 
     return jsonify({
         "ok": True,
-        "plot": f"/plots/{png_name}",
+        "plot": plot_url,
         "signals": [{"ts": i["index"].isoformat(), "dir": i["direction"], "exp": i["expiry_idx"].isoformat()} for i in sigs],
         "stats": stats
     })
@@ -536,61 +560,6 @@ def telegram_test():
         results[t] = ENGINE.send_to_tier(t, f"{msg} ({t.upper()})")
     return jsonify({"ok": True, "results": results})
 
-@bp.get("/api/check_bot")
-def api_check_bot():
-    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    out = {
-        "configured_chats": {k: bool(v) for k, v in (TIER_TO_CHAT or {}).items()},
-        "caps": DAILY_CAPS,
-        "running": ENGINE.status().get("running", False),
-    }
-    if token:
-        try:
-            import requests
-            r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-            out["getMe"] = r.json()
-        except Exception as e:
-            out["getMe"] = {"ok": False, "error": str(e)}
-    else:
-        out["getMe"] = {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
-    return jsonify(out)
-
-# ------------------------------ Live Engine ----------------------------------
-@bp.post("/live/start")
-@_admin_required
-def live_start():
-    ok, msg = ENGINE.start()
-    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
-
-@bp.post("/live/stop")
-@_admin_required
-def live_stop():
-    ok, msg = ENGINE.stop()
-    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
-
-@bp.post("/live/debug/on")
-@_admin_required
-def live_debug_on():
-    ENGINE.set_debug(True)
-    return jsonify({"ok": True})
-
-@bp.post("/live/debug/off")
-@_admin_required
-def live_debug_off():
-    ENGINE.set_debug(False)
-    return jsonify({"ok": True})
-
-@bp.get("/live/status")
-def live_status():
-    return jsonify(ENGINE.status())
-
-@bp.get("/live/tally")
-def live_tally():
-    st = ENGINE.status()
-    tally = st.get("tally") or st.get("tallies") or {}
-    return jsonify(tally)
-
-# ------------------------------ Users (Telegram) -----------------------------
 @bp.post("/users/add")
 @_admin_required
 def users_add():
@@ -626,7 +595,44 @@ def api_users():
     rows = exec_sql("SELECT id,tier,chat_id,label FROM tg_users ORDER BY tier,id", fetch=True) or []
     return jsonify([{"id":r[0],"tier":r[1],"chat_id":r[2],"label":r[3]} for r in rows])
 
+# ------------------------------ Live Engine ----------------------------------
+@bp.post("/live/start")
+@_admin_required
+def live_start():
+    ok, msg = ENGINE.start()
+    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
+
+@bp.post("/live/stop")
+@_admin_required
+def live_stop():
+    ok, msg = ENGINE.stop()
+    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
+
+@bp.post("/live/debug/on")
+@_admin_required
+def live_debug_on():
+    ENGINE.set_debug(True); return jsonify({"ok": True})
+
+@bp.post("/live/debug/off")
+@_admin_required
+def live_debug_off():
+    ENGINE.set_debug(False); return jsonify({"ok": True})
+
+@bp.get("/live/status")
+def live_status():
+    return jsonify(ENGINE.status())
+
+@bp.get("/live/tally")
+def live_tally():
+    st = ENGINE.status()
+    tally = st.get("tally") or st.get("tallies") or {}
+    return jsonify(tally)
+
 # ------------------------------ Status / Health ------------------------------
+@bp.get("/api/indicators/specs")
+def api_indicator_specs_only():
+    return jsonify(INDICATOR_SPECS)
+
 @bp.get("/api/status")
 def api_status_dup():
     s = ENGINE.status()
@@ -643,6 +649,25 @@ def api_status_dup():
         "tally": s.get("tally", {"date": datetime.now(TZ).strftime("%Y-%m-%d"),
                                   "total": 0, "by_tier": {"free":0,"basic":0,"pro":0,"vip":0}}),
     }
+    return jsonify(out)
+
+@bp.get("/api/check_bot")
+def api_check_bot():
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    out = {
+        "configured_chats": {k: bool(v) for k, v in (TIER_TO_CHAT or {}).items()},
+        "caps": DAILY_CAPS,
+        "running": ENGINE.status().get("running", False),
+    }
+    if token:
+        try:
+            import requests
+            r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+            out["getMe"] = r.json()
+        except Exception as e:
+            out["getMe"] = {"ok": False, "error": str(e)}
+    else:
+        out["getMe"] = {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
     return jsonify(out)
 
 @bp.get("/_up")
