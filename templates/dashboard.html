@@ -7,8 +7,7 @@
   <style>
     :root{
       --bg:#0b0f17; --panel:#111827; --muted:#9ca3af; --text:#e5e7eb;
-      --ok:#16a34a; --warn:#f59e0b; --err:#ef4444; --accent:#3b82f6;
-      --line:#1f2937;
+      --ok:#16a34a; --warn:#f59e0b; --err:#ef4444; --accent:#3b82f6; --line:#1f2937;
     }
     *{box-sizing:border-box}
     body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto,Inter,sans-serif}
@@ -24,10 +23,7 @@
     .btn.ok{background:rgba(22,163,74,.18);border-color:#1f5b35;color:#bff6cd}
     .btn.stop{background:rgba(239,68,68,.2);border-color:#5b1f27;color:#ffd0d0}
     .btn.ghost{background:transparent;border-color:var(--line);color:var(--muted)}
-    input, select, textarea{
-      background:#0c1322;border:1px solid #1d2741;color:var(--text);
-      border-radius:10px;padding:8px 10px;outline:none
-    }
+    input, select, textarea{background:#0c1322;border:1px solid #1d2741;color:var(--text);border-radius:10px;padding:8px 10px;outline:none}
     textarea{width:100%;min-height:70px;resize:vertical}
     label{display:inline-flex;align-items:center;gap:6px;margin:4px 10px 4px 0}
     small{color:var(--muted)}
@@ -57,6 +53,7 @@
     .checkbox-col{columns:3}
     @media (max-width:1100px){ .cols{grid-template-columns:1fr} .checkbox-col{columns:2} }
     @media (max-width:640px){ .checkbox-col{columns:1} }
+    code.small{font-size:12px}
   </style>
 </head>
 <body>
@@ -79,7 +76,6 @@
 
 <div class="grid" style="padding:14px">
 
-  {# ------------------- FLASH MESSAGES ------------------- #}
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       {% for cat, msg in messages %}
@@ -88,7 +84,6 @@
     {% endif %}
   {% endwith %}
 
-  {# ------------------- LOGIN VIEW ------------------- #}
   {% if view == 'login' %}
     <div class="panel" style="max-width:520px;margin:40px auto">
       <h3 class="section-title">Admin Login</h3>
@@ -100,7 +95,6 @@
     </div>
   {% else %}
 
-  {# ------------------- TOP STRIP: ENGINE + QUICK SEND ------------------- #}
   <div class="grid cols">
     <div class="panel">
       <div class="row">
@@ -130,41 +124,41 @@
       </div>
     </div>
 
+    <!-- Quick API Reference (requested) -->
     <div class="panel">
-      <strong>Quick Telegram Broadcast</strong>
-      <form id="frmSend" class="mt8 row" onsubmit="return sendBroadcast(event)">
-        <select name="tier">
-          <option value="all">All tiers</option>
-          <option value="free">free</option>
-          <option value="basic">basic</option>
-          <option value="pro">pro</option>
-          <option value="vip">vip</option>
-        </select>
-        <input class="w100" name="text" placeholder="Type a message to broadcast…" />
-        <button class="btn ok">Send</button>
-        <button class="btn" type="button" onclick="testAll()">Test All</button>
-      </form>
-      <div id="sendResult" class="mt8 muted"></div>
+      <strong>Quick API Reference</strong>
+      <div class="mt8">
+        <div><code class="small">POST {{ url_for('dashboard.api_ind_toggle') }}</code></div>
+        <div class="muted">Body: <code class="small">{ "key": "RSI", "enabled": true }</code></div>
+      </div>
+      <div class="mt8">
+        <div><code class="small">POST {{ url_for('dashboard.api_ind_params') }}</code></div>
+        <div class="muted">Body: <code class="small">{ "key": "RSI", "params": { "period": 14 } }</code></div>
+      </div>
+      <div class="mt8">
+        <div><code class="small">POST {{ url_for('dashboard.api_ind_toggle_all') }}</code></div>
+        <div class="muted">Body: <code class="small">{ "panel": "overlay|osc|all", "enabled": true }</code></div>
+      </div>
     </div>
   </div>
 
-  {# ------------------- MAIN GRID ------------------- #}
   <div class="grid cols">
     <div class="panel">
       <form action="{{ url_for('dashboard.view') }}" method="post">
         <h3 class="section-title">1) Symbols / Pairs & Defaults</h3>
-        <div class="mb8"><small class="muted">Select majors and/or add your own. Use “Convert PO→Deriv” to map PocketOption symbols to Deriv (frx…)</small></div>
+        <div class="mb8"><small class="muted">Select majors and/or add your own. Use “Convert PO→Deriv”.</small></div>
 
         <div class="checkbox-col mb12">
           {% set majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"] %}
           {% for po in majors %}
-            <label><input type="checkbox" name="pair_{{ po }}"> {{ po }}</label>
+            <label><input type="checkbox" name="pair_{{
+              po }}"> {{ po }}</label>
           {% endfor %}
         </div>
 
         <div class="split">
           <div>
-            <label class="w100">Manual symbols (space or comma separated)
+            <label class="w100">Manual symbols
               <textarea name="symbols_text" placeholder="frxEURUSD frxGBPUSD ...">{{ ' '.join(cfg.get('symbols_raw', [])) }}</textarea>
             </label>
             <label><input type="checkbox" name="convert_po"> Convert PO→Deriv</label>
@@ -187,8 +181,8 @@
               </label>
             </div>
             <div class="row">
-              <label>Window Start <input name="window_start" value="{{ (cfg.get('window') or {}).get('start','08:00') }}" placeholder="08:00"></label>
-              <label>Window End <input name="window_end" value="{{ (cfg.get('window') or {}).get('end','17:00') }}" placeholder="17:00"></label>
+              <label>Window Start <input name="window_start" value="{{ (cfg.get('window') or {}).get('start','08:00') }}"></label>
+              <label>Window End <input name="window_end" value="{{ (cfg.get('window') or {}).get('end','17:00') }}"></label>
               <label>TZ <input name="window_tz" value="{{ (cfg.get('window') or {}).get('timezone', tz) }}"></label>
             </div>
             <div class="row">
@@ -206,38 +200,40 @@
           {% endfor %}
         </div>
         <div class="split mt8">
-          <label>CUSTOM 1 rules<textarea name="custom1_rules" placeholder="human rules or JSON…">{{ cfg.get('custom1_rules','') }}</textarea></label>
+          <label>CUSTOM 1 rules<textarea name="custom1_rules">{{ cfg.get('custom1_rules','') }}</textarea></label>
           <label>CUSTOM 2 rules<textarea name="custom2_rules">{{ cfg.get('custom2_rules','') }}</textarea></label>
         </div>
-        <div class="mt8">
-          <label>CUSTOM 3 rules<textarea name="custom3_rules">{{ cfg.get('custom3_rules','') }}</textarea></label>
-        </div>
+        <div class="mt8"><label>CUSTOM 3 rules<textarea name="custom3_rules">{{ cfg.get('custom3_rules','') }}</textarea></label></div>
 
         <div class="divider"></div>
         <h3 class="section-title">3) Indicators</h3>
 
-        <!-- LIVE-WIRED indicator toggles + per-indicator param saves -->
+        <!-- Toggle-all controls -->
+        <div class="row mb8">
+          <button class="btn" type="button" onclick="toggleAll('overlay', true)">Enable all overlays</button>
+          <button class="btn" type="button" onclick="toggleAll('overlay', false)">Disable all overlays</button>
+          <button class="btn" type="button" onclick="toggleAll('osc', true)">Enable all oscillators</button>
+          <button class="btn" type="button" onclick="toggleAll('osc', false)">Disable all oscillators</button>
+          <button class="btn" type="button" onclick="toggleAll('all', false)">Disable ALL</button>
+        </div>
+
         <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
           {% for key, spec in ind_specs.items() %}
             {% set block = (cfg.get('indicators') or {}).get(key, {}) %}
             <div class="panel" style="padding:10px">
               <div class="row">
-                <label>
-                  <input type="checkbox" data-ind-toggle="{{ key }}" {{ 'checked' if block.get('enabled') else '' }}>
-                  <strong>{{ spec.title }}</strong>
-                </label>
+                <label><input type="checkbox" name="ind_{{ key }}" {{ 'checked' if block.get('enabled') else '' }}> <strong>{{ spec.title }}</strong></label>
                 <span class="pill">{{ spec.panel }}</span>
                 <span class="muted right">{{ key }}</span>
               </div>
               {% if spec.fields %}
-                <form class="row mt8" style="flex-wrap:wrap" onsubmit="return saveIndParams(event,'{{ key }}')">
+                <div class="row mt8" style="flex-wrap:wrap">
                   {% for fname, default in spec.fields.items() %}
                     <label class="nowrap">{{ fname }}
-                      <input style="width:120px" name="{{ fname }}" value="{{ block.get(fname, default) }}">
+                      <input style="width:120px" name="ind_{{ key }}_{{ fname }}" value="{{ block.get(fname, default) }}">
                     </label>
                   {% endfor %}
-                  <button class="btn">Save Params</button>
-                </form>
+                </div>
               {% endif %}
             </div>
           {% endfor %}
@@ -273,8 +269,8 @@
             <label><input type="checkbox" name="use_deriv_fetch" {{ 'checked' if cfg.get('use_deriv_fetch') else '' }}> Use Deriv</label>
           </div>
           <div class="mt8">
-            <input class="w100" name="bt_symbols" placeholder="Optional override: symbols (comma separated) e.g. frxEURUSD,frxGBPUSD" />
-            <label class="mt8"><input type="checkbox" name="convert_po_bt"> Convert PO→Deriv (for the above box)</label>
+            <input class="w100" name="bt_symbols" placeholder="Optional override: symbols…" />
+            <label class="mt8"><input type="checkbox" name="convert_po_bt"> Convert PO→Deriv</label>
           </div>
           <div class="row mt8">
             <label>CSV (optional) <input type="file" name="bt_csv" accept=".csv"></label>
@@ -296,9 +292,7 @@
         <h3 class="section-title">Telegram Users</h3>
         <form action="{{ url_for('dashboard.users_add') }}" method="post" class="row">
           <select name="tier">
-            {% for t in ["free","basic","pro","vip"] %}
-              <option value="{{ t }}">{{ t }}</option>
-            {% endfor %}
+            {% for t in ["free","basic","pro","vip"] %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
           </select>
           <input name="chat_id" placeholder="chat_id" required />
           <input name="label" placeholder="label (optional)" />
@@ -307,25 +301,25 @@
         <div class="list mt8">
           <table>
             <thead><tr><th>ID</th><th>Tier</th><th>Chat</th><th>Label</th><th></th></tr></thead>
-          <tbody>
-            {% for r in users %}
-              <tr>
-                <td>{{ r[0] }}</td>
-                <td>{{ r[1] }}</td>
-                <td class="nowrap">{{ r[2] }}</td>
-                <td>{{ r[3] or '' }}</td>
-                <td>
-                  <form action="{{ url_for('dashboard.users_delete') }}" method="post"
-                        onsubmit="return confirm('Delete user #{{ r[0] }}?')">
-                    <input type="hidden" name="id" value="{{ r[0] }}">
-                    <button class="btn stop">Delete</button>
-                  </form>
-                </td>
-              </tr>
-            {% else %}
-              <tr><td colspan="5" class="muted">No users yet.</td></tr>
-            {% endfor %}
-          </tbody>
+            <tbody>
+              {% for r in users %}
+                <tr>
+                  <td>{{ r[0] }}</td>
+                  <td>{{ r[1] }}</td>
+                  <td class="nowrap">{{ r[2] }}</td>
+                  <td>{{ r[3] or '' }}</td>
+                  <td>
+                    <form action="{{ url_for('dashboard.users_delete') }}" method="post"
+                          onsubmit="return confirm('Delete user #{{ r[0] }}?')">
+                      <input type="hidden" name="id" value="{{ r[0] }}">
+                      <button class="btn stop">Delete</button>
+                    </form>
+                  </td>
+                </tr>
+              {% else %}
+                <tr><td colspan="5" class="muted">No users yet.</td></tr>
+              {% endfor %}
+            </tbody>
           </table>
         </div>
       </div>
@@ -343,17 +337,20 @@ const statusHint = q('#statusHint');
 async function postJSON(url, body){
   const r = await fetch(url, {
     method:'POST',
-    headers:{},
-    body: (body instanceof FormData) ? body : JSON.stringify(body),
-    ...(body instanceof FormData ? {} : {headers:{'Content-Type':'application/json'}})
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body || {})
   });
-  const ct = r.headers.get('content-type')||'';
-  const js = ct.includes('application/json') ? await r.json() : { ok: r.ok };
-  if(!r.ok) throw js;
-  return js;
+  return r.json();
 }
 
-/* ---------------- Live Engine buttons ---------------- */
+// Toggle-all helpers
+async function toggleAll(panel, enabled){
+  const js = await postJSON('{{ url_for("dashboard.api_ind_toggle_all") }}', {panel, enabled});
+  if(js.ok){ alert(`Toggled ${panel} → ${enabled?'ON':'OFF'}`); }
+  else { alert('Failed'); }
+}
+
+// Live Engine
 q('#btnStart')?.addEventListener('click', async ()=>{
   statusHint.textContent='Starting…';
   try{
@@ -362,7 +359,6 @@ q('#btnStart')?.addEventListener('click', async ()=>{
     refreshStatus();
   }catch(e){ statusHint.textContent='Error starting'; }
 });
-
 q('#btnStop')?.addEventListener('click', async ()=>{
   statusHint.textContent='Stopping…';
   try{
@@ -371,13 +367,8 @@ q('#btnStop')?.addEventListener('click', async ()=>{
     refreshStatus();
   }catch(e){ statusHint.textContent='Error stopping'; }
 });
-
-q('#btnDbgOn')?.addEventListener('click', async ()=>{
-  await postJSON('{{ url_for("dashboard.live_debug_on") }}', {}); refreshStatus();
-});
-q('#btnDbgOff')?.addEventListener('click', async ()=>{
-  await postJSON('{{ url_for("dashboard.live_debug_off") }}', {}); refreshStatus();
-});
+q('#btnDbgOn')?.addEventListener('click', async ()=>{ await postJSON('{{ url_for("dashboard.live_debug_on") }}', {}); refreshStatus(); });
+q('#btnDbgOff')?.addEventListener('click', async ()=>{ await postJSON('{{ url_for("dashboard.live_debug_off") }}', {}); refreshStatus(); });
 
 async function refreshStatus(){
   try{
@@ -389,8 +380,9 @@ async function refreshStatus(){
     q('#st_total').textContent   = (s.tally && s.tally.total) ? s.tally.total : (s.tallies?.all ?? 0);
   }catch(e){}
 }
+setInterval(refreshStatus, 10000);
 
-/* ---------------- Backtest ---------------- */
+// Backtest
 async function runBacktest(ev){
   ev.preventDefault();
   const f = ev.target;
@@ -422,80 +414,6 @@ async function runBacktest(ev){
   }
   return false;
 }
-
-/* ---------------- Telegram send / test ---------------- */
-async function sendBroadcast(ev){
-  ev.preventDefault();
-  const f = ev.target;
-  const fd = new FormData(f);
-  q('#sendResult').textContent = 'Sending…';
-  try{
-    const r = await fetch('{{ url_for("dashboard.telegram_send") }}', { method:'POST', body: fd });
-    const js = await r.json();
-    q('#sendResult').textContent = js.ok ? 'Sent ✔' : ('Error: ' + (js.error || 'Unknown'));
-  }catch(e){
-    q('#sendResult').textContent = 'Error: ' + e;
-  }
-  return false;
-}
-
-async function testAll(){
-  q('#sendResult').textContent = 'Testing…';
-  try{
-    const fd = new FormData();
-    fd.set('text','🧪 Dashboard test');
-    const r = await fetch('{{ url_for("dashboard.telegram_test") }}', { method:'POST', body: fd });
-    const js = await r.json();
-    q('#sendResult').textContent = js.ok ? 'Test sent to all tiers ✔' : 'Test failed';
-  }catch(e){
-    q('#sendResult').textContent = 'Error: ' + e;
-  }
-}
-
-/* ---------------- LIVE indicators (AJAX) ---------------- */
-async function jsonFetch(url, opts={}){
-  const res = await fetch(url, {headers:{'Accept':'application/json', ...(opts.headers||{})}, ...opts});
-  const ct = res.headers.get('content-type')||'';
-  const body = ct.includes('application/json') ? await res.json() : await res.text();
-  if(!res.ok) throw new Error(typeof body==='string'?body:(body.error||JSON.stringify(body)));
-  return body;
-}
-
-document.querySelectorAll('[data-ind-toggle]').forEach(cb=>{
-  cb.addEventListener('change', async (e)=>{
-    const key = e.target.getAttribute('data-ind-toggle');
-    try{
-      await jsonFetch('{{ url_for("dashboard.api_ind_toggle") }}', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({key, enabled: e.target.checked})
-      });
-    }catch(err){
-      alert('Failed: '+err.message);
-      e.target.checked = !e.target.checked; // revert on error
-    }
-  });
-});
-
-async function saveIndParams(ev, key){
-  ev.preventDefault();
-  const fd = new FormData(ev.target);
-  const params = {};
-  for (const [k,v] of fd.entries()) params[k]=v;
-  try{
-    await jsonFetch('{{ url_for("dashboard.api_ind_params") }}', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({key, params})
-    });
-  }catch(err){
-    alert('Save failed: '+err.message);
-  }
-  return false;
-}
-
-/* Poll status every 10s */
-setInterval(refreshStatus, 10000);
 </script>
 </body>
 </html>
