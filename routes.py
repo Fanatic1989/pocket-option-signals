@@ -35,12 +35,11 @@ ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "admin")
 
 # ---------------- Indicator specs ----------------
 INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
-    # overlays
-    "SMA": {"title":"Simple MA","panel":"overlay","fields":{"period":50}},
-    "EMA": {"title":"Exponential MA","panel":"overlay","fields":{"period":20}},
-    "WMA": {"title":"Weighted MA","panel":"overlay","fields":{"period":20}},
+    "SMA":{"title":"Simple MA","panel":"overlay","fields":{"period":50}},
+    "EMA":{"title":"Exponential MA","panel":"overlay","fields":{"period":20}},
+    "WMA":{"title":"Weighted MA","panel":"overlay","fields":{"period":20}},
     "SMMA":{"title":"Smoothed MA","panel":"overlay","fields":{"period":20}},
-    "TMA": {"title":"Triangular MA","panel":"overlay","fields":{"period":20}},
+    "TMA":{"title":"Triangular MA","panel":"overlay","fields":{"period":20}},
     "BOLL":{"title":"Bollinger Bands","panel":"overlay","fields":{"period":20,"mult":2}},
     "KELTNER":{"title":"Keltner Channel","panel":"overlay","fields":{"period":20,"mult":2}},
     "DONCHIAN":{"title":"Donchian Channels","panel":"overlay","fields":{"period":20}},
@@ -50,7 +49,6 @@ INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
     "SUPERTREND":{"title":"Supertrend","panel":"overlay","fields":{"period":10,"mult":3}},
     "ALLIGATOR":{"title":"Alligator","panel":"overlay","fields":{"jaw":13,"teeth":8,"lips":5,"jaw_shift":8,"teeth_shift":5,"lips_shift":3}},
     "FRACTAL":{"title":"Fractal Chaos Bands","panel":"overlay","fields":{"lookback":2,"smooth":5}},
-    # oscillators
     "RSI":{"title":"RSI","panel":"osc","fields":{"period":14}},
     "STOCH":{"title":"Stochastic","panel":"osc","fields":{"k":14,"d":3}},
     "ATR":{"title":"ATR","panel":"osc","fields":{"period":14}},
@@ -171,7 +169,6 @@ def logout():
 def view():
     if request.method == "POST":
         cfg = _ensure_cfg_defaults(get_config())
-        # window + live defaults
         w = cfg.get("window", {})
         w["start"] = request.form.get("window_start", w.get("start","08:00"))
         w["end"]   = request.form.get("window_end",   w.get("end","17:00"))
@@ -180,7 +177,6 @@ def view():
         cfg["live_tf"] = request.form.get("live_tf", cfg.get("live_tf","M1")).upper()
         cfg["live_expiry"] = request.form.get("live_expiry", cfg.get("live_expiry","5m"))
 
-        # symbols (selector + manual)
         majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"]
         chosen = [m for m in majors if request.form.get(f"pair_{m}")]
         typed = (request.form.get("symbols_text","") or "").replace(",", " ").split()
@@ -188,37 +184,31 @@ def view():
         if request.form.get("convert_po"):
             symbols = convert_po_to_deriv(symbols)
         if symbols:
-            cfg["symbols_raw"] = list(dict.fromkeys(symbols))  # unique preserve
+            cfg["symbols_raw"] = list(dict.fromkeys(symbols))
 
-        # fetch settings
         cfg["use_deriv_fetch"] = bool(request.form.get("use_deriv_fetch"))
         try:
             cfg["deriv_count"] = int(request.form.get("deriv_count", cfg.get("deriv_count", 300)))
         except Exception:
             cfg["deriv_count"] = 300
 
-        # strategies toggles
         st = cfg.get("strategies", {})
         for name in ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"]:
             st[name] = {"enabled": bool(request.form.get(f"s_{name}"))}
         cfg["strategies"] = st
 
-        # custom rules
         cfg["custom1_rules"] = request.form.get("custom1_rules", cfg.get("custom1_rules",""))
         cfg["custom2_rules"] = request.form.get("custom2_rules", cfg.get("custom2_rules",""))
         cfg["custom3_rules"] = request.form.get("custom3_rules", cfg.get("custom3_rules",""))
 
-        # indicators
         _save_indicators_from_form(cfg, request.form)
-
         set_config(cfg)
         flash("Saved.", "ok")
         return redirect(url_for("dashboard.view"))
-
     return render_template("dashboard.html", **_ctx_base("dashboard"))
 
 # ---------------- Indicators: live APIs ----------------
-@bp.post("/api/indicators/toggle")
+@bp.route("/api/indicators/toggle", methods=["POST"])
 @_admin_required
 def api_ind_toggle():
     data = request.get_json(silent=True) or {}
@@ -233,7 +223,7 @@ def api_ind_toggle():
     set_config(cfg)
     return jsonify({"ok": True, "indicator": cfg["indicators"][key]})
 
-@bp.post("/api/indicators/params")
+@bp.route("/api/indicators/params", methods=["POST"])
 @_admin_required
 def api_ind_params():
     data = request.get_json(silent=True) or {}
@@ -257,13 +247,9 @@ def api_ind_params():
     set_config(cfg)
     return jsonify({"ok": True, "indicator": cfg["indicators"][key]})
 
-@bp.post("/api/indicators/toggle_all")
+@bp.route("/api/indicators/toggle_all", methods=["POST"])
 @_admin_required
 def api_ind_toggle_all():
-    """
-    JSON body:
-      { "panel": "overlay" | "osc" | "all", "enabled": true/false }
-    """
     data = request.get_json(silent=True) or {}
     panel = (data.get("panel") or "all").lower()
     enabled = bool(data.get("enabled"))
@@ -276,14 +262,14 @@ def api_ind_toggle_all():
     set_config(cfg)
     return jsonify({"ok": True, "state": cfg["indicators"]})
 
-@bp.get("/api/indicators")
+@bp.route("/api/indicators", methods=["GET"])
 @_admin_required
 def api_indicators():
     cfg = _ensure_cfg_defaults(get_config())
     return jsonify({"specs": INDICATOR_SPECS, "state": cfg.get("indicators", {})})
 
 # ---------------- Backtest ----------------
-@bp.post("/backtest")
+@bp.route("/backtest", methods=["POST"])
 @_admin_required
 def backtest():
     cfg = _ensure_cfg_defaults(get_config())
@@ -334,12 +320,40 @@ def backtest():
         "stats": stats
     })
 
-@bp.get("/plots/<name>")
+@bp.route("/plots/<name>", methods=["GET"])
 def plot_file(name: str):
     return send_file(os.path.join("static","plots", name))
 
+# ---------------- Live Engine ----------------
+@bp.route("/live/start", methods=["POST"])
+@_admin_required
+def live_start():
+    ok, msg = ENGINE.start()
+    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
+
+@bp.route("/live/stop", methods=["POST"])
+@_admin_required
+def live_stop():
+    ok, msg = ENGINE.stop()
+    return jsonify({"ok": ok, "msg": msg, "status": ENGINE.status()})
+
+@bp.route("/live/status", methods=["GET"])
+@_admin_required
+def live_status():
+    return jsonify(ENGINE.status())
+
+@bp.route("/live/debug/on", methods=["POST"])
+@_admin_required
+def live_debug_on():
+    ENGINE.set_debug(True); return jsonify({"ok": True})
+
+@bp.route("/live/debug/off", methods=["POST"])
+@_admin_required
+def live_debug_off():
+    ENGINE.set_debug(False); return jsonify({"ok": True})
+
 # ---------------- Telegram ----------------
-@bp.post("/telegram/send")
+@bp.route("/telegram/send", methods=["POST"])
 @_admin_required
 def telegram_send():
     data = request.form.to_dict() or {}
@@ -351,14 +365,14 @@ def telegram_send():
     results = {t: ENGINE.send_to_tier(t, text) for t in tiers}
     return jsonify({"ok": True, "results": results, "status": ENGINE.status()})
 
-@bp.post("/telegram/test")
+@bp.route("/telegram/test", methods=["POST"])
 @_admin_required
 def telegram_test():
     msg = request.form.get("text") or "🧪 Dashboard test"
     results = {t: ENGINE.send_to_tier(t, f"{msg} ({t.upper()})") for t in ["free","basic","pro","vip"]}
     return jsonify({"ok": True, "results": results})
 
-@bp.get("/api/check_bot")
+@bp.route("/api/check_bot", methods=["GET"])
 def api_check_bot():
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     out = {
@@ -378,7 +392,7 @@ def api_check_bot():
     return jsonify(out)
 
 # ---------------- Users ----------------
-@bp.post("/users/add")
+@bp.route("/users/add", methods=["POST"])
 @_admin_required
 def users_add():
     tier = (request.form.get("tier") or "").lower().strip()
@@ -395,7 +409,7 @@ def users_add():
         flash(f"DB error: {e}", "error")
     return redirect(url_for("dashboard.view"))
 
-@bp.post("/users/delete")
+@bp.route("/users/delete", methods=["POST"])
 @_admin_required
 def users_delete():
     try:
@@ -407,7 +421,7 @@ def users_delete():
     return redirect(url_for("dashboard.view"))
 
 # ---------------- Health ----------------
-@bp.get("/api/status")
+@bp.route("/api/status", methods=["GET"])
 def api_status_dup():
     s = ENGINE.status()
     out = {
@@ -424,6 +438,6 @@ def api_status_dup():
     }
     return jsonify(out)
 
-@bp.get("/_up")
+@bp.route("/_up", methods=["GET"])
 def up_check():
     return jsonify({"ok": True, "ts": datetime.now(timezone.utc).isoformat()+"Z"})
