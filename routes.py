@@ -1,6 +1,6 @@
-# routes.py — Dashboard, config, backtest, Telegram + Live APIs (everything enabled)
+# routes.py — Dashboard, config, backtest, Telegram + Live APIs (aliases-enabled)
 from __future__ import annotations
-import os, io
+import os, io, re
 from datetime import datetime, timezone
 from typing import Dict, Any
 
@@ -73,6 +73,40 @@ INDICATOR_SPECS: Dict[str, Dict[str, Any]] = {
 }
 
 TF_TO_GRAN = {"M1":60,"M2":120,"M3":180,"M5":300,"M10":600,"M15":900,"M30":1800,"H1":3600,"H4":14400,"D1":86400}
+
+# ---------------- Aliases / Normalizer for indicator keys --------------------
+INDICATOR_ALIASES = {
+    "STOCHASTIC": "STOCH", "STOCH": "STOCH",
+    "BOLLINGER": "BOLL", "BOLLINGERBANDS": "BOLL",
+    "KELTNERCHANNEL": "KELTNER", "KELTNER": "KELTNER",
+    "DONCHIANCHANNELS": "DONCHIAN", "DONCHIAN": "DONCHIAN",
+    "ENVELOPE": "ENVELOPES", "ENVELOPES": "ENVELOPES",
+    "PARABOLICSAR": "PSAR", "SAR": "PSAR", "PSAR": "PSAR",
+    "SUPERTREND": "SUPERTREND",
+    "ALLIGATOR": "ALLIGATOR", "FRACTALCHAOSBANDS": "FRACTAL", "FRACTAL": "FRACTAL",
+    "WILLIAMSR": "WILLR", "WILLIAMSPERCENTR": "WILLR", "PERCENTR": "WILLR", "WILLR": "WILLR",
+    "SIMPLEMA": "SMA", "MOVINGAVERAGE": "SMA", "SMA": "SMA",
+    "EMA": "EMA", "WMA": "WMA", "SMMA": "SMMA", "TMA": "TMA",
+    "RSI": "RSI", "ATR":"ATR", "ADX":"ADX", "CCI":"CCI",
+    "MOMENTUM":"MOMENTUM", "ROC":"ROC", "VORTEX":"VORTEX",
+    "MACD":"MACD", "AO":"AO", "AWESOME":"AO", "AC":"AC",
+    "BEARS":"BEARS", "BEARPOWER":"BEARS", "BULLS":"BULLS", "BULLPOWER":"BULLS",
+    "DEMARKER":"DEMARKER", "OSMA":"OSMA", "ZIGZAG":"ZIGZAG",
+    "AROON":"AROON", "STC":"STC", "ICHIMOKU":"ICHIMOKU",
+}
+_slug = re.compile(r"[\s_\-\.%]+")
+def _slugify(s: str) -> str:
+    return _slug.sub("", (s or "").upper())
+
+_ALIAS_LOOKUP: Dict[str, str] = {}
+for key, spec in INDICATOR_SPECS.items():
+    _ALIAS_LOOKUP[_slugify(key)] = key
+    _ALIAS_LOOKUP[_slugify(spec["title"])] = key
+for a, k in INDICATOR_ALIASES.items():
+    _ALIAS_LOOKUP[_slugify(a)] = k
+
+def _normalize_ind_key(user_key: str) -> str | None:
+    return _ALIAS_LOOKUP.get(_slugify(user_key))
 
 # ---------------- DB for Telegram users ----------------
 exec_sql("""CREATE TABLE IF NOT EXISTS tg_users(
@@ -221,16 +255,35 @@ def view():
     return render_template("dashboard.html", **_ctx_base("dashboard"))
 
 # ---------------- Indicator APIs (live) ----------------
+@bp.get("/api/indicators/keys")
+@_admin_required
+def api_ind_keys():
+    aliases = {}
+    for slug, k in _ALIAS_LOOKUP.items():
+        aliases.setdefault(k, []).append(slug)
+    return jsonify({"keys": list(INDICATOR_SPECS.keys()), "aliases": aliases})
+
+def _normalize_or_400(user_key: str):
+    k = _normalize_ind_key(user_key)
+    if not k:
+        return None, (jsonify({
+            "ok": False,
+            "error": f"Unknown indicator '{user_key}'",
+            "hint": "GET /api/indicators/keys for valid keys and aliases"
+        }), 400)
+    return k, None
+
 @bp.post("/api/indicators/toggle")
 @_admin_required
 def api_ind_toggle():
     data = request.get_json(silent=True) or {}
-    key = (data.get("key") or "").upper()
+    user_key = data.get("key") or ""
     enabled = bool(data.get("enabled"))
+    key, err = _normalize_or_400(user_key)
+    if err: return err
     cfg = _ensure_cfg_defaults(get_config())
-    if key not in INDICATOR_SPECS:
-        return jsonify({"ok": False, "error": f"Unknown indicator '{key}'"}), 400
-    cur = cfg["indicators"].get(key, {"enabled": False, **INDICATOR_SPECS[key]["fields"]})
+    spec = INDICATOR_SPECS[key]
+    cur = cfg["indicators"].get(key, {"enabled": False, **spec["fields"]})
     cur["enabled"] = enabled
     cfg["indicators"][key] = cur
     set_config(cfg)
@@ -240,11 +293,11 @@ def api_ind_toggle():
 @_admin_required
 def api_ind_params():
     data = request.get_json(silent=True) or {}
-    key = (data.get("key") or "").upper()
+    user_key = data.get("key") or ""
     params = data.get("params") or {}
+    key, err = _normalize_or_400(user_key)
+    if err: return err
     cfg = _ensure_cfg_defaults(get_config())
-    if key not in INDICATOR_SPECS:
-        return jsonify({"ok": False, "error": f"Unknown indicator '{key}'"}), 400
     spec = INDICATOR_SPECS[key]
     cur = cfg["indicators"].get(key, {"enabled": False, **spec["fields"]})
     for fname, default in spec["fields"].items():
@@ -440,7 +493,7 @@ def live_debug_off():
 
 @bp.get("/live/status")
 def live_status():
-    return jsonify(ENGINE.status())
+    return jsonify(ENGINE.status()))
 
 @bp.get("/live/tally")
 def live_tally():
