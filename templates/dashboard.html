@@ -24,6 +24,7 @@
     .btn.ok{background:rgba(22,163,74,.18);border-color:#1f5b35;color:#bff6cd}
     .btn.stop{background:rgba(239,68,68,.2);border-color:#5b1f27;color:#ffd0d0}
     .btn.ghost{background:transparent;border-color:var(--line);color:var(--muted)}
+    .btn.warn{background:rgba(245,158,11,.18);border-color:#7a5a12;color:#ffe0a6}
     input, select, textarea{
       background:#0c1322;border:1px solid #1d2741;color:var(--text);
       border-radius:10px;padding:8px 10px;outline:none
@@ -57,8 +58,8 @@
     .checkbox-col{columns:3}
     @media (max-width:1100px){ .cols{grid-template-columns:1fr} .checkbox-col{columns:2} }
     @media (max-width:640px){ .checkbox-col{columns:1} }
-    .mono{font-family:ui-monospace,monospace}
-    .code{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap}
+    code{background:#0a1222;border:1px solid #1b2747;padding:2px 6px;border-radius:8px;color:#bcd7ff}
+    .mono{font-family:ui-monospace, Menlo, Consolas, monospace}
   </style>
 </head>
 <body>
@@ -98,7 +99,7 @@
         <input type="password" name="password" placeholder="Password" required />
         <button class="btn ok">Login</button>
       </form>
-      <div class="mt12"><small class="muted">Default password is "admin" (env: ADMIN_PASSWORD).</small></div>
+      <div class="mt12"><small class="muted">Default password is "admin" (env: <code>ADMIN_PASSWORD</code>).</small></div>
     </div>
   {% else %}
 
@@ -150,21 +151,6 @@
     </div>
   </div>
 
-  {# ------------------- QUICK API REFERENCE ------------------- #}
-  <div class="panel">
-    <div class="row">
-      <strong>Quick API Reference</strong>
-      <span class="pill">click to try</span>
-    </div>
-    <div class="mt8 row">
-      <button class="btn" onclick="apiToggle('STOCH', true)">/api/indicators/toggle STOCH:ON</button>
-      <button class="btn" onclick="apiToggle('STOCHASTIC', false)">/api/indicators/toggle STOCHASTIC:OFF</button>
-      <button class="btn" onclick="apiParams('RSI', {period: 7})">/api/indicators/params RSI:period=7</button>
-      <button class="btn" onclick="apiParams('SUPERTREND', {period: 12, mult: 2.5})">/api/indicators/params SUPERTREND</button>
-    </div>
-    <div id="apiRefOut" class="code mt8"></div>
-  </div>
-
   {# ------------------- MAIN GRID ------------------- #}
   <div class="grid cols">
     <div class="panel">
@@ -184,7 +170,7 @@
             <label class="w100">Manual symbols (space or comma separated)
               <textarea name="symbols_text" placeholder="frxEURUSD frxGBPUSD ...">{{ ' '.join(cfg.get('symbols_raw', [])) }}</textarea>
             </label>
-            <label><input type="checkbox" name="convert_po" checked> Convert PO→Deriv</label>
+            <label><input type="checkbox" name="convert_po"> Convert PO→Deriv</label>
           </div>
           <div>
             <div class="row">
@@ -239,7 +225,7 @@
               <div class="row">
                 <label><input type="checkbox" name="ind_{{ key }}" {{ 'checked' if block.get('enabled') else '' }}> <strong>{{ spec.title }}</strong></label>
                 <span class="pill">{{ spec.panel }}</span>
-                <span class="muted right mono">{{ key }}</span>
+                <span class="muted right">{{ key }}</span>
               </div>
               {% if spec.fields %}
                 <div class="row mt8" style="flex-wrap:wrap">
@@ -285,7 +271,7 @@
           </div>
           <div class="mt8">
             <input class="w100" name="bt_symbols" placeholder="Optional override: symbols (comma or space) e.g. frxEURUSD,frxGBPUSD" />
-            <label class="mt8"><input type="checkbox" name="convert_po_bt" checked> Convert PO→Deriv (for the above box)</label>
+            <label class="mt8"><input type="checkbox" name="convert_po_bt"> Convert PO→Deriv (for the above box)</label>
           </div>
           <div class="row mt8">
             <label>CSV (optional) <input type="file" name="bt_csv" accept=".csv"></label>
@@ -301,7 +287,6 @@
         </form>
         <div id="btSummary" class="mt8 muted"></div>
         <img id="btPlot" class="plot mt8" style="display:none" alt="Backtest Plot" />
-        <pre id="btStats" class="code mt8"></pre>
       </div>
 
       <div class="panel">
@@ -342,20 +327,50 @@
         </div>
       </div>
 
-      <div class="panel">
-        <h3 class="section-title">Live Tally</h3>
+    </div>
+  </div>
+
+  {# ---------------- Quick API Reference (clickable) ---------------- #}
+  <div class="panel mt16">
+    <h3 class="section-title">Quick API Reference (live)</h3>
+    <div class="row">
+      <div>
+        <div class="mb8"><strong>Toggle Indicator</strong></div>
         <div class="row">
-          <button class="btn" onclick="loadTally()">Refresh Tally</button>
-          <div id="tallyOut" class="code"></div>
+          <button class="btn" onclick="apiToggle('STOCH', true)">/api/indicators/toggle STOCH:ON</button>
+          <button class="btn" onclick="apiToggle('STOCHASTIC', false)">/api/indicators/toggle STOCHASTIC:OFF</button>
         </div>
       </div>
-
+      <div>
+        <div class="mb8"><strong>Update Params</strong></div>
+        <div class="row">
+          <button class="btn" onclick="apiParams('RSI', {period:7})">/api/indicators/params RSI:period=7</button>
+          <button class="btn" onclick="apiParams('SUPERTREND', {period:10, mult:3})">/api/indicators/params SUPERTREND {…}</button>
+        </div>
+      </div>
+      <div>
+        <div class="mb8"><strong>Toggle All</strong></div>
+        <div class="row">
+          <button class="btn ok" onclick="apiToggleAll(true)">/api/indicators/toggle_all ON</button>
+          <button class="btn stop" onclick="apiToggleAll(false)">/api/indicators/toggle_all OFF</button>
+        </div>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="row">
+      <input id="apiRaw" class="w100" placeholder='Freeform: "RSI:ON" or "RSI:period=7" or JSON {"key":"MACD","enabled":true}'/>
+      <button class="btn" onclick="apiSendRaw()">Send</button>
+      <span id="apiOut" class="muted"></span>
+    </div>
+    <div class="mt8">
+      <small class="muted">Aliases supported: <code>STOCHASTIC→STOCH</code>, <code>W%R→WILLR</code>, <code>BOLLINGER→BOLL</code>, <code>SCHAFF→STC</code>, etc.</small>
     </div>
   </div>
 
   {% endif %}
 </div>
 
+{% if view != 'login' %}
 <script>
 const q = (sel,root=document)=>root.querySelector(sel);
 const statusHint = q('#statusHint');
@@ -367,7 +382,7 @@ async function postJSON(url, body){
     ...(body instanceof FormData ? {} : {headers:{'Content-Type':'application/json'}})
   });
   const js = await r.json().catch(()=>({}));
-  if(!r.ok) throw new Error(js.error || (js && JSON.stringify(js)) || 'HTTP '+r.status);
+  if(!r.ok){ throw new Error(js.error || 'HTTP '+r.status); }
   return js;
 }
 
@@ -378,7 +393,7 @@ q('#btnStart')?.addEventListener('click', async ()=>{
     const js = await postJSON('{{ url_for("dashboard.live_start") }}', {});
     statusHint.textContent = js.ok ? 'Started' : ('Failed: ' + (js.msg||''));
     refreshStatus();
-  }catch(e){ statusHint.textContent='Error starting: ' + e.message; }
+  }catch(e){ statusHint.textContent='Error starting: '+e.message; }
 });
 
 q('#btnStop')?.addEventListener('click', async ()=>{
@@ -387,7 +402,7 @@ q('#btnStop')?.addEventListener('click', async ()=>{
     const js = await postJSON('{{ url_for("dashboard.live_stop") }}', {});
     statusHint.textContent = js.ok ? 'Stopped' : ('Failed: ' + (js.msg||''));
     refreshStatus();
-  }catch(e){ statusHint.textContent='Error stopping: ' + e.message; }
+  }catch(e){ statusHint.textContent='Error stopping: '+e.message; }
 });
 
 q('#btnDbgOn')?.addEventListener('click', async ()=>{
@@ -419,7 +434,6 @@ async function runBacktest(ev){
   if(btn){ btn.disabled = true; btn.textContent = 'Running…'; }
   q('#btSummary').textContent = '';
   q('#btPlot').style.display='none';
-  q('#btStats').textContent='';
   try{
     const r = await fetch('{{ url_for("dashboard.backtest") }}', { method:'POST', body: fd });
     const js = await r.json();
@@ -427,7 +441,6 @@ async function runBacktest(ev){
       if(js.stats){
         const st = js.stats;
         q('#btSummary').textContent = `${st.wins||0}W / ${st.loss||0}L / ${st.draw||0}D — WR ${(st.win_rate||0).toFixed(1)}%`;
-        q('#btStats').textContent = JSON.stringify(st, null, 2);
       }
       if(js.plot){
         const img = q('#btPlot');
@@ -460,7 +473,6 @@ async function sendBroadcast(ev){
   }
   return false;
 }
-
 async function testAll(){
   q('#sendResult').textContent = 'Testing…';
   try{
@@ -474,37 +486,49 @@ async function testAll(){
   }
 }
 
-// ---------- Live tally panel ----------
-async function loadTally(){
-  try{
-    const r = await fetch('{{ url_for("dashboard.live_tally") }}');
-    const js = await r.json();
-    q('#tallyOut').textContent = JSON.stringify(js, null, 2);
-  }catch(e){
-    q('#tallyOut').textContent = 'Error: ' + e.message;
-  }
-}
-
-// ---------- Quick API Reference buttons ----------
+// ---------- Quick API Reference ----------
 async function apiToggle(key, enabled){
   try{
     const js = await postJSON('{{ url_for("dashboard.api_ind_toggle") }}', {key, enabled});
-    q('#apiRefOut').textContent = JSON.stringify(js, null, 2);
-  }catch(e){
-    q('#apiRefOut').textContent = 'Error: ' + e.message;
-  }
+    q('#apiOut').textContent = JSON.stringify(js);
+  }catch(e){ q('#apiOut').textContent = 'Error: '+e.message; }
 }
 async function apiParams(key, params){
   try{
     const js = await postJSON('{{ url_for("dashboard.api_ind_params") }}', {key, params});
-    q('#apiRefOut').textContent = JSON.stringify(js, null, 2);
+    q('#apiOut').textContent = JSON.stringify(js);
+  }catch(e){ q('#apiOut').textContent = 'Error: '+e.message; }
+}
+async function apiToggleAll(enabled){
+  try{
+    const js = await postJSON('{{ url_for("dashboard.api_ind_toggle_all") }}', {enabled});
+    q('#apiOut').textContent = JSON.stringify(js);
+  }catch(e){ q('#apiOut').textContent = 'Error: '+e.message; }
+}
+async function apiSendRaw(){
+  const raw = q('#apiRaw').value.trim();
+  if(!raw){ q('#apiOut').textContent = 'Enter a command first.'; return; }
+  try{
+    // Try raw to /toggle first if it looks like KEY:ON/OFF, else /params
+    if(raw.includes(':') && !raw.includes('{') && !raw.includes('=') ){
+      const js = await fetch('{{ url_for("dashboard.api_ind_toggle") }}', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(raw) }).then(r=>r.json());
+      q('#apiOut').textContent = JSON.stringify(js);
+    }else if(raw.includes(':') && raw.includes('=')){
+      const js = await fetch('{{ url_for("dashboard.api_ind_params") }}', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(raw) }).then(r=>r.json());
+      q('#apiOut').textContent = JSON.stringify(js);
+    }else{
+      // Try as JSON
+      const js = await fetch('{{ url_for("dashboard.api_ind_params") }}', { method:'POST', headers:{'Content-Type':'application/json'}, body: raw }).then(r=>r.json());
+      q('#apiOut').textContent = JSON.stringify(js);
+    }
   }catch(e){
-    q('#apiRefOut').textContent = 'Error: ' + e.message;
+    q('#apiOut').textContent = 'Error: '+e.message;
   }
 }
 
 // Poll status every 10s
 setInterval(refreshStatus, 10000);
 </script>
+{% endif %}
 </body>
 </html>
