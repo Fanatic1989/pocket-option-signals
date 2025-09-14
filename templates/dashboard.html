@@ -5,7 +5,11 @@
   <title>Signal Dashboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    :root{ --bg:#0b0f17; --panel:#111827; --muted:#9ca3af; --text:#e5e7eb; --ok:#16a34a; --warn:#f59e0b; --err:#ef4444; --accent:#3b82f6; --line:#1f2937; }
+    :root{
+      --bg:#0b0f17; --panel:#111827; --muted:#9ca3af; --text:#e5e7eb;
+      --ok:#16a34a; --warn:#f59e0b; --err:#ef4444; --accent:#3b82f6;
+      --line:#1f2937;
+    }
     *{box-sizing:border-box}
     body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto,Inter,sans-serif}
     header{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:14px 16px;background:#0f1625;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}
@@ -20,19 +24,41 @@
     .btn.ok{background:rgba(22,163,74,.18);border-color:#1f5b35;color:#bff6cd}
     .btn.stop{background:rgba(239,68,68,.2);border-color:#5b1f27;color:#ffd0d0}
     .btn.ghost{background:transparent;border-color:var(--line);color:var(--muted)}
-    input, select, textarea{background:#0c1322;border:1px solid #1d2741;color:var(--text);border-radius:10px;padding:8px 10px;outline:none}
+    input, select, textarea{
+      background:#0c1322;border:1px solid #1d2741;color:var(--text);
+      border-radius:10px;padding:8px 10px;outline:none
+    }
     textarea{width:100%;min-height:70px;resize:vertical}
     label{display:inline-flex;align-items:center;gap:6px;margin:4px 10px 4px 0}
     small{color:var(--muted)}
     .tag{display:inline-block;padding:2px 8px;border-radius:999px;background:#18233b;color:#b9d1ff;font-size:12px;border:1px solid #223055}
     .kvs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
     .kvs div{background:#0c1322;border:1px solid #1d2741;border-radius:10px;padding:8px}
+    .flex{display:flex;gap:10px;align-items:center}
     .split{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .mb8{margin-bottom:8px}.mb12{margin-bottom:12px}.mb16{margin-bottom:16px}
+    .mt8{margin-top:8px}.mt12{margin-top:12px}.mt16{margin-top:16px}
+    .section-title{font-weight:700;margin:0 0 8px 0}
+    .divider{height:1px;background:var(--line);margin:10px 0}
+    .pill{padding:2px 6px;border-radius:8px;border:1px solid var(--line);background:#0d1526;color:#cbd5e1;font-size:12px}
+    .list{max-height:220px;overflow:auto;border:1px solid #1d2741;border-radius:10px}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid #15203a}
+    th{position:sticky;top:0;background:#111b2f;text-align:left}
+    .flash{padding:8px 10px;border-radius:10px;margin:8px 0;border:1px solid #233154}
+    .flash.ok{background:rgba(22,163,74,.16);border-color:#205837}
+    .flash.error{background:rgba(239,68,68,.14);border-color:#6f2a2a}
+    .flash.info{background:#0f1a31;border-color:#243456}
+    .caps{display:flex;flex-wrap:wrap;gap:6px}
+    .w100{width:100%}
+    .nowrap{white-space:nowrap}
+    .right{margin-left:auto}
+    img.plot{width:100%;border:1px solid #172342;border-radius:12px;background:#0b0f17}
     .checkbox-col{columns:3}
     @media (max-width:1100px){ .cols{grid-template-columns:1fr} .checkbox-col{columns:2} }
     @media (max-width:640px){ .checkbox-col{columns:1} }
-    pre.code{white-space:pre-wrap;background:#0c1322;border:1px solid #1d2741;border-radius:10px;padding:10px}
-    img.plot{width:100%;border:1px solid #172342;border-radius:12px;background:#0b0f17}
+    .mono{font-family:ui-monospace,monospace}
+    .code{font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap}
   </style>
 </head>
 <body>
@@ -55,6 +81,7 @@
 
 <div class="grid" style="padding:14px">
 
+  {# ------------------- FLASH MESSAGES ------------------- #}
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       {% for cat, msg in messages %}
@@ -63,6 +90,7 @@
     {% endif %}
   {% endwith %}
 
+  {# ------------------- LOGIN VIEW ------------------- #}
   {% if view == 'login' %}
     <div class="panel" style="max-width:520px;margin:40px auto">
       <h3 class="section-title">Admin Login</h3>
@@ -72,88 +100,112 @@
       </form>
       <div class="mt12"><small class="muted">Default password is "admin" (env: ADMIN_PASSWORD).</small></div>
     </div>
-
   {% else %}
 
-  <!-- Top strip -->
+  {# ------------------- TOP STRIP: ENGINE + QUICK SEND ------------------- #}
   <div class="grid cols">
     <div class="panel">
       <div class="row">
         <strong>Live Engine</strong>
-        <span class="tag">Running: <span id="st_running">{{ 'true' if engine.get('running') else 'false' }}</span></span>
-        <span class="tag">Debug: <span id="st_debug">{{ 'true' if engine.get('debug') else 'false' }}</span></span>
-        <span class="tag">Loop Sleep: <span id="st_sleep">{{ engine.get('loop_sleep',4) }}</span>s</span>
-        <span class="tag">Total: <span id="st_total">{{ (engine.get('tally') or {}).get('total', 0) }}</span></span>
+        <span class="pill">Running: <span id="st_running">{{ 'true' if engine.get('running') else 'false' }}</span></span>
+        <span class="pill">Debug: <span id="st_debug">{{ 'true' if engine.get('debug') else 'false' }}</span></span>
+        <span class="pill">Loop Sleep: <span id="st_sleep">{{ engine.get('loop_sleep',4) }}</span>s</span>
+        <span class="pill">Total: <span id="st_total">{{ (engine.get('tally') or {}).get('total', 0) }}</span></span>
         <button id="btnStart" class="btn ok">Start</button>
         <button id="btnStop" class="btn stop">Stop</button>
         <button id="btnDbgOn" class="btn">Debug ON</button>
         <button id="btnDbgOff" class="btn">Debug OFF</button>
-        <span class="muted" id="statusHint"></span>
+        <span class="right muted" id="statusHint"></span>
+      </div>
+      <div class="divider"></div>
+      <div class="kvs">
+        <div><small>Configured chats</small><div class="caps">
+          {% for tier, cid in (tier_to_chat or {}).items() %}
+            <span class="tag">{{ tier }}: {{ 'yes' if cid else 'no' }}</span>
+          {% endfor %}
+        </div></div>
+        <div><small>Daily caps</small><div class="caps">
+          {% for tier, cap in (daily_caps or {}).items() %}
+            <span class="tag">{{ tier }}: {{ cap if cap is not none else '∞' }}</span>
+          {% endfor %}
+        </div></div>
       </div>
     </div>
 
-    <!-- Signals / Tally -->
     <div class="panel">
-      <strong>Signals / Tally</strong>
-      <div class="row mt8">
-        <button class="btn ok" id="btnTestAll">Send Test Signal to ALL</button>
-        <button class="btn" id="btnTally">Refresh Live Tally</button>
-        <button class="btn" id="btnCheckBot">Check Bot</button>
-      </div>
-      <div class="mt8"><pre id="tallyBox" class="code">—</pre></div>
+      <strong>Quick Telegram Broadcast</strong>
+      <form id="frmSend" class="mt8 row" onsubmit="return sendBroadcast(event)">
+        <select name="tier">
+          <option value="all">All tiers</option>
+          <option value="free">free</option>
+          <option value="basic">basic</option>
+          <option value="pro">pro</option>
+          <option value="vip">vip</option>
+        </select>
+        <input class="w100" name="text" placeholder="Type a message to broadcast…" />
+        <button class="btn ok">Send</button>
+        <button class="btn" type="button" onclick="testAll()">Test All</button>
+      </form>
+      <div id="sendResult" class="mt8 muted"></div>
     </div>
   </div>
 
-  <!-- Middle: Telegram Broadcast -->
+  {# ------------------- QUICK API REFERENCE ------------------- #}
   <div class="panel">
-    <strong>Quick Telegram Broadcast</strong>
-    <form id="frmSend" class="row" onsubmit="return sendBroadcast(event)">
-      <select name="tier">
-        <option value="all">All tiers</option>
-        <option value="free">free</option>
-        <option value="basic">basic</option>
-        <option value="pro">pro</option>
-        <option value="vip">vip</option>
-      </select>
-      <input class="w100" name="text" placeholder="Type a message to broadcast…" />
-      <button class="btn ok">Send</button>
-    </form>
-    <div id="sendResult" class="mt8 muted"></div>
+    <div class="row">
+      <strong>Quick API Reference</strong>
+      <span class="pill">click to try</span>
+    </div>
+    <div class="mt8 row">
+      <button class="btn" onclick="apiToggle('STOCH', true)">/api/indicators/toggle STOCH:ON</button>
+      <button class="btn" onclick="apiToggle('STOCHASTIC', false)">/api/indicators/toggle STOCHASTIC:OFF</button>
+      <button class="btn" onclick="apiParams('RSI', {period: 7})">/api/indicators/params RSI:period=7</button>
+      <button class="btn" onclick="apiParams('SUPERTREND', {period: 12, mult: 2.5})">/api/indicators/params SUPERTREND</button>
+    </div>
+    <div id="apiRefOut" class="code mt8"></div>
   </div>
 
-  <!-- Main grid -->
+  {# ------------------- MAIN GRID ------------------- #}
   <div class="grid cols">
-    <!-- Left: Config -->
     <div class="panel">
       <form action="{{ url_for('dashboard.view') }}" method="post">
         <h3 class="section-title">1) Symbols / Pairs & Defaults</h3>
-        <div class="checkbox-col">
+        <div class="mb8"><small class="muted">Select majors and/or add your own. Use “Convert PO→Deriv” to map PocketOption symbols to Deriv (frx…)</small></div>
+
+        <div class="checkbox-col mb12">
           {% set majors = ["EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD","EURGBP","EURJPY","GBPJPY","EURAUD","AUDJPY","CADJPY","CHFJPY"] %}
-          {% for po in majors %}<label><input type="checkbox" name="pair_{{ po }}"> {{ po }}</label>{% endfor %}
+          {% for po in majors %}
+            <label><input type="checkbox" name="pair_{{ po }}"> {{ po }}</label>
+          {% endfor %}
         </div>
+
         <div class="split">
           <div>
-            <label>Manual symbols
+            <label class="w100">Manual symbols (space or comma separated)
               <textarea name="symbols_text" placeholder="frxEURUSD frxGBPUSD ...">{{ ' '.join(cfg.get('symbols_raw', [])) }}</textarea>
             </label>
-            <label><input type="checkbox" name="convert_po"> Convert PO→Deriv</label>
+            <label><input type="checkbox" name="convert_po" checked> Convert PO→Deriv</label>
           </div>
           <div>
             <div class="row">
               <label>Live TF
-                <select name="live_tf">{% for tf in ["M1","M2","M3","M5","M10","M15","M30","H1","H4","D1"] %}
-                  <option value="{{ tf }}" {{ 'selected' if cfg.get('live_tf')==tf else '' }}>{{ tf }}</option>{% endfor %}
+                <select name="live_tf">
+                  {% for tf in ["M1","M2","M3","M5","M10","M15","M30","H1","H4","D1"] %}
+                    <option value="{{ tf }}" {{ 'selected' if cfg.get('live_tf')==tf else '' }}>{{ tf }}</option>
+                  {% endfor %}
                 </select>
               </label>
               <label>Live Expiry
-                <select name="live_expiry">{% for e in ["1m","3m","5m","10m","30m","1h","4h"] %}
-                  <option value="{{ e }}" {{ 'selected' if cfg.get('live_expiry')==e else '' }}>{{ e }}</option>{% endfor %}
+                <select name="live_expiry">
+                  {% for e in ["1m","3m","5m","10m","30m","1h","4h"] %}
+                    <option value="{{ e }}" {{ 'selected' if cfg.get('live_expiry')==e else '' }}>{{ e }}</option>
+                  {% endfor %}
                 </select>
               </label>
             </div>
             <div class="row">
-              <label>Window Start <input name="window_start" value="{{ (cfg.get('window') or {}).get('start','08:00') }}"></label>
-              <label>Window End <input name="window_end" value="{{ (cfg.get('window') or {}).get('end','17:00') }}"></label>
+              <label>Window Start <input name="window_start" value="{{ (cfg.get('window') or {}).get('start','08:00') }}" placeholder="08:00"></label>
+              <label>Window End <input name="window_end" value="{{ (cfg.get('window') or {}).get('end','17:00') }}" placeholder="17:00"></label>
               <label>TZ <input name="window_tz" value="{{ (cfg.get('window') or {}).get('timezone', tz) }}"></label>
             </div>
             <div class="row">
@@ -170,11 +222,13 @@
             <label><input type="checkbox" name="s_{{ s }}" {{ 'checked' if (cfg.get('strategies',{}).get(s,{}).get('enabled')) else '' }}> {{ s }}</label>
           {% endfor %}
         </div>
-        <div class="split">
-          <label>CUSTOM 1 rules<textarea name="custom1_rules">{{ cfg.get('custom1_rules','') }}</textarea></label>
+        <div class="split mt8">
+          <label>CUSTOM 1 rules<textarea name="custom1_rules" placeholder="human rules or JSON…">{{ cfg.get('custom1_rules','') }}</textarea></label>
           <label>CUSTOM 2 rules<textarea name="custom2_rules">{{ cfg.get('custom2_rules','') }}</textarea></label>
         </div>
-        <label>CUSTOM 3 rules<textarea name="custom3_rules">{{ cfg.get('custom3_rules','') }}</textarea></label>
+        <div class="mt8">
+          <label>CUSTOM 3 rules<textarea name="custom3_rules">{{ cfg.get('custom3_rules','') }}</textarea></label>
+        </div>
 
         <div class="divider"></div>
         <h3 class="section-title">3) Indicators</h3>
@@ -184,13 +238,15 @@
             <div class="panel" style="padding:10px">
               <div class="row">
                 <label><input type="checkbox" name="ind_{{ key }}" {{ 'checked' if block.get('enabled') else '' }}> <strong>{{ spec.title }}</strong></label>
-                <span class="tag">{{ spec.panel }}</span>
-                <span class="muted" style="margin-left:auto">{{ key }}</span>
+                <span class="pill">{{ spec.panel }}</span>
+                <span class="muted right mono">{{ key }}</span>
               </div>
               {% if spec.fields %}
-                <div class="row" style="flex-wrap:wrap">
+                <div class="row mt8" style="flex-wrap:wrap">
                   {% for fname, default in spec.fields.items() %}
-                    <label class="nowrap">{{ fname }} <input style="width:120px" name="ind_{{ key }}_{{ fname }}" value="{{ block.get(fname, default) }}"></label>
+                    <label class="nowrap">{{ fname }}
+                      <input style="width:120px" name="ind_{{ key }}_{{ fname }}" value="{{ block.get(fname, default) }}">
+                    </label>
                   {% endfor %}
                 </div>
               {% endif %}
@@ -198,80 +254,83 @@
           {% endfor %}
         </div>
 
-        <div class="row" style="margin-top:10px">
+        <div class="mt12 row">
           <button class="btn ok">Save All</button>
-          <span class="muted">Saved in SQLite.</span>
+          <span class="muted">Saved values persist in SQLite.</span>
         </div>
       </form>
     </div>
 
-    <!-- Right column: Backtest + Quick API + Users -->
     <div class="grid" style="gap:14px">
       <div class="panel">
         <h3 class="section-title">Backtest</h3>
         <form id="frmBT" onsubmit="return runBacktest(event)" enctype="multipart/form-data">
           <div class="row">
             <label>TF
-              <select name="bt_tf">{% for tf in ["M1","M2","M3","M5","M10","M15","M30","H1","H4","D1"] %}
-                <option value="{{ tf }}" {{ 'selected' if cfg.get('live_tf')==tf else '' }}>{{ tf }}</option>{% endfor %}
+              <select name="bt_tf">
+                {% for tf in ["M1","M2","M3","M5","M10","M15","M30","H1","H4","D1"] %}
+                  <option value="{{ tf }}" {{ 'selected' if cfg.get('live_tf')==tf else '' }}>{{ tf }}</option>
+                {% endfor %}
               </select>
             </label>
             <label>Expiry
-              <select name="bt_expiry">{% for e in ["1m","3m","5m","10m","30m","1h","4h"] %}
-                <option value="{{ e }}" {{ 'selected' if cfg.get('live_expiry')==e else '' }}>{{ e }}</option>{% endfor %}
+              <select name="bt_expiry">
+                {% for e in ["1m","3m","5m","10m","30m","1h","4h"] %}
+                  <option value="{{ e }}" {{ 'selected' if cfg.get('live_expiry')==e else '' }}>{{ e }}</option>
+                {% endfor %}
               </select>
             </label>
             <label>Count <input type="number" name="bt_count" value="{{ cfg.get('deriv_count',300) }}" min="60" step="60" style="width:110px"></label>
             <label><input type="checkbox" name="use_deriv_fetch" {{ 'checked' if cfg.get('use_deriv_fetch') else '' }}> Use Deriv</label>
           </div>
-          <input class="w100" name="bt_symbols" placeholder="Optional symbols override (comma) e.g. frxEURUSD,frxGBPUSD" />
-          <label><input type="checkbox" name="convert_po_bt"> Convert PO→Deriv</label>
-          <div class="row">
+          <div class="mt8">
+            <input class="w100" name="bt_symbols" placeholder="Optional override: symbols (comma or space) e.g. frxEURUSD,frxGBPUSD" />
+            <label class="mt8"><input type="checkbox" name="convert_po_bt" checked> Convert PO→Deriv (for the above box)</label>
+          </div>
+          <div class="row mt8">
             <label>CSV (optional) <input type="file" name="bt_csv" accept=".csv"></label>
             <label>Strategy
-              <select name="bt_strategy">{% for s in ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"] %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
+              <select name="bt_strategy">
+                {% for s in ["BASE","TREND","CHOP","CUSTOM1","CUSTOM2","CUSTOM3"] %}
+                  <option value="{{ s }}">{{ s }}</option>
+                {% endfor %}
+              </select>
             </label>
             <button class="btn ok">Run</button>
           </div>
         </form>
-        <div id="btSummary" class="muted" style="margin-top:8px"></div>
-        <img id="btPlot" class="plot" style="display:none" alt="Backtest Plot" />
-      </div>
-
-      <!-- Quick API Reference -->
-      <div class="panel">
-        <h3 class="section-title">Quick API Reference (clickable)</h3>
-        <small class="muted">/api/indicators/toggle · /api/indicators/params · /api/indicators/toggle_all</small>
-        <div class="divider"></div>
-        <strong>Toggle Indicator</strong>
-        <div class="row"><input id="api_key_toggle" placeholder="e.g. RSI" /><label><input type="checkbox" id="api_enabled_toggle"> enabled</label><button class="btn" id="btnApiToggle">POST /api/indicators/toggle</button></div>
-        <div class="divider"></div>
-        <strong>Update Params</strong>
-        <div class="row"><input id="api_key_params" placeholder="e.g. RSI" /><input id="api_params_json" class="w100" placeholder='JSON e.g. {"period":14}' /><button class="btn" id="btnApiParams">POST /api/indicators/params</button></div>
-        <div class="divider"></div>
-        <strong>Toggle All</strong>
-        <div class="row"><select id="api_panel"><option value="all">all</option><option value="overlay">overlay</option><option value="osc">osc</option></select><label><input type="checkbox" id="api_enabled_all"> enabled</label><button class="btn" id="btnApiAll">POST /api/indicators/toggle_all</button></div>
-        <pre id="apiOut" class="code" style="margin-top:8px">—</pre>
+        <div id="btSummary" class="mt8 muted"></div>
+        <img id="btPlot" class="plot mt8" style="display:none" alt="Backtest Plot" />
+        <pre id="btStats" class="code mt8"></pre>
       </div>
 
       <div class="panel">
         <h3 class="section-title">Telegram Users</h3>
         <form action="{{ url_for('dashboard.users_add') }}" method="post" class="row">
-          <select name="tier">{% for t in ["free","basic","pro","vip"] %}<option value="{{ t }}">{{ t }}</option>{% endfor %}</select>
+          <select name="tier">
+            {% for t in ["free","basic","pro","vip"] %}
+              <option value="{{ t }}">{{ t }}</option>
+            {% endfor %}
+          </select>
           <input name="chat_id" placeholder="chat_id" required />
           <input name="label" placeholder="label (optional)" />
           <button class="btn ok">Add</button>
         </form>
-        <div class="list" style="margin-top:8px">
+        <div class="list mt8">
           <table>
             <thead><tr><th>ID</th><th>Tier</th><th>Chat</th><th>Label</th><th></th></tr></thead>
             <tbody>
               {% for r in users %}
                 <tr>
-                  <td>{{ r[0] }}</td><td>{{ r[1] }}</td><td class="nowrap">{{ r[2] }}</td><td>{{ r[3] or '' }}</td>
+                  <td>{{ r[0] }}</td>
+                  <td>{{ r[1] }}</td>
+                  <td class="nowrap mono">{{ r[2] }}</td>
+                  <td>{{ r[3] or '' }}</td>
                   <td>
-                    <form action="{{ url_for('dashboard.users_delete') }}" method="post" onsubmit="return confirm('Delete user #{{ r[0] }}?')">
-                      <input type="hidden" name="id" value="{{ r[0] }}"><button class="btn stop">Delete</button>
+                    <form action="{{ url_for('dashboard.users_delete') }}" method="post"
+                          onsubmit="return confirm('Delete user #{{ r[0] }}?')">
+                      <input type="hidden" name="id" value="{{ r[0] }}">
+                      <button class="btn stop">Delete</button>
                     </form>
                   </td>
                 </tr>
@@ -283,35 +342,62 @@
         </div>
       </div>
 
+      <div class="panel">
+        <h3 class="section-title">Live Tally</h3>
+        <div class="row">
+          <button class="btn" onclick="loadTally()">Refresh Tally</button>
+          <div id="tallyOut" class="code"></div>
+        </div>
+      </div>
+
     </div>
   </div>
 
   {% endif %}
 </div>
 
-{% if view != 'login' %}
 <script>
 const q = (sel,root=document)=>root.querySelector(sel);
+const statusHint = q('#statusHint');
 
 async function postJSON(url, body){
-  const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{}) });
-  return r.json();
+  const r = await fetch(url, {
+    method:'POST',
+    body: (body instanceof FormData) ? body : JSON.stringify(body),
+    ...(body instanceof FormData ? {} : {headers:{'Content-Type':'application/json'}})
+  });
+  const js = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(js.error || (js && JSON.stringify(js)) || 'HTTP '+r.status);
+  return js;
 }
 
-/* ---- Live Engine ---- */
-const statusHint = q('#statusHint');
+// ---------- Live Engine buttons ----------
 q('#btnStart')?.addEventListener('click', async ()=>{
   statusHint.textContent='Starting…';
-  try{ const js = await postJSON('{{ url_for("dashboard.live_start") }}', {}); statusHint.textContent = js.ok ? 'Started' : ('Failed: ' + (js.msg||'')); refreshStatus(); }
-  catch(e){ statusHint.textContent='Error starting'; }
+  try{
+    const js = await postJSON('{{ url_for("dashboard.live_start") }}', {});
+    statusHint.textContent = js.ok ? 'Started' : ('Failed: ' + (js.msg||''));
+    refreshStatus();
+  }catch(e){ statusHint.textContent='Error starting: ' + e.message; }
 });
+
 q('#btnStop')?.addEventListener('click', async ()=>{
   statusHint.textContent='Stopping…';
-  try{ const js = await postJSON('{{ url_for("dashboard.live_stop") }}', {}); statusHint.textContent = js.ok ? 'Stopped' : ('Failed: ' + (js.msg||'')); refreshStatus(); }
-  catch(e){ statusHint.textContent='Error stopping'; }
+  try{
+    const js = await postJSON('{{ url_for("dashboard.live_stop") }}', {});
+    statusHint.textContent = js.ok ? 'Stopped' : ('Failed: ' + (js.msg||''));
+    refreshStatus();
+  }catch(e){ statusHint.textContent='Error stopping: ' + e.message; }
 });
-q('#btnDbgOn')?.addEventListener('click', async ()=>{ await postJSON('{{ url_for("dashboard.live_debug_on") }}', {}); refreshStatus(); });
-q('#btnDbgOff')?.addEventListener('click', async ()=>{ await postJSON('{{ url_for("dashboard.live_debug_off") }}', {}); refreshStatus(); });
+
+q('#btnDbgOn')?.addEventListener('click', async ()=>{
+  try{ await postJSON('{{ url_for("dashboard.live_debug_on") }}', {}); }catch(e){}
+  refreshStatus();
+});
+q('#btnDbgOff')?.addEventListener('click', async ()=>{
+  try{ await postJSON('{{ url_for("dashboard.live_debug_off") }}', {}); }catch(e){}
+  refreshStatus();
+});
 
 async function refreshStatus(){
   try{
@@ -323,38 +409,8 @@ async function refreshStatus(){
     q('#st_total').textContent   = (s.tally && s.tally.total) ? s.tally.total : (s.tallies?.all ?? 0);
   }catch(e){}
 }
-setInterval(refreshStatus, 10000);
 
-/* ---- Telegram: test/tally/check/broadcast ---- */
-q('#btnTestAll')?.addEventListener('click', async ()=>{
-  const fd = new FormData(); fd.set('text','🧪 Dashboard test');
-  const r = await fetch('{{ url_for("dashboard.telegram_test") }}', {method:'POST', body: fd});
-  const js = await r.json();
-  q('#tallyBox').textContent = JSON.stringify(js, null, 2);
-});
-q('#btnTally')?.addEventListener('click', async ()=>{
-  const r = await fetch('{{ url_for("dashboard.live_tally") }}');
-  const js = await r.json();
-  q('#tallyBox').textContent = JSON.stringify(js, null, 2);
-});
-q('#btnCheckBot')?.addEventListener('click', async ()=>{
-  const r = await fetch('{{ url_for("dashboard.api_check_bot") }}');
-  const js = await r.json();
-  q('#tallyBox').textContent = JSON.stringify(js, null, 2);
-});
-async function sendBroadcast(ev){
-  ev.preventDefault();
-  const f = ev.target, fd = new FormData(f);
-  q('#sendResult').textContent = 'Sending…';
-  try{
-    const r = await fetch('{{ url_for("dashboard.telegram_send") }}', { method:'POST', body: fd });
-    const js = await r.json();
-    q('#sendResult').textContent = js.ok ? 'Sent ✔' : ('Error: ' + (js.error || 'Unknown'));
-  }catch(e){ q('#sendResult').textContent = 'Error: ' + e; }
-  return false;
-}
-
-/* ---- Backtest ---- */
+// ---------- Backtest ----------
 async function runBacktest(ev){
   ev.preventDefault();
   const f = ev.target;
@@ -363,6 +419,7 @@ async function runBacktest(ev){
   if(btn){ btn.disabled = true; btn.textContent = 'Running…'; }
   q('#btSummary').textContent = '';
   q('#btPlot').style.display='none';
+  q('#btStats').textContent='';
   try{
     const r = await fetch('{{ url_for("dashboard.backtest") }}', { method:'POST', body: fd });
     const js = await r.json();
@@ -370,6 +427,7 @@ async function runBacktest(ev){
       if(js.stats){
         const st = js.stats;
         q('#btSummary').textContent = `${st.wins||0}W / ${st.loss||0}L / ${st.draw||0}D — WR ${(st.win_rate||0).toFixed(1)}%`;
+        q('#btStats').textContent = JSON.stringify(st, null, 2);
       }
       if(js.plot){
         const img = q('#btPlot');
@@ -380,44 +438,73 @@ async function runBacktest(ev){
       q('#btSummary').textContent = 'Error: ' + (js.error || 'Unknown');
     }
   }catch(e){
-    q('#btSummary').textContent = 'Error: ' + e;
+    q('#btSummary').textContent = 'Error: ' + e.message;
   }finally{
     if(btn){ btn.disabled=false; btn.textContent='Run'; }
   }
   return false;
 }
 
-/* ---- Quick API Reference buttons ---- */
-const out = q('#apiOut');
-q('#btnApiToggle')?.addEventListener('click', async ()=>{
-  const key = q('#api_key_toggle').value.trim().toUpperCase();
-  const enabled = q('#api_enabled_toggle').checked;
-  const r = await fetch('{{ url_for("dashboard.api_ind_toggle") }}', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({key, enabled})
-  });
-  const js = await r.json(); out.textContent = JSON.stringify(js, null, 2);
-});
-q('#btnApiParams')?.addEventListener('click', async ()=>{
-  const key = q('#api_key_params').value.trim().toUpperCase();
-  let params = {};
-  try{ params = JSON.parse(q('#api_params_json').value || '{}'); }catch(e){ return out.textContent='Invalid JSON'; }
-  const r = await fetch('{{ url_for("dashboard.api_ind_params") }}', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({key, params})
-  });
-  const js = await r.json(); out.textContent = JSON.stringify(js, null, 2);
-});
-q('#btnApiAll')?.addEventListener('click', async ()=>{
-  const panel = q('#api_panel').value;
-  const enabled = q('#api_enabled_all').checked;
-  const r = await fetch('{{ url_for("dashboard.api_ind_toggle_all") }}', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({panel, enabled})
-  });
-  const js = await r.json(); out.textContent = JSON.stringify(js, null, 2);
-});
+// ---------- Telegram send / test ----------
+async function sendBroadcast(ev){
+  ev.preventDefault();
+  const f = ev.target;
+  const fd = new FormData(f);
+  q('#sendResult').textContent = 'Sending…';
+  try{
+    const r = await fetch('{{ url_for("dashboard.telegram_send") }}', { method:'POST', body: fd });
+    const js = await r.json();
+    q('#sendResult').textContent = js.ok ? 'Sent ✔' : ('Error: ' + (js.error || 'Unknown'));
+  }catch(e){
+    q('#sendResult').textContent = 'Error: ' + e.message;
+  }
+  return false;
+}
+
+async function testAll(){
+  q('#sendResult').textContent = 'Testing…';
+  try{
+    const fd = new FormData();
+    fd.set('text','🧪 Dashboard test');
+    const r = await fetch('{{ url_for("dashboard.telegram_test") }}', { method:'POST', body: fd });
+    const js = await r.json();
+    q('#sendResult').textContent = js.ok ? 'Test sent to all tiers ✔' : 'Test failed';
+  }catch(e){
+    q('#sendResult').textContent = 'Error: ' + e.message;
+  }
+}
+
+// ---------- Live tally panel ----------
+async function loadTally(){
+  try{
+    const r = await fetch('{{ url_for("dashboard.live_tally") }}');
+    const js = await r.json();
+    q('#tallyOut').textContent = JSON.stringify(js, null, 2);
+  }catch(e){
+    q('#tallyOut').textContent = 'Error: ' + e.message;
+  }
+}
+
+// ---------- Quick API Reference buttons ----------
+async function apiToggle(key, enabled){
+  try{
+    const js = await postJSON('{{ url_for("dashboard.api_ind_toggle") }}', {key, enabled});
+    q('#apiRefOut').textContent = JSON.stringify(js, null, 2);
+  }catch(e){
+    q('#apiRefOut').textContent = 'Error: ' + e.message;
+  }
+}
+async function apiParams(key, params){
+  try{
+    const js = await postJSON('{{ url_for("dashboard.api_ind_params") }}', {key, params});
+    q('#apiRefOut').textContent = JSON.stringify(js, null, 2);
+  }catch(e){
+    q('#apiRefOut').textContent = 'Error: ' + e.message;
+  }
+}
+
+// Poll status every 10s
+setInterval(refreshStatus, 10000);
 </script>
-{% endif %}
 </body>
 </html>
