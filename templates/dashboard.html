@@ -215,23 +215,29 @@
 
         <div class="divider"></div>
         <h3 class="section-title">3) Indicators</h3>
+
+        <!-- LIVE-WIRED indicator toggles + per-indicator param saves -->
         <div class="grid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
           {% for key, spec in ind_specs.items() %}
             {% set block = (cfg.get('indicators') or {}).get(key, {}) %}
             <div class="panel" style="padding:10px">
               <div class="row">
-                <label><input type="checkbox" name="ind_{{ key }}" {{ 'checked' if block.get('enabled') else '' }}> <strong>{{ spec.title }}</strong></label>
+                <label>
+                  <input type="checkbox" data-ind-toggle="{{ key }}" {{ 'checked' if block.get('enabled') else '' }}>
+                  <strong>{{ spec.title }}</strong>
+                </label>
                 <span class="pill">{{ spec.panel }}</span>
                 <span class="muted right">{{ key }}</span>
               </div>
               {% if spec.fields %}
-                <div class="row mt8" style="flex-wrap:wrap">
+                <form class="row mt8" style="flex-wrap:wrap" onsubmit="return saveIndParams(event,'{{ key }}')">
                   {% for fname, default in spec.fields.items() %}
                     <label class="nowrap">{{ fname }}
-                      <input style="width:120px" name="ind_{{ key }}_{{ fname }}" value="{{ block.get(fname, default) }}">
+                      <input style="width:120px" name="{{ fname }}" value="{{ block.get(fname, default) }}">
                     </label>
                   {% endfor %}
-                </div>
+                  <button class="btn">Save Params</button>
+                </form>
               {% endif %}
             </div>
           {% endfor %}
@@ -301,25 +307,25 @@
         <div class="list mt8">
           <table>
             <thead><tr><th>ID</th><th>Tier</th><th>Chat</th><th>Label</th><th></th></tr></thead>
-            <tbody>
-              {% for r in users %}
-                <tr>
-                  <td>{{ r[0] }}</td>
-                  <td>{{ r[1] }}</td>
-                  <td class="nowrap">{{ r[2] }}</td>
-                  <td>{{ r[3] or '' }}</td>
-                  <td>
-                    <form action="{{ url_for('dashboard.users_delete') }}" method="post"
-                          onsubmit="return confirm('Delete user #{{ r[0] }}?')">
-                      <input type="hidden" name="id" value="{{ r[0] }}">
-                      <button class="btn stop">Delete</button>
-                    </form>
-                  </td>
-                </tr>
-              {% else %}
-                <tr><td colspan="5" class="muted">No users yet.</td></tr>
-              {% endfor %}
-            </tbody>
+          <tbody>
+            {% for r in users %}
+              <tr>
+                <td>{{ r[0] }}</td>
+                <td>{{ r[1] }}</td>
+                <td class="nowrap">{{ r[2] }}</td>
+                <td>{{ r[3] or '' }}</td>
+                <td>
+                  <form action="{{ url_for('dashboard.users_delete') }}" method="post"
+                        onsubmit="return confirm('Delete user #{{ r[0] }}?')">
+                    <input type="hidden" name="id" value="{{ r[0] }}">
+                    <button class="btn stop">Delete</button>
+                  </form>
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="5" class="muted">No users yet.</td></tr>
+            {% endfor %}
+          </tbody>
           </table>
         </div>
       </div>
@@ -341,10 +347,13 @@ async function postJSON(url, body){
     body: (body instanceof FormData) ? body : JSON.stringify(body),
     ...(body instanceof FormData ? {} : {headers:{'Content-Type':'application/json'}})
   });
-  return r.json();
+  const ct = r.headers.get('content-type')||'';
+  const js = ct.includes('application/json') ? await r.json() : { ok: r.ok };
+  if(!r.ok) throw js;
+  return js;
 }
 
-// ---------- Live Engine buttons ----------
+/* ---------------- Live Engine buttons ---------------- */
 q('#btnStart')?.addEventListener('click', async ()=>{
   statusHint.textContent='Starting…';
   try{
@@ -381,7 +390,7 @@ async function refreshStatus(){
   }catch(e){}
 }
 
-// ---------- Backtest ----------
+/* ---------------- Backtest ---------------- */
 async function runBacktest(ev){
   ev.preventDefault();
   const f = ev.target;
@@ -414,7 +423,7 @@ async function runBacktest(ev){
   return false;
 }
 
-// ---------- Telegram send / test ----------
+/* ---------------- Telegram send / test ---------------- */
 async function sendBroadcast(ev){
   ev.preventDefault();
   const f = ev.target;
@@ -443,7 +452,49 @@ async function testAll(){
   }
 }
 
-// Poll status every 10s
+/* ---------------- LIVE indicators (AJAX) ---------------- */
+async function jsonFetch(url, opts={}){
+  const res = await fetch(url, {headers:{'Accept':'application/json', ...(opts.headers||{})}, ...opts});
+  const ct = res.headers.get('content-type')||'';
+  const body = ct.includes('application/json') ? await res.json() : await res.text();
+  if(!res.ok) throw new Error(typeof body==='string'?body:(body.error||JSON.stringify(body)));
+  return body;
+}
+
+document.querySelectorAll('[data-ind-toggle]').forEach(cb=>{
+  cb.addEventListener('change', async (e)=>{
+    const key = e.target.getAttribute('data-ind-toggle');
+    try{
+      await jsonFetch('{{ url_for("dashboard.api_ind_toggle") }}', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({key, enabled: e.target.checked})
+      });
+    }catch(err){
+      alert('Failed: '+err.message);
+      e.target.checked = !e.target.checked; // revert on error
+    }
+  });
+});
+
+async function saveIndParams(ev, key){
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const params = {};
+  for (const [k,v] of fd.entries()) params[k]=v;
+  try{
+    await jsonFetch('{{ url_for("dashboard.api_ind_params") }}', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({key, params})
+    });
+  }catch(err){
+    alert('Save failed: '+err.message);
+  }
+  return false;
+}
+
+/* Poll status every 10s */
 setInterval(refreshStatus, 10000);
 </script>
 </body>
