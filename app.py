@@ -34,7 +34,7 @@ def create_app() -> Flask:
     app.register_blueprint(dashboard_bp, url_prefix="")
 
     # ------------------------------------------------------------------
-    # Auth helper (shared by all POST endpoints)
+    # Auth helper (shared by POST endpoints)
     # ------------------------------------------------------------------
     def _check_key():
         want = (os.getenv("CORE_SEND_KEY") or "").strip()
@@ -129,7 +129,7 @@ def create_app() -> Flask:
     @app.post("/api/worker/once")
     def worker_once():
         if not _check_key(): return jsonify({"ok": False, "error": "unauthorized"}), 401
-        # Lazy import => clearer error if file/module missing
+        # Lazy import => clearer error if module missing
         try:
             from worker_inline import one_cycle as _one
         except Exception as e:
