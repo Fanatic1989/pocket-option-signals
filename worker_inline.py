@@ -1,9 +1,8 @@
 # worker_inline.py
 from __future__ import annotations
-import time, json, traceback
+import time, traceback
 from datetime import datetime, timezone
 from typing import Dict, Any, List
-import requests
 import pandas as pd
 
 # --- import strategy helpers: try 'strategy', then fallback to 'strategies'
@@ -28,8 +27,10 @@ try:
     from rules import get_symbol_strategies
 except Exception:
     def get_symbol_strategies():
-        # No strategies defined: keep file valid
         return []
+
+# Use the in-process ENGINE to avoid HTTP self-calls (deadlocks on 1 worker)
+from live_engine import ENGINE
 
 # ------------------ internal throttles / dedupe ------------------
 _last_sent_key: Dict[str, str] = {}   # per symbol
@@ -46,15 +47,14 @@ def _throttle_ok() -> bool:
 
 def _mark_sent(): _last_send_ts.append(time.time())
 
-# ------------------ core helpers ------------------
-def _send_all(core_send_url: str, headers: Dict[str, str], text: str) -> Dict[str, Any]:
-    r = requests.post(core_send_url, json={"tier": "all", "text": text},
-                      headers=headers, timeout=15)
-    try:
-        return r.json()
-    except Exception:
-        return {"ok": False, "error": f"HTTP {r.status_code}", "raw": r.text[:300]}
+# ------------------ engine send ------------------
+def _send_all_engine(text: str) -> Dict[str, Any]:
+    results = {}
+    for t in ["free", "basic", "pro", "vip"]:
+        results[t] = ENGINE.send_to_tier(t, text)
+    return {"ok": True, "results": results}
 
+# ------------------ signal detection ------------------
 def _detect_latest_signal(df: pd.DataFrame, core: str, cfg: Dict[str, Any],
                           tf: str, expiry: str):
     d = _ensure_cols(df)
@@ -63,7 +63,7 @@ def _detect_latest_signal(df: pd.DataFrame, core: str, cfg: Dict[str, Any],
 
     ind = (cfg.get("indicators") or {}) if isinstance(cfg.get("indicators"), dict) else {}
     ip = {
-        "sma_period": int((ind.get("sma") or {}).get("period", 50)),
+        "sma_period": int((ind.get("sma") or {}).get("period", 20)),
         "rsi_period": int((ind.get("rsi") or {}).get("period", 14)),
         "stoch_k":    int((ind.get("stoch") or {}).get("k", 14)),
         "stoch_d":    int((ind.get("stoch") or {}).get("d", 3)),
@@ -99,13 +99,8 @@ def one_cycle(api_base: str, api_key: str | None) -> Dict[str, Any]:
     Runs one pass over all strategies:
       * fetch candles (data_fetch.py / Deriv)
       * evaluate latest closed bar with strategy helpers
-      * broadcast to all tiers via /api/core/send (caps enforced by ENGINE)
+      * broadcast to all tiers via ENGINE (caps enforced)
     """
-    core_send_url = f"{api_base.rstrip('/')}/api/core/send"
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["X-API-Key"] = api_key
-
     out: Dict[str, Any] = {"sent": 0, "details": [], "errors": []}
 
     try:
@@ -151,7 +146,7 @@ def one_cycle(api_base: str, api_key: str | None) -> Dict[str, Any]:
                 f"RSI: {ctx.get('rsi')} | SMA: {ctx.get('sma')} | bars→exp: {ctx.get('bars_to_expiry')}\n"
             )
 
-            res = _send_all(core_send_url, headers, msg)
+            res = _send_all_engine(msg)
             ok = res.get("ok") is True or isinstance(res.get("results"), dict)
             out["details"].append({"symbol": symbol, "tf": tf, "sig": sig, "api": res})
 
