@@ -1,37 +1,36 @@
 # live_engine.py
 # -----------------------------------------------------------------------------
 # Telegram wiring + live loop + per-tier daily caps
-# - Env: TELEGRAM_BOT_TOKEN
-#        TELEGRAM_CHAT_FREE / TELEGRAM_CHAT_ID_FREE
-#        TELEGRAM_CHAT_BASIC / TELEGRAM_CHAT_ID_BASIC
-#        TELEGRAM_CHAT_PRO / TELEGRAM_CHAT_ID_PRO
-#        TELEGRAM_CHAT_VIP / TELEGRAM_CHAT_ID_VIP
-#        (optional fallback) TELEGRAM_CHAT_ID
-# - Caps: FREE=3, BASIC=6, PRO=15, VIP=∞
-# - Public API expected by app/routes:
-#       ENGINE.start()/stop()/set_debug(bool)/status()
-#       ENGINE.send_signal(tier, text)        # preferred
-#       ENGINE.send_to_tier(tier, text)       # legacy alias
-#   Helpers exported for diagnostics:
-#       tg_test() -> (ok: bool, diag_json_str)
-#       tg_test_all() -> (ok: bool, diag_json_str)   # alias
-#       BOT_TOKEN, TIER_TO_CHAT, DAILY_CAPS
+# Env vars:
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_FREE / TELEGRAM_CHAT_ID_FREE
+#   TELEGRAM_CHAT_BASIC / TELEGRAM_CHAT_ID_BASIC
+#   TELEGRAM_CHAT_PRO / TELEGRAM_CHAT_ID_PRO
+#   TELEGRAM_CHAT_VIP / TELEGRAM_CHAT_ID_VIP
+#   (fallback) TELEGRAM_CHAT_ID
+# Optional env:
+#   ENGINE_LOOP_SLEEP (default 4)
+#   TELEGRAM_PARSE_HTML=1/0  (default 1)
+#   TELEGRAM_DISABLE_HTML_FALLBACK=1 to turn off auto plain-text fallback
+# Public API (import-safe):
+#   ENGINE.start()/stop()/set_debug(bool)/status()
+#   ENGINE.send_signal(tier, text)   # preferred
+#   ENGINE.send_to_tier(tier, text)  # alias
+#   tg_test(), tg_test_all()
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
-import os
-import json
-import time
-import threading
+import os, json, time, threading
 from datetime import datetime, date, timezone
 from typing import Optional, Dict, Any, Tuple
-
 import requests
+import html
 
 # ========================= Telegram configuration ============================
 
 BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-
+USE_HTML = (os.getenv("TELEGRAM_PARSE_HTML", "1").strip() == "1")
+DISABLE_HTML_FALLBACK = (os.getenv("TELEGRAM_DISABLE_HTML_FALLBACK", "0").strip() == "1")
 
 def _first_nonempty(*names: str) -> str:
     for n in names:
@@ -40,69 +39,101 @@ def _first_nonempty(*names: str) -> str:
             return v.strip()
     return ""
 
-
 # Accept both new and legacy names; allow a single fallback channel
-CHAT_FREE = _first_nonempty("TELEGRAM_CHAT_FREE", "TELEGRAM_CHAT_ID_FREE")
-CHAT_BASIC = _first_nonempty("TELEGRAM_CHAT_BASIC", "TELEGRAM_CHAT_ID_BASIC")
-CHAT_PRO = _first_nonempty("TELEGRAM_CHAT_PRO", "TELEGRAM_CHAT_ID_PRO")
-CHAT_VIP = _first_nonempty("TELEGRAM_CHAT_VIP", "TELEGRAM_CHAT_ID_VIP")
-FALLBACK_CHAT = _first_nonempty("TELEGRAM_CHAT_ID")
+CHAT_FREE   = _first_nonempty("TELEGRAM_CHAT_FREE",  "TELEGRAM_CHAT_ID_FREE")
+CHAT_BASIC  = _first_nonempty("TELEGRAM_CHAT_BASIC", "TELEGRAM_CHAT_ID_BASIC")
+CHAT_PRO    = _first_nonempty("TELEGRAM_CHAT_PRO",   "TELEGRAM_CHAT_ID_PRO")
+CHAT_VIP    = _first_nonempty("TELEGRAM_CHAT_VIP",   "TELEGRAM_CHAT_ID_VIP")
+FALLBACK    = _first_nonempty("TELEGRAM_CHAT_ID")  # optional
 
 TIER_TO_CHAT: Dict[str, str] = {
-    "free": CHAT_FREE or FALLBACK_CHAT,
-    "basic": CHAT_BASIC or FALLBACK_CHAT,
-    "pro": CHAT_PRO or FALLBACK_CHAT,
-    "vip": CHAT_VIP or FALLBACK_CHAT,
+    "free":  CHAT_FREE  or FALLBACK,
+    "basic": CHAT_BASIC or FALLBACK,
+    "pro":   CHAT_PRO   or FALLBACK,
+    "vip":   CHAT_VIP   or FALLBACK,
 }
 
+# =============================== Tier caps ===================================
 # Per-tier caps (None => unlimited)
 DAILY_CAPS: Dict[str, Optional[int]] = {
-    "free": 3,
+    "free":  3,
     "basic": 6,
-    "pro": 15,
-    "vip": None,
+    "pro":   16,
+    "vip":   None,  # unlimited
 }
 
+# ============================ Telegram senders ===============================
 
 def _send_telegram_raw(chat_id: str, text: str) -> Dict[str, Any]:
-    """Low-level Telegram send; returns response JSON or {'ok': False, 'error': ...}."""
+    """Low-level Telegram send; returns Telegram JSON or {'ok': False, 'error': ...}."""
     if not BOT_TOKEN:
         return {"ok": False, "error": "Missing TELEGRAM_BOT_TOKEN"}
-
     if not chat_id:
         return {"ok": False, "error": "Missing chat_id"}
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+
+    # Build base payload; optionally HTML-escaped text when using HTML mode
+    if USE_HTML:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+    else:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+
     try:
         r = requests.post(url, json=payload, timeout=15)
-        # Telegram always returns JSON
         try:
             js = r.json()
         except Exception:
             js = {"ok": False, "error": f"HTTP {r.status_code}", "text": r.text[:300]}
+
+        # If HTML parse fails, try plain text (unless disabled)
+        if USE_HTML and not DISABLE_HTML_FALLBACK:
+            desc = (js.get("description") or "").lower()
+            if (not js.get("ok")) and ("parse entities" in desc or "could not parse" in desc):
+                # Try again without parse_mode and with safely escaped text as fallback
+                fallback_payload = {
+                    "chat_id": chat_id,
+                    "text": text,  # raw text; Telegram treats as plain text
+                    "disable_web_page_preview": True,
+                }
+                r2 = requests.post(url, json=fallback_payload, timeout=15)
+                try:
+                    js2 = r2.json()
+                except Exception:
+                    js2 = {"ok": False, "error": f"HTTP {r2.status_code}", "text": r2.text[:300]}
+                return js2
         return js
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
 
 def _send_telegram_tier(tier: str, text: str) -> Dict[str, Any]:
     t = (tier or "vip").lower()
     chat_id = TIER_TO_CHAT.get(t)
     if not chat_id:
         return {"ok": False, "error": f"No Telegram chat configured for '{t}'"}
-    return _send_telegram_raw(chat_id, text)
+    # If using HTML, escape unsafe chars to reduce parse errors (still allow <b>, <i>, etc if user provided)
+    safe_text = text
+    if USE_HTML:
+        # Minimal safe: escape &, <, > unless msg already includes simple tags; this keeps it robust for odds like "1<2" or "&"
+        safe_text = safe_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # Allow simple line breaks
+        safe_text = safe_text.replace("\n", "\n")
+    return _send_telegram_raw(chat_id, safe_text)
 
+# =============================== Diagnostics =================================
 
 def tg_test() -> Tuple[bool, str]:
     """
     Send a tiny test to each configured tier; returns (overall_ok, json_string).
-    Exported because routes/app import this.
     """
     results: Dict[str, Any] = {}
     if not BOT_TOKEN:
@@ -126,11 +157,8 @@ def tg_test() -> Tuple[bool, str]:
         s = str(results)
     return overall_ok, s
 
-
 def tg_test_all() -> Tuple[bool, str]:
-    # Alias kept for older app.py builds
     return tg_test()
-
 
 # =============================== Live Engine =================================
 
@@ -141,24 +169,23 @@ class LiveEngine:
       - per-tier daily tallies with cap enforcement
       - debug flag
       - thread-safe counters
-    NOTE: Signal discovery logic is not here; call .send_signal(tier, text).
+    Signal discovery logic lives elsewhere; call .send_signal(tier, text).
     """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self._sleep_seconds = int(os.getenv("ENGINE_LOOP_SLEEP", "4"))
+        self._sleep_seconds = max(1, int(os.getenv("ENGINE_LOOP_SLEEP", "4") or "4"))
         self.debug = False
 
         today = date.today().isoformat()
-        # Primary shape
         self._tally = {
             "date": today,
             "by_tier": {"free": 0, "basic": 0, "pro": 0, "vip": 0},
             "total": 0,
         }
-        # Legacy shape (some templates read 'tallies')
+        # Legacy compat (some UIs read this)
         self._tallies_legacy = {"free": 0, "basic": 0, "pro": 0, "vip": 0, "all": 0}
 
         self._last_send_result: Dict[str, Any] = {}
@@ -205,7 +232,6 @@ class LiveEngine:
             if not self._running:
                 return True, "already stopped"
             self._running = False
-        # quick join
         for _ in range(40):
             t = self._thread
             if not t or not t.is_alive():
@@ -219,7 +245,7 @@ class LiveEngine:
 
     def can_send(self, tier: str) -> bool:
         t = (tier or "").lower()
-        return not self._cap_reached(t)
+        return t in ("free", "basic", "pro", "vip") and (not self._cap_reached(t))
 
     def send_signal(self, tier: str, text: str) -> Dict[str, Any]:
         """
@@ -254,16 +280,16 @@ class LiveEngine:
             self._inc_tally(t)
         return res
 
-    # legacy name used by some previous builds
     def send_to_tier(self, tier: str, text: str) -> Dict[str, Any]:
+        # Legacy alias
         return self.send_signal(tier, text)
 
     def status(self) -> Dict[str, Any]:
         """
-        Provide a superset so both old and new UIs work:
+        Superset for new/old UIs:
           - running/debug/loop_sleep
-          - tally (by_tier + total)  [new]
-          - tallies (legacy with 'all') [old]
+          - tally (by_tier + total)
+          - tallies (legacy with 'all')
           - caps, configured_chats
           - last_send_result, last_error, day
         """
@@ -273,8 +299,8 @@ class LiveEngine:
                 "running": self._running,
                 "debug": self.debug,
                 "loop_sleep": self._sleep_seconds,
-                "tally": json.loads(json.dumps(self._tally)),  # copy
-                "tallies": json.loads(json.dumps(self._tallies_legacy)),
+                "tally": json.loads(json.dumps(self._tally)),           # copy
+                "tallies": json.loads(json.dumps(self._tallies_legacy)),# legacy
                 "caps": DAILY_CAPS,
                 "configured_chats": {k: bool(v) for k, v in TIER_TO_CHAT.items()},
                 "last_send_result": self._last_send_result,
@@ -299,7 +325,6 @@ class LiveEngine:
                 with self._lock:
                     self._last_error = f"{type(e).__name__}: {e}"
             time.sleep(slp)
-
 
 # Singleton used by the app
 ENGINE = LiveEngine()
