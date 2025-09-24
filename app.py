@@ -20,18 +20,10 @@ except Exception:
             return {"ok": False, "error": "ENGINE not wired", "tier": tier, "text": text}
     ENGINE = _StubEngine()
     TIER_TO_CHAT = {"free": None, "basic": None, "pro": None, "vip": None}
-    # ✅ keep caps consistent with live engine
     DAILY_CAPS = {"free": 3, "basic": 6, "pro": 16, "vip": None}
 
 # --- UI blueprint (dashboard etc.) ---
 from routes import bp as dashboard_bp
-
-# --- Inline worker (HTTP-triggered one-shot cycle) ---
-# Make sure worker_inline.py is present next to this file, with one_cycle(api_base, api_key)
-try:
-    from worker_inline import one_cycle
-except Exception:
-    one_cycle = None
 
 
 def create_app() -> Flask:
@@ -42,18 +34,18 @@ def create_app() -> Flask:
     app.register_blueprint(dashboard_bp, url_prefix="")
 
     # ------------------------------------------------------------------
-    # Minimal “core” JSON API (no overlap with routes.py)
+    # Auth helper (shared by all POST endpoints)
     # ------------------------------------------------------------------
     def _check_key():
-        want = os.getenv("CORE_SEND_KEY", "").strip()
-        have = request.headers.get("X-API-Key", "").strip()
-        # also allow ?key=... for friendly uptime monitors
+        want = (os.getenv("CORE_SEND_KEY") or "").strip()
+        have = (request.headers.get("X-API-Key") or "").strip()
         if not have:
-            have = (request.args.get("key") or "").strip()
-        if want and (have != want):
-            return False
-        return True
+            have = (request.args.get("key") or "").strip()  # allow ?key=... for pingers
+        return (not want) or (have == want)
 
+    # ------------------------------------------------------------------
+    # Core JSON API (caps enforced in ENGINE)
+    # ------------------------------------------------------------------
     @app.get("/api/core/status")
     def core_status():
         return jsonify(ENGINE.status())
@@ -86,8 +78,7 @@ def create_app() -> Flask:
     def core_send():
         """
         Body: {"tier":"vip|pro|basic|free|all", "text":"message"}
-        If tier="all", broadcasts to all tiers.
-        Enforces per-tier caps inside ENGINE.
+        If tier="all", broadcasts to all tiers. Caps enforced inside ENGINE.
         """
         if not _check_key(): return jsonify({"ok": False, "error": "unauthorized"}), 401
         data = request.get_json(silent=True) or {}
@@ -95,7 +86,6 @@ def create_app() -> Flask:
         text = (data.get("text") or "").strip()
         if not text:
             return jsonify({"ok": False, "error": "Text required"}), 400
-
         tiers = ["free", "basic", "pro", "vip"] if tier == "all" else [tier]
         results = {t: ENGINE.send_to_tier(t, text) for t in tiers}
         return jsonify({"ok": True, "results": results, "status": ENGINE.status()})
@@ -134,18 +124,18 @@ def create_app() -> Flask:
         return jsonify({"ok": True, "caps": DAILY_CAPS})
 
     # ------------------------------------------------------------------
-    # 🔹 HTTP-triggered one-shot worker (Option A)
-    #     Hit this every 30–60s via UptimeRobot/GitHub Actions.
-    #     Auth: same X-API-Key (or ?key=...) as /api/core/*.
+    # HTTP-triggered one-shot worker (free, pinger-friendly)
     # ------------------------------------------------------------------
     @app.post("/api/worker/once")
     def worker_once():
         if not _check_key(): return jsonify({"ok": False, "error": "unauthorized"}), 401
-        if one_cycle is None:
-            return jsonify({"ok": False, "error": "worker_inline.one_cycle not available"}), 500
-        # Use our own public base and the same protected key to send to /api/core/send
+        # Lazy import => clearer error if file/module missing
+        try:
+            from worker_inline import one_cycle as _one
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"import_error: {type(e).__name__}: {e}"}), 500
         api_base = request.url_root.rstrip("/")
-        out = one_cycle(api_base, os.getenv("CORE_SEND_KEY", ""))
+        out = _one(api_base, os.getenv("CORE_SEND_KEY", ""))
         return jsonify({"ok": True, "summary": out})
 
     return app
