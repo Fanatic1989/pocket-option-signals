@@ -26,6 +26,13 @@ except Exception:
 # --- UI blueprint (dashboard etc.) ---
 from routes import bp as dashboard_bp
 
+# --- Inline worker (HTTP-triggered one-shot cycle) ---
+# Make sure worker_inline.py is present next to this file, with one_cycle(api_base, api_key)
+try:
+    from worker_inline import one_cycle
+except Exception:
+    one_cycle = None
+
 
 def create_app() -> Flask:
     app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -40,6 +47,9 @@ def create_app() -> Flask:
     def _check_key():
         want = os.getenv("CORE_SEND_KEY", "").strip()
         have = request.headers.get("X-API-Key", "").strip()
+        # also allow ?key=... for friendly uptime monitors
+        if not have:
+            have = (request.args.get("key") or "").strip()
         if want and (have != want):
             return False
         return True
@@ -122,6 +132,21 @@ def create_app() -> Flask:
     @app.get("/healthz")
     def healthz():
         return jsonify({"ok": True, "caps": DAILY_CAPS})
+
+    # ------------------------------------------------------------------
+    # 🔹 HTTP-triggered one-shot worker (Option A)
+    #     Hit this every 30–60s via UptimeRobot/GitHub Actions.
+    #     Auth: same X-API-Key (or ?key=...) as /api/core/*.
+    # ------------------------------------------------------------------
+    @app.post("/api/worker/once")
+    def worker_once():
+        if not _check_key(): return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if one_cycle is None:
+            return jsonify({"ok": False, "error": "worker_inline.one_cycle not available"}), 500
+        # Use our own public base and the same protected key to send to /api/core/send
+        api_base = request.url_root.rstrip("/")
+        out = one_cycle(api_base, os.getenv("CORE_SEND_KEY", ""))
+        return jsonify({"ok": True, "summary": out})
 
     return app
 
