@@ -345,3 +345,31 @@ def get_symbol_strategies():
             }
         },
     ]
+def get_symbol_strategies():
+    """
+    Strategies the worker scans each cycle.
+    If your data_fetch expects plain FX codes, change 'frxEURUSD' -> 'EURUSD', etc.
+    """
+    return [
+        # EURUSD — three cores
+        {"name":"EURUSD M1 BASE",  "symbol":"frxEURUSD","tf":"M1","expiry":"1m","core":"BASE",
+         "cfg":{"indicators":{"sma":{"period":20},"rsi":{"period":14},"stoch":{"k":14,"d":3}}}},
+        {"name":"EURUSD M1 WIDE",  "symbol":"frxEURUSD","tf":"M1","expiry":"1m","core":"WIDE",
+         "cfg":{"indicators":{"sma":{"period":20},"rsi":{"period":14},"stoch":{"k":14,"d":3}}}},
+        {"name":"EURUSD M3 TREND", "symbol":"frxEURUSD","tf":"M3","expiry":"3m","core":"TREND",
+         "cfg":{"indicators":{"sma":{"period":20},"rsi":{"period":14}}}},
+
+        # GBPUSD
+        {"name":"GBPUSD M1 BASE",  "symbol":"frxGBPUSD","tf":"M1","expiry":"1m","core":"BASE",
+         "cfg":{"indicators":{"sma":{"period":20},"rsi":{"period":14},"stoch":{"k":14,"d":3}}}},
+        {"name":"GBPUSD M1 WIDE",  "symbol":"frxGBPUSD","tf":"M1","expiry":"1m","core":"WIDE",
+         "cfg":{"indicators":{"sma":{"period":20},"rsi":{"period":14},"stoch":{"k":14,"d":3}}}},
+
+        # USDJPY
+        {"name":"USDJPY M1 WIDE",  "symbol":"frxUSDJPY","tf":"M1","expiry":"1m","core":"WIDE",
+         "cfg":{"indicators":{"sma":{"period":20},"rsi":{"period":14},"stoch":{"k":14,"d":3}}}},
+
+        # AUDUSD
+        {"name":"AUDUSD M1 WIDE",  "symbol":"frxAUDUSD","tf":"M1","expiry":"1m","core":"WIDE",
+         "cfg":{"indicators":{"sma":{"period":20},"rsi":{"period":14},"stoch":{"k":14,"d":3}}}},
+    ]
