@@ -10,13 +10,13 @@ try:
     from strategy import (
         _ensure_cols, _prep_indicators,
         _base_conditions, _trend_conditions, _chop_conditions, _eval_custom,
-        _expiry_to_bars,
+        _expiry_to_bars, _wide_conditions,  # <- new core
     )
 except ImportError:
     from strategies import (
         _ensure_cols, _prep_indicators,
         _base_conditions, _trend_conditions, _chop_conditions, _eval_custom,
-        _expiry_to_bars,
+        _expiry_to_bars, _wide_conditions,  # <- new core
     )
 
 # Candle source
@@ -75,6 +75,8 @@ def _detect_latest_signal(df: pd.DataFrame, core: str, cfg: Dict[str, Any],
         buy, sell = _trend_conditions(d)
     elif cu == "CHOP":
         buy, sell = _chop_conditions(d)
+    elif cu == "WIDE":
+        buy, sell = _wide_conditions(d)  # permissive core
     elif cu == "CUSTOM":
         custom = (cfg.get("custom") or {}) if isinstance(cfg.get("custom"), dict) else {}
         buy, sell = _eval_custom(d, custom)
@@ -85,12 +87,15 @@ def _detect_latest_signal(df: pd.DataFrame, core: str, cfg: Dict[str, Any],
     if i < 1:
         return None, None, {"reason": "short_after_prep"}
 
-    sig = "BUY" if bool(buy.iloc[i]) else ("SELL" if bool(sell.iloc[i]) else None)
     ctx = {
         "rsi": float(d["rsi"].iloc[i]) if "rsi" in d else None,
         "sma": float(d["sma"].iloc[i]) if "sma" in d else None,
+        "close": float(d["close"].iloc[i]),
+        "sk": float(d["sk"].iloc[i]),
+        "sd": float(d["sd"].iloc[i]),
         "bars_to_expiry": _expiry_to_bars(tf, expiry),
     }
+    sig = "BUY" if bool(buy.iloc[i]) else ("SELL" if bool(sell.iloc[i]) else None)
     return sig, int(d["timestamp"].iloc[i]), ctx
 
 # ------------------ public entry ------------------
@@ -124,7 +129,7 @@ def one_cycle(api_base: str, api_key: str | None) -> Dict[str, Any]:
 
             sig, ref_ts, ctx = _detect_latest_signal(df, core, cfg, tf, expiry)
             if not sig:
-                out["details"].append({"symbol": symbol, "tf": tf, "skipped": "no_signal"})
+                out["details"].append({"symbol": symbol, "tf": tf, "skipped": "no_signal", "ctx": ctx})
                 continue
 
             key = f"{symbol}:{tf}:{core}:{ref_ts}:{sig}"
