@@ -129,7 +129,7 @@ def create_app() -> Flask:
     @app.post("/api/worker/once")
     def worker_once():
         if not _check_key(): return jsonify({"ok": False, "error": "unauthorized"}), 401
-        # Lazy import => clearer error if module missing
+        # Lazy import => clearer error if file/module missing
         try:
             from worker_inline import one_cycle as _one
         except Exception as e:
