@@ -269,3 +269,79 @@ def parse_natural_pair(text: str):
     buy_expr = side_to_expr(buy_txt, "buy")
     sell_expr = side_to_expr(sell_txt, "sell")
     return buy_expr, sell_expr
+# --- Add this to rules.py ---
+
+def get_symbol_strategies():
+    """
+    Return a list of strategies the worker should evaluate each cycle.
+    Symbols shown use Deriv naming (e.g., frxEURUSD). Adjust if your
+    data_fetch.py expects plain 'EURUSD' instead.
+    """
+    return [
+        # ===== EURUSD (Deriv: frxEURUSD) =====
+        {
+            "name":   "EURUSD M1 BASE",
+            "symbol": "frxEURUSD",
+            "tf":     "M1",
+            "expiry": "1m",
+            "core":   "BASE",
+            "cfg": {
+                "indicators": {
+                    "sma":   {"period": 20},
+                    "rsi":   {"period": 14},
+                    "stoch": {"k": 14, "d": 3},
+                }
+            }
+        },
+        {
+            "name":   "EURUSD M1 TREND",
+            "symbol": "frxEURUSD",
+            "tf":     "M1",
+            "expiry": "1m",
+            "core":   "TREND",
+            "cfg": {
+                "indicators": {
+                    "sma": {"period": 20},
+                    "rsi": {"period": 14},
+                }
+            }
+        },
+
+        # ===== GBPUSD =====
+        {
+            "name":   "GBPUSD M1 BASE",
+            "symbol": "frxGBPUSD",
+            "tf":     "M1",
+            "expiry": "1m",
+            "core":   "BASE",
+            "cfg": {
+                "indicators": {
+                    "sma":   {"period": 20},
+                    "rsi":   {"period": 14},
+                    "stoch": {"k": 14, "d": 3},
+                }
+            }
+        },
+
+        # ===== A more explicit CUSTOM example (tune thresholds as you like) =====
+        {
+            "name":   "EURUSD M1 CUSTOM",
+            "symbol": "frxEURUSD",
+            "tf":     "M1",
+            "expiry": "1m",
+            "core":   "CUSTOM",
+            "cfg": {
+                "indicators": {
+                    "sma":   {"period": 20},
+                    "rsi":   {"period": 14},
+                    "stoch": {"k": 14, "d": 3},
+                },
+                # _eval_custom supports: price_above_sma/price_below_sma (bool),
+                # rsi_gt/rsi_lt (number), stoch_cross_up/stoch_cross_dn (bool)
+                "custom": {
+                    "buy_rule":  {"price_above_sma": True, "rsi_gt": 52, "stoch_cross_up": True},
+                    "sell_rule": {"price_below_sma": True, "rsi_lt": 48, "stoch_cross_dn": True}
+                }
+            }
+        },
+    ]
